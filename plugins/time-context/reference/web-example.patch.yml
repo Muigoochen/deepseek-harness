@@ -1,0 +1,25 @@
+# Test-only companion overlay for the shipped time-context Web example. Pins
+# the deterministic mock adapter and an isolated persistence root; the example
+# overlay itself supplies the time-context insert and its timeZone config.
+- id: headless-startup
+  disabled: true
+
+- id: headless-runner
+  disabled: true
+
+- id: agent-loop
+  config:
+    agents:
+      - id: main
+        provider: time-context-mock
+        model: time-context-mock
+        cwd: !!js process.cwd()
+
+- id: session-persistence-jsonl
+  config:
+    root: './.sessions'
+    compression: none
+
+- insert:
+    - id: time-context-mock-llm
+      name: './mock-llm.ts'

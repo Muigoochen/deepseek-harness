@@ -1,0 +1,17 @@
+# Opt-in per-step clock context over the shipped Web composition. The model
+# receives a durable time reading before each request step, formatted in the
+# browser zone attached to the prompt:
+#
+#   dsh web --patch plugins/time-context/cordis.patch.yml
+#
+# The overlay inserts the time-context plugin only; every other row comes from
+# the dsh-base / dsh-web-app bundles. `timeZone` is the display fallback when
+# the open turn carries no unique browser zone; per-prompt browser zones win
+# when present. Long-term local enable: write this same patch into
+# $DSH_HOME/profiles/web/cordis.patch.yml (web profile reloads it live).
+
+- insert:
+    - id: time-context
+      name: '@deepseek-ai/dsh-time-context'
+      config:
+        timeZone: Asia/Shanghai

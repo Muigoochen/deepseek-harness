@@ -1,0 +1,12 @@
+# plugins 插件项目通用忽略：node_modules / 构建产物 / 日志 / 临时文件
+node_modules/
+dist/
+lib/
+*.tsbuildinfo
+*.log
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+.dsh/
+tmp/
