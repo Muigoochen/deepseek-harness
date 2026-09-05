@@ -1,0 +1,8 @@
+# 离线资产：随包整体拷贝分发，不入库（node msi ~33MB、pnpm.tgz、
+# source.tar.gz ~17MB、pnpm-store ~1GB，且均可再生成）。本地文件保留。
+assets/
+
+# 运行残留
+installer.log
+__pycache__/
+*.pyc
