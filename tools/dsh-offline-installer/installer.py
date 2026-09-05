@@ -24,8 +24,11 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+import plugin_store as pstore  # 插件管理原语（同目录模块）
 
 __version__ = "0.1.0"
 
@@ -146,14 +149,25 @@ BROWSER_CHOICES = ("默认浏览器", "Microsoft Edge", "Google Chrome",
                    "QQ 浏览器", "Mozilla Firefox", "自定义…")
 
 
+def plugin_home() -> Path:
+    """DSH 家目录：优先 $env:DSH_HOME，其次 ~/.dsh（产品默认位）。"""
+    return Path(os.environ["DSH_HOME"]) if os.environ.get("DSH_HOME") \
+        else Path.home() / ".dsh"
+
+
 def web_clock_overlay(project: Path) -> Path | None:
-    """plugins/time-context 时钟 overlay；profile 层已启用或文件缺失时不附加。"""
+    """plugins/time-context 时钟 overlay；profile 层已挂 time-context 或文件缺失时不附加。
+
+    time-context 以持久行进入 web 补丁（任何来源）即视为已挂载 → 返回 None，
+    避免 `--patch` 双挂（去双挂）。未挂载且示例 overlay 存在时保持向后兼容。
+    """
     overlay = project / "plugins" / "time-context" / "cordis.patch.yml"
     if not overlay.exists():
         return None
-    home_patch = Path.home() / ".dsh" / "profiles" / "web" / "cordis.patch.yml"
     try:
-        if home_patch.exists() and "dsh-time-context" in home_patch.read_text(encoding="utf-8"):
+        home_patch = pstore.web_patch(plugin_home())
+        if home_patch.exists() and "dsh-time-context" in \
+                home_patch.read_text(encoding="utf-8"):
             return None
     except OSError:
         pass
@@ -427,8 +441,18 @@ class App(tk.Tk):
         self.custom_browser: str | None = None
         self._open_pending = False
         self._open_deadline = 0.0
+        # --- 插件区（v0.1）状态 ---
+        self.plugin_home_dir: Path | None = None
+        self.plugin_project: Path | None = None
+        self.plugin_cards: list[pstore.PluginCard] = []
+        self.plugin_pending: dict[str, str] = {}
+        self.plugin_busy = False
+        self.web_tail: deque[str] = deque(maxlen=500)
+        self.rollback_armed = False
+        self._activation_checks = 0
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(400, self._refresh_plugins)
 
     def _build_ui(self) -> None:
         pad = {"padx": 12, "pady": 5}
@@ -497,6 +521,8 @@ class App(tk.Tk):
         ttk.Label(ops, text="用「▶ 在窗口内运行 dsh web」启动后，可在此再次打开或复制带 token 的登录地址。",
                   foreground="#666").pack(anchor="w", pady=(6, 0))
 
+        self._build_plugin_ui(root)
+
         # 日志
         lf = ttk.LabelFrame(root, text="日志")
         lf.pack(fill="both", expand=True)
@@ -530,6 +556,11 @@ class App(tk.Tk):
         self.btn_full.configure(state=state)
         self.btn_start.configure(state=state)
         self.btn_term.configure(state=state)
+        for b in getattr(self, "_plugin_btns", ()):
+            try:
+                b.configure(state="disabled" if busy or self.plugin_busy else "normal")
+            except Exception:  # noqa: BLE001
+                pass
         self.btn_open_page.configure(state=state)
 
     def _status(self, text: str, color: str = "#1a6b1a") -> None:
@@ -748,6 +779,7 @@ class App(tk.Tk):
                     break
                 text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if text:
+                    self.web_tail.append(text)
                     self._append("[终端] " + text)
                     m = re.search(r"dsh web: (\S+)", text)
                     if m is not None and self.web_auth_url is None:
@@ -797,6 +829,292 @@ class App(tk.Tk):
             self._append("[终端] 已停止。")
             self.btn_stop.configure(state="disabled")
             self._status("已停止")
+
+    # ------------------------------------------------------------------ 插件区
+
+    STATE_CN = {
+        "enabled": "已启用",
+        "disabled": "已停用",
+        "external": "已启用·外部(只读)",
+        "external-disabled": "已停用·外部(只读)",
+        "first_party": "内置(只读)",
+        "first_party-disabled": "内置·停用(只读)",
+        "downloaded": "已下载",
+    }
+    STATE_COLOR = {
+        "enabled": "#1a6b1a", "disabled": "#888", "external": "#1a4a8a",
+        "external-disabled": "#888", "first_party": "#666",
+        "first_party-disabled": "#888", "downloaded": "#a06700",
+    }
+
+    def _build_plugin_ui(self, root: ttk.Frame) -> None:
+        box = ttk.LabelFrame(root, text="插件（@dsh-user 插件管理 v0.1）", padding=8)
+        box.pack(fill="x", pady=4)
+        bar = ttk.Frame(box)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="重新扫描", command=self._refresh_plugins,
+                   width=10).pack(side="left")
+        ttk.Button(bar, text="从文件夹导入…", command=self._plugin_import,
+                   width=14).pack(side="left", padx=6)
+        self.plugin_hint_lbl = ttk.Label(bar, text="扫描中…", foreground="#666")
+        self.plugin_hint_lbl.pack(side="left", padx=6)
+        self.plugin_rows = ttk.Frame(box)
+        self.plugin_rows.pack(fill="x", pady=(6, 0))
+        self.plugin_btns: list[ttk.Button] = []
+        self.plugin_note = ttk.Label(
+            box, text="外部/内置行 v0.1 只读展示；改动为草稿，点「保存」才落盘并重启验证。",
+            foreground="#888", font=("Microsoft YaHei UI", 8))
+        self.plugin_note.pack(anchor="w", pady=(4, 0))
+        self.btn_save = ttk.Button(box, text="全部保存并重启网页版",
+                                   command=self.on_plugin_save, state="disabled")
+        self.btn_save.pack(anchor="e", pady=(2, 0))
+        self._plugin_btns = self.plugin_btns
+
+    def _set_plugin_busy(self, busy: bool) -> None:
+        self.plugin_busy = busy
+        for b in self.plugin_btns:
+            try:
+                b.configure(state="disabled" if busy or self.busy else "normal")
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self.btn_save.configure(
+                state="disabled" if busy or not self.plugin_pending else "normal")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _plugin_env(self) -> tuple[Path, Path] | None:
+        home = plugin_home()
+        project = self._resolve_web_project()
+        if not home.exists() or not (home / "profiles" / "web").is_dir():
+            self._append("[插件] DSH 环境未就绪：" + str(home))
+            return None
+        if project is None:
+            self._append("[插件] 未找到项目目录，无法运行结构门 dump。")
+            return None
+        self.plugin_home_dir, self.plugin_project = home, project
+        return home, project
+
+    def _refresh_plugins(self) -> None:
+        if self.plugin_busy:
+            return
+        threading.Thread(target=self._refresh_worker, daemon=True).start()
+
+    def _refresh_worker(self) -> None:
+        try:
+            env = self._plugin_env()
+            if env is None:
+                self.after(0, lambda: self.plugin_hint_lbl.configure(text="环境未就绪"))
+                return
+            home, project = env
+            sources = pstore.discover_sources(project, ASSETS)
+            patch_text = ""
+            patch = pstore.web_patch(home)
+            if patch.exists():
+                patch_text = patch.read_text(encoding="utf-8")
+            try:
+                dump = pstore.structure_gate(home, patch_text, project=project)
+            except pstore.GateError as exc:
+                self._append(f"[插件] 当前补丁结构门未过：{exc}")
+                dump = pstore.parse_dump("")
+            cards = pstore.status_view(home, sources, dump)
+            self.after(0, lambda: self._apply_plugin_view(cards, home, project))
+        except Exception as exc:  # noqa: BLE001
+            self._append(f"[插件] 刷新失败：{exc}")
+
+    def _apply_plugin_view(self, cards, home: Path, project: Path) -> None:
+        self.plugin_cards = cards
+        self.plugin_home_dir, self.plugin_project = home, project
+        for child in self.plugin_rows.winfo_children():
+            child.destroy()
+        self.plugin_btns.clear()
+        if not cards:
+            ttk.Label(self.plugin_rows, text="（未发现插件：可在项目 plugins/ 或 assets/plugins/ 放置，或「从文件夹导入」）",
+                      foreground="#888").pack(anchor="w")
+        for card in cards:
+            row = ttk.Frame(self.plugin_rows)
+            row.pack(fill="x", pady=1)
+            pending = self.plugin_pending.get(card.slug)
+            mark = {"install": "待安装", "uninstall": "待卸载",
+                    "set_on": "待启用", "set_off": "待停用"}.get(pending, "")
+            tail = f"  [{mark}]" if mark else ""
+            ttk.Label(row, text=card.slug, width=20,
+                      font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
+            st = self.STATE_CN.get(card.state, card.state)
+            ttk.Label(row, text=st + tail, width=22,
+                      foreground=self.STATE_COLOR.get(card.state, "#000")
+                      ).pack(side="left")
+            desc = (card.description or "")[:40]
+            ttk.Label(row, text=desc, foreground="#666").pack(side="left", fill="x", expand=True)
+            for text, act, enabled in self._row_actions(card):
+                btn = ttk.Button(row, text=text, width=8,
+                                 command=lambda s=card.slug, a=act: self._plugin_act(s, a))
+                if not enabled:
+                    btn.configure(state="disabled")
+                btn.pack(side="left", padx=2)
+                self.plugin_btns.append(btn)
+        self.plugin_hint_lbl.configure(text=f"{len(cards)} 个插件"
+                                       if cards else "无插件")
+        self._set_plugin_busy(self.plugin_busy)
+
+    @staticmethod
+    def _row_actions(card: pstore.PluginCard) -> list[tuple[str, str, bool]]:
+        st = card.state
+        if st == "downloaded":
+            return [("安装", "install", card.validation_errors == ()),
+                    ("校验失败", "none", card.validation_errors != ())]
+        if st == "enabled":
+            return [("停用", "set_off", True), ("卸载", "uninstall", True)]
+        if st == "disabled":
+            return [("启用", "set_on", True), ("卸载", "uninstall", True)]
+        return []          # external / first_party：只读展示
+
+    def _plugin_act(self, slug: str, action: str) -> None:
+        if self.plugin_busy or action == "none":
+            if action == "none":
+                messagebox.showinfo("校验失败",
+                                    "该插件未通过安装前置校验（name/lib/client 等），见日志。")
+            return
+        if action == "uninstall":
+            if not messagebox.askyesno("卸载确认",
+                                       f"卸载 {slug}？将移除其组合行并删除共享目录\n"
+                                       f"（源码仍留在项目 plugins/ 中，可重新安装）。"):
+                return
+        self.plugin_pending[slug] = action
+        self._set_plugin_busy(self.plugin_busy)
+        self._render_pending_only(slug)
+        self._append(f"[插件] 已加入待办：{slug} → {action}（点『全部保存并重启网页版』生效）")
+
+    def _render_pending_only(self, _slug: str) -> None:
+        # 只刷新保存按钮可用性（行内容在保存/刷新后重建）
+        self.btn_save.configure(state="normal")
+
+    def on_plugin_save(self) -> None:
+        if self.plugin_busy or not self.plugin_pending:
+            return
+        self._set_plugin_busy(True)
+        threading.Thread(target=self._plugin_save_worker, daemon=True).start()
+
+    def _plugin_save_worker(self) -> None:
+        home, project = self.plugin_home_dir, self.plugin_project
+        ok_all = True
+        was_running = self.web_proc is not None and self.web_proc.poll() is None
+        try:
+            if home is None or project is None:
+                raise pstore.PluginError("插件环境未就绪（先点「重新扫描」）。")
+            pending = list(self.plugin_pending.items())
+            # 卸载/启停前先停 web：避免删除运行中的共享目录/热态竞争
+            had_uninstall = any(a == "uninstall" for _, a in pending)
+            if had_uninstall and was_running:
+                self._stop_web_internal(quiet=True)
+            sources = {s.slug: s for s in pstore.discover_sources(project, ASSETS)}
+            for slug, act in pending:
+                try:
+                    if act == "install":
+                        src = sources.get(slug)
+                        if src is None:
+                            raise pstore.PluginError(f"{slug} 不在来源目录中")
+                        pstore.install(home, src, project=project)
+                        self._append(f"[插件] ✓ 已安装 {slug}")
+                    elif act == "uninstall":
+                        pstore.uninstall(home, slug, project=project)
+                        self._append(f"[插件] ✓ 已卸载 {slug}")
+                    elif act in ("set_on", "set_off"):
+                        pstore.set_enabled(home, slug, enabled=(act == "set_on"),
+                                           project=project)
+                        self._append(f"[插件] ✓ {'启用' if act == 'set_on' else '停用'} {slug}")
+                except (pstore.PluginError, pstore.ProtectedShapeError,
+                        pstore.GateError) as exc:
+                    ok_all = False
+                    self._append(f"[插件] ✗ {slug}：{exc}")
+                    break
+            self.rollback_armed = ok_all and any(
+                a in ("install", "set_on") for _, a in pending)
+        except Exception as exc:  # noqa: BLE001
+            ok_all = False
+            self._append(f"[插件] ✗ 保存失败：{exc}")
+        finally:
+            self.after(0, lambda: self._plugin_save_done(ok_all, was_running))
+
+    def _plugin_save_done(self, ok_all: bool, was_running: bool) -> None:
+        self.plugin_pending.clear()
+        self._set_plugin_busy(False)
+        if ok_all and (was_running or self.rollback_armed):
+            # 确定性验证：重启 + 健康检查（失败自动回滚）
+            self._append("[插件] 正在重启网页版以确认生效…")
+            self._stop_web_internal(quiet=True)
+            if self._launch_web():
+                self._activation_checks = 0
+                self.after(600, self._activation_poll)
+        elif ok_all:
+            self._status("已保存（补丁已热应用；未运行服务，下次启动生效）")
+            self._append("[插件] 已保存：改动已热应用；下次启动生效。")
+        else:
+            self._status("保存失败，见日志", "#b00000")
+        self._refresh_plugins()
+
+    def _activation_poll(self) -> None:
+        """激活门健康检查：启动日志无 loader 失败即视为生效；失败回滚 .bak 重启一次。"""
+        self._activation_checks += 1
+        text = "\n".join(self.web_tail)
+        running = self.web_proc is not None and self.web_proc.poll() is None
+        if running and pstore.health_ok(text):
+            if "dsh web:" in text:
+                self.rollback_armed = False
+                self._status("插件改动已生效（网页版运行中）")
+                return
+            if self._activation_checks > 60:
+                self._status("网页版启动中…")
+                return
+            self.after(400, self._activation_poll)
+            return
+        # 启动失败或健康检查失败
+        if not running:
+            self._append("[插件] 网页版未能保持运行（见日志）。")
+        else:
+            self._append("[插件] 启动日志出现 loader 错误，判定未生效。")
+        if self.rollback_armed:
+            self.rollback_armed = False
+            try:
+                if pstore.rollback_patch(self.plugin_home_dir or plugin_home()):
+                    self._append("[插件] 已自动回滚补丁（.bak），正在重启…")
+                    self._stop_web_internal(quiet=True)
+                    if self._launch_web():
+                        self.after(1500, self._activation_poll)
+                    return
+            except Exception as exc:  # noqa: BLE001
+                self._append(f"[插件] 回滚失败：{exc}")
+        self._status("插件保存未生效，见日志", "#b00000")
+
+    def _plugin_import(self) -> None:
+        if self.plugin_busy:
+            return
+        home = plugin_home()
+        project = self._resolve_web_project()
+        if project is None:
+            messagebox.showerror("未找到项目", "找不到项目源码目录，无法导入。")
+            return
+        picked = filedialog.askdirectory(title="选择插件目录（含 package.json）")
+        if not picked:
+            return
+        src = Path(picked)
+        slug = src.name
+        if not pstore.is_valid_slug(slug):
+            messagebox.showerror("非法目录名", "插件目录名须为小写字母/数字/连字符。")
+            return
+        v = pstore.validate_package(src)
+        if not v.ok:
+            messagebox.showerror("校验失败", "\n".join(v.errors))
+            return
+        dst = project / "plugins" / slug
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            messagebox.showerror("已存在", f"{dst} 已存在，请先处理。")
+            return
+        shutil.copytree(src, dst, ignore=shutil.ignore_patterns(
+            "__pycache__", "*.pyc", ".git", "tmp"))
+        self._append(f"[插件] 已导入到 {dst}（重新扫描后即可安装）")
+        self._refresh_plugins()
 
     def _on_close(self) -> None:
         """关窗口前先停 dsh web，再销毁窗口。"""
