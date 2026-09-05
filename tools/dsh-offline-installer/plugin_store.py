@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -762,6 +763,160 @@ def _sync_anchor(home: Path, slug: str, src: Path) -> None:
     if dst.exists():
         shutil.rmtree(dst, ignore_errors=True)
     os.replace(staging, dst)
+
+
+# ---------------------------------------------------------------- 外部行接管（v0.2）
+
+def _leading_comment(lines: list[str], at: int) -> bool:
+    """元素上方（跳过空行）是否紧贴注释行——有则视为他人注释归属，拒接管。"""
+    p = at - 1
+    while p >= 0 and not lines[p].strip():
+        p -= 1
+    return p >= 0 and lines[p].lstrip().startswith("#")
+
+
+def find_standalone_element(text: str, slug: str) -> tuple[int, int, ManagedRow]:
+    """找"干净可接管"的外部顶层元素（唯一、单子条目、无 config/注释、上方无注释）。
+
+    返回 (start_line, end_line, row)（含行）。不满足 → ProtectedShapeError 给出原因。
+    """
+    lines = _raw_lines(text)
+    matches: list[tuple[int, int, ManagedRow]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        if lines[i].rstrip("\r\n") != "- insert:":
+            i += 1
+            continue
+        start = i
+        # 元素结束 = 下一行同为顶层（缩进 0 的非空行）或 EOF
+        end = n - 1
+        k = i + 1
+        while k < n:
+            ln = lines[k]
+            if ln.strip() and not ln[0].isspace() and ln[0] != "#":
+                end = k - 1
+                break
+            k += 1
+        if _leading_comment(lines, start):
+            i = k
+            continue                      # 上方有注释：归属不明，不接管
+        try:
+            rows = _parse_standalone_block(lines[start + 1:end + 1])
+        except ProtectedShapeError:
+            i = k
+            continue
+        if rows:
+            row = rows[0]
+            if row.id == slug:
+                matches.append((start, end, row))
+        i = k
+    if not matches:
+        raise ProtectedShapeError(
+            f"{slug} 没有可接管的独立外部行：需是单个顶层 `- insert:` 元素、"
+            f"无 config/注释/多条目，且上方无注释。")
+    if len(matches) > 1:
+        raise ProtectedShapeError(f"{slug} 在补丁里出现多个候选外部行，接管有歧义。")
+    return matches[0]
+
+
+def _parse_standalone_block(lines: Sequence[str]) -> list[ManagedRow]:
+    """解析独立 insert 元素内部：仅接受模板化子条目（id/name[/disabled]）。"""
+    rows: list[ManagedRow] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i].rstrip("\r\n")
+        if not ln.strip():
+            i += 1
+            continue
+        if ln.startswith("#"):
+            raise ProtectedShapeError("元素内含注释，不接管")
+        m = re.match(r"^    - id: ([A-Za-z0-9-]+)$", ln)
+        if not m:
+            raise ProtectedShapeError(f"元素含未知内容：{ln!r}")
+        slug = m.group(1)
+        i += 1
+        if i >= n:
+            raise ProtectedShapeError("缺 name 行")
+        nm = re.match(r"^      name: '@dsh-user/([A-Za-z0-9-]+)'$",
+                      lines[i].rstrip("\r\n"))
+        if not nm or nm.group(1) != slug:
+            raise ProtectedShapeError("id/name 不自洽")
+        i += 1
+        disabled = False
+        if i < n and lines[i].rstrip("\r\n") == "      disabled: true":
+            disabled = True
+            i += 1
+        if i < n and lines[i].rstrip("\r\n").startswith(("      ", "    ")) \
+                and lines[i].strip() and not lines[i].lstrip().startswith("- "):
+            raise ProtectedShapeError(f"{slug} 含 config/未知字段")
+        if i < n and lines[i].lstrip().startswith("- ") \
+                and not lines[i].startswith("    - id:"):
+            raise ProtectedShapeError("多条目/复合元素，不接管")
+        rows.append(ManagedRow(id=slug, disabled=disabled))
+    return rows
+
+
+def adopt(home: Path, slug: str, *, project: Optional[Path] = None,
+          run_dump: Optional[Callable[[Path], DumpResult]] = None,
+          dsh_command: Optional[Sequence[str]] = None) -> Ledger:
+    """接管外部行：删除其独立顶层元素 → 并入台账/自有段 → 结构门 → 落盘。
+
+    前置：该行不在台账、元素"干净可接管"（find_standalone_element）。包目录
+    （共享锚）默认已存在（外部安装时同步过）；缺失会随下次重启暴露于激活门。
+    """
+    if not is_valid_slug(slug):
+        raise PluginError(f"非法 slug：{slug!r}")
+    ledger = ledger_load(home)
+    if ledger.row(slug) is not None:
+        raise PluginError(f"{slug} 已在台账（无需接管）。")
+    text = _read_patch(home)
+    start, end, row = find_standalone_element(text, slug)
+    lines = _raw_lines(text)
+    without = "".join(lines[:start] + lines[end + 1:])
+    new_ledger = ledger.upsert(ManagedRow(id=slug, disabled=row.disabled))
+    out = apply_managed(without, new_ledger.rows, expect=ledger.rows)
+    structure_gate(home, out, run_dump=run_dump, project=project,
+                   dsh_command=dsh_command)
+    _save_ledger_and_patch(home, new_ledger, out)
+    return new_ledger
+
+
+def list_archive_plugins(archive: Path) -> list[tuple[str, Validation]]:
+    """列出离线包（assets/plugins.tar.gz）里按规范打包的插件。
+
+    仅作打包/分发自检辅助：逐成员读取 package.json，校验 name 恰为
+    `@dsh-user/<目录名>`；文件存在性交由打包自检脚本保证（v0.2 pack_plugins.py）。
+    """
+    out: list[tuple[str, Validation]] = []
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            names = {m.name for m in tf.getmembers() if m.isfile()}
+            for member in tf.getmembers():
+                if not member.name.endswith("/package.json"):
+                    continue
+                slug = member.name.split("/")[0]
+                if not is_valid_slug(slug) or f"{slug}/package.json" != member.name:
+                    continue
+                try:
+                    fh = tf.extractfile(member)
+                    pkg = json.loads(fh.read().decode("utf-8")) if fh else {}
+                except (OSError, json.JSONDecodeError):
+                    continue
+                errs: list[str] = []
+                if pkg.get("name") != f"@dsh-user/{slug}":
+                    errs.append("name 与目录名不符")
+                if f"{slug}/lib/index.js" not in names:
+                    errs.append("缺 lib/index.js")
+                if pkg.get("dsh", {}).get("client") and \
+                        f"{slug}/lib/client.js" not in names:
+                    errs.append("声明 dsh.client 但缺 lib/client.js")
+                out.append((slug, Validation(ok=not errs, errors=tuple(errs))))
+    except (OSError, tarfile.TarError) as exc:
+        raise PluginError(f"无法读取离线包 {archive}：{exc}") from exc
+    out.sort(key=lambda t: t[0])
+    return out
 
 
 # ---------------------------------------------------------------- 状态合成

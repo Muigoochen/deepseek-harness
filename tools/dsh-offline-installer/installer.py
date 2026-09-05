@@ -936,7 +936,8 @@ class App(tk.Tk):
             row.pack(fill="x", pady=1)
             pending = self.plugin_pending.get(card.slug)
             mark = {"install": "待安装", "uninstall": "待卸载",
-                    "set_on": "待启用", "set_off": "待停用"}.get(pending, "")
+                    "set_on": "待启用", "set_off": "待停用",
+                    "adopt": "待接管"}.get(pending, "")
             tail = f"  [{mark}]" if mark else ""
             ttk.Label(row, text=card.slug, width=20,
                       font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
@@ -967,7 +968,9 @@ class App(tk.Tk):
             return [("停用", "set_off", True), ("卸载", "uninstall", True)]
         if st == "disabled":
             return [("启用", "set_on", True), ("卸载", "uninstall", True)]
-        return []          # external / first_party：只读展示
+        if st in ("external", "external-disabled"):
+            return [("接管", "adopt", True)]
+        return []          # first_party：只读展示
 
     def _plugin_act(self, slug: str, action: str) -> None:
         if self.plugin_busy or action == "none":
@@ -1023,6 +1026,9 @@ class App(tk.Tk):
                         pstore.set_enabled(home, slug, enabled=(act == "set_on"),
                                            project=project)
                         self._append(f"[插件] ✓ {'启用' if act == 'set_on' else '停用'} {slug}")
+                    elif act == "adopt":
+                        pstore.adopt(home, slug, project=project)
+                        self._append(f"[插件] ✓ 已接管 {slug}（转为助手管理）")
                 except (pstore.PluginError, pstore.ProtectedShapeError,
                         pstore.GateError) as exc:
                     ok_all = False
