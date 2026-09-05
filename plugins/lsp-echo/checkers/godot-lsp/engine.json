@@ -1,0 +1,6 @@
+{
+  "name": "godot-lsp",
+  "marker": "project.godot",
+  "extensions": [".gd", ".gdshader"],
+  "bridge": "godot-lsp.mjs"
+}

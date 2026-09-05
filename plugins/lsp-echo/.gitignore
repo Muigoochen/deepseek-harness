@@ -1,0 +1,10 @@
+# This plugin is zero-build: lib/ is source, not compiled output, so it must be
+# committed despite the parent plugins/.gitignore's `lib/` rule. Node modules,
+# build products, logs, temp files and the bridge .runtime dir stay ignored by
+# the parent rules (nothing here re-includes them).
+!lib/
+
+# Machine-local dev reference (real godot exe / default project paths); the
+# install script generates a machine godot-lsp.config.json instead of shipping
+# this, and checkers/*/.runtime never gets committed either.
+checkers/godot-lsp/godot-lsp.config.local-dev.json

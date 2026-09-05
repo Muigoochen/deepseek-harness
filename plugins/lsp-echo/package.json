@@ -1,0 +1,19 @@
+{
+  "name": "@dsh-user/lsp-echo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "description": "Self-contained language-server diagnostics echo for the DeepSeek Harness. Manages bundled checker engines (Godot LSP first) and auto-injects compile diagnostics into agent context after file edits. No npm dependencies; @deepseek-ai/* services resolve from the profile node_modules at load time.",
+  "license": "UNLICENSED"
+}

@@ -1,0 +1,88 @@
+{
+  "host": "127.0.0.1",
+  "port": 64117,
+  "file": "E:\\GodotProject\\xu_world\\Modules\\Equipment\\UI\\equipment_panel_simple.gd",
+  "uri": "file:///E:/GodotProject/xu_world/Modules/Equipment/UI/equipment_panel_simple.gd",
+  "serverProject": "E:/GodotProject/xu_world",
+  "phases": {
+    "clean": [],
+    "broken": {
+      "diagnostics": []
+    }
+  },
+  "events": [
+    {
+      "t": "2026-09-04T05:19:37.162Z",
+      "log": "connected to 127.0.0.1:64117"
+    },
+    {
+      "t": "2026-09-04T05:19:38.754Z",
+      "log": "server notification: window/showMessage"
+    },
+    {
+      "t": "2026-09-04T05:19:38.754Z",
+      "log": "server reports project: E:/GodotProject/xu_world"
+    },
+    {
+      "t": "2026-09-04T05:19:38.754Z",
+      "log": "initialize OK, server version: \"n/a\""
+    },
+    {
+      "t": "2026-09-04T05:19:38.758Z",
+      "log": "server capabilities notification received"
+    },
+    {
+      "t": "2026-09-04T05:19:42.758Z",
+      "log": "opening file:///E:/GodotProject/xu_world/Modules/Equipment/UI/equipment_panel_simple.gd (356 lines, clean content)"
+    },
+    {
+      "t": "2026-09-04T05:19:42.780Z",
+      "log": "publishDiagnostics file:///E%3A/GodotProject/xu_world/Modules/Equipment/UI/equipment_panel_simple.gd -> 0 item(s)"
+    },
+    {
+      "t": "2026-09-04T05:20:02.968Z",
+      "log": "phase CLEAN -> NO publish within window"
+    },
+    {
+      "t": "2026-09-04T05:20:02.968Z",
+      "log": "sending didChange with injected parse error (line 2)"
+    },
+    {
+      "t": "2026-09-04T05:20:02.976Z",
+      "log": "publishDiagnostics file:///E%3A/GodotProject/xu_world/Modules/Equipment/UI/equipment_panel_simple.gd -> 4 item(s)"
+    },
+    {
+      "t": "2026-09-04T05:20:02.976Z",
+      "log": "  diag [1] 2:16 gdscript (0) Expected expression for variable initial value after \"=\"."
+    },
+    {
+      "t": "2026-09-04T05:20:02.976Z",
+      "log": "  diag [1] 2:18 gdscript (0) Expected \"get\" or \"set\" for property declaration."
+    },
+    {
+      "t": "2026-09-04T05:20:02.976Z",
+      "log": "  diag [1] 6:1 gdscript (0) Unexpected \"extends\" in class body."
+    },
+    {
+      "t": "2026-09-04T05:20:02.976Z",
+      "log": "  diag [1] 7:1 gdscript (0) Unexpected \"class_name\" in class body."
+    },
+    {
+      "t": "2026-09-04T05:20:23.182Z",
+      "log": "phase BROKEN -> NO publish within window"
+    },
+    {
+      "t": "2026-09-04T05:20:23.203Z",
+      "log": "publishDiagnostics file:///E%3A/GodotProject/xu_world/Modules/Equipment/UI/equipment_panel_simple.gd -> 0 item(s)"
+    },
+    {
+      "t": "2026-09-04T05:20:24.696Z",
+      "log": "didClose sent"
+    },
+    {
+      "t": "2026-09-04T05:20:24.701Z",
+      "log": "shutdown: \"shutdown err: shutdown failed: {\\\"code\\\":-32601,\\\"message\\\":\\\"Method not found: shutdown\\\"}\""
+    }
+  ],
+  "connectedBootNote": 1
+}

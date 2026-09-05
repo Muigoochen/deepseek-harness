@@ -1,0 +1,8 @@
+# Append this to C:\Users\<you>\.dsh\profiles\web\cordis.patch.yml
+# (install.ps1 does this automatically and idempotently).
+- insert:
+    - id: lsp-echo
+      name: '@dsh-user/lsp-echo'
+      config:
+        projects:
+          - path: 'E:/GodotProject/xu_world'
