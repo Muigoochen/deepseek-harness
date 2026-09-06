@@ -425,13 +425,13 @@ class Engine:
 
 # ---------------------------------------------------------------- GUI
 class App(tk.Tk):
-    WIDTH, HEIGHT = 780, 640
+    WIDTH, HEIGHT = 860, 720
 
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
         self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
-        self.minsize(700, 560)
+        self.minsize(760, 600)
         self.mode = tk.StringVar(value="auto")
         self.mirror = tk.BooleanVar(value=True)
         self.busy = False
@@ -455,7 +455,6 @@ class App(tk.Tk):
         self.after(400, self._refresh_plugins)
 
     def _build_ui(self) -> None:
-        pad = {"padx": 12, "pady": 5}
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
 
@@ -464,8 +463,17 @@ class App(tk.Tk):
         ttk.Label(root, text="自动：检测环境 → Node → pnpm → 源码 → 依赖 → 构建 → 打开网页版",
                   foreground="#555").pack(anchor="w", pady=(0, 6))
 
+        # 分页：安装与启动 / 插件
+        nb = ttk.Notebook(root)
+        nb.pack(fill="both", expand=True, pady=(2, 0))
+        tab_run = ttk.Frame(nb, padding=8)
+        nb.add(tab_run, text="安装与启动")
+        tab_plug = ttk.Frame(nb, padding=8)
+        nb.add(tab_plug, text="插件")
+
+        # ---------------- Tab 1：安装与启动 ----------------
         # 安装方式
-        box = ttk.LabelFrame(root, text="安装方式", padding=8)
+        box = ttk.LabelFrame(tab_run, text="安装方式", padding=8)
         box.pack(fill="x", pady=4)
         hints = Engine.describe_assets()
         hint_txt = "已检测到离线数据：" if any(f for _, _, f in hints) else "未检测到离线数据（将走网络）："
@@ -483,7 +491,7 @@ class App(tk.Tk):
                         ).pack(anchor="w")
 
         # 按钮
-        btns = ttk.Frame(root)
+        btns = ttk.Frame(tab_run)
         btns.pack(fill="x", pady=6)
         self.btn_full = ttk.Button(btns, text="一键完整安装", command=self.on_full)
         self.btn_full.pack(side="left", ipadx=16, ipady=3)
@@ -495,11 +503,11 @@ class App(tk.Tk):
         self.btn_stop = ttk.Button(btns, text="⏹ 停止服务", command=self.on_stop_terminal,
                                    state="disabled")
         self.btn_stop.pack(side="left", padx=(0, 8), ipadx=16, ipady=3)
-        ttk.Label(btns, text="（终端输出在本窗口实时显示）",
+        ttk.Label(btns, text="（终端输出在下方日志区实时显示）",
                   foreground="#666").pack(side="left", padx=0)
 
         # 打开与复制
-        ops = ttk.LabelFrame(root, text="打开与复制（选浏览器 → 打开登录页 / 复制）", padding=8)
+        ops = ttk.LabelFrame(tab_run, text="打开与复制（选浏览器 → 打开登录页 / 复制）", padding=8)
         ops.pack(fill="x", pady=4)
         row = ttk.Frame(ops)
         row.pack(fill="x")
@@ -521,22 +529,23 @@ class App(tk.Tk):
         ttk.Label(ops, text="用「▶ 在窗口内运行 dsh web」启动后，可在此再次打开或复制带 token 的登录地址。",
                   foreground="#666").pack(anchor="w", pady=(6, 0))
 
-        self._build_plugin_ui(root)
-
-        # 日志
-        lf = ttk.LabelFrame(root, text="日志")
-        lf.pack(fill="both", expand=True)
-        self.txt = tk.Text(lf, height=14, wrap="word", state="disabled",
+        # 日志（终端）
+        lf = ttk.LabelFrame(tab_run, text="日志（终端输出实时显示在此）")
+        lf.pack(fill="both", expand=True, pady=(4, 0))
+        self.txt = tk.Text(lf, height=12, wrap="word", state="disabled",
                            font=("Microsoft YaHei UI", 9))
         sb = ttk.Scrollbar(lf, command=self.txt.yview)
         self.txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.txt.pack(fill="both", expand=True)
 
+        # ---------------- Tab 2：插件 ----------------
+        self._build_plugin_ui(tab_plug)
+
         self.status = ttk.Label(root, text="就绪", foreground="#1a6b1a")
         self.status.pack(anchor="w", pady=(6, 0))
 
-        self._append("欢迎！选择安装方式后点击「一键完整安装」。")
+        self._append("欢迎！安装/启动/服务日志在「安装与启动」页；插件管理在「插件」页。")
         self.log = self._append
 
     def _append(self, msg: str) -> None:
@@ -549,6 +558,11 @@ class App(tk.Tk):
             self.after(0, write)
         except Exception:  # noqa: BLE001
             pass
+
+    def _plog(self, msg: str) -> None:
+        """插件操作消息：UI 日志区 + installer.log 双写。"""
+        log_line(msg)
+        self._append(msg)
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
@@ -848,8 +862,8 @@ class App(tk.Tk):
     }
 
     def _build_plugin_ui(self, root: ttk.Frame) -> None:
-        box = ttk.LabelFrame(root, text="插件（@dsh-user 插件管理 v0.1）", padding=8)
-        box.pack(fill="x", pady=4)
+        box = ttk.LabelFrame(root, text="插件（@dsh-user 插件管理）", padding=8)
+        box.pack(fill="both", expand=True)
         bar = ttk.Frame(box)
         bar.pack(fill="x")
         ttk.Button(bar, text="重新扫描", command=self._refresh_plugins,
@@ -859,11 +873,13 @@ class App(tk.Tk):
         self.plugin_hint_lbl = ttk.Label(bar, text="扫描中…", foreground="#666")
         self.plugin_hint_lbl.pack(side="left", padx=6)
         self.plugin_rows = ttk.Frame(box)
-        self.plugin_rows.pack(fill="x", pady=(6, 0))
+        self.plugin_rows.pack(fill="both", expand=True, pady=(6, 0))
         self.plugin_btns: list[ttk.Button] = []
         self.plugin_note = ttk.Label(
-            box, text="外部/内置行 v0.1 只读展示；改动为草稿，点「保存」才落盘并重启验证。",
-            foreground="#888", font=("Microsoft YaHei UI", 8))
+            box, text="外部行可【接管】（限无 config 的独立行）；内置行只读。"
+                      "改动为草稿，点「保存」落盘；结果提示见窗口底部状态栏与弹窗，"
+                      "详情写入 installer.log。",
+            foreground="#888", font=("Microsoft YaHei UI", 8), justify="left")
         self.plugin_note.pack(anchor="w", pady=(4, 0))
         self.btn_save = ttk.Button(box, text="全部保存并重启网页版",
                                    command=self.on_plugin_save, state="disabled")
@@ -1001,6 +1017,7 @@ class App(tk.Tk):
     def _plugin_save_worker(self) -> None:
         home, project = self.plugin_home_dir, self.plugin_project
         ok_all = True
+        fail_msgs: list[str] = []
         was_running = self.web_proc is not None and self.web_proc.poll() is None
         try:
             if home is None or project is None:
@@ -1018,45 +1035,56 @@ class App(tk.Tk):
                         if src is None:
                             raise pstore.PluginError(f"{slug} 不在来源目录中")
                         pstore.install(home, src, project=project)
-                        self._append(f"[插件] ✓ 已安装 {slug}")
+                        self._plog(f"[插件] ✓ 已安装 {slug}")
                     elif act == "uninstall":
                         pstore.uninstall(home, slug, project=project)
-                        self._append(f"[插件] ✓ 已卸载 {slug}")
+                        self._plog(f"[插件] ✓ 已卸载 {slug}")
                     elif act in ("set_on", "set_off"):
                         pstore.set_enabled(home, slug, enabled=(act == "set_on"),
                                            project=project)
-                        self._append(f"[插件] ✓ {'启用' if act == 'set_on' else '停用'} {slug}")
+                        self._plog(f"[插件] ✓ {'启用' if act == 'set_on' else '停用'} {slug}")
                     elif act == "adopt":
                         pstore.adopt(home, slug, project=project)
-                        self._append(f"[插件] ✓ 已接管 {slug}（转为助手管理）")
+                        self._plog(f"[插件] ✓ 已接管 {slug}（转为助手管理）")
                 except (pstore.PluginError, pstore.ProtectedShapeError,
                         pstore.GateError) as exc:
                     ok_all = False
-                    self._append(f"[插件] ✗ {slug}：{exc}")
+                    fail_msgs.append(f"{slug}：{exc}")
+                    self._plog(f"[插件] ✗ {slug}：{exc}")
                     break
             self.rollback_armed = ok_all and any(
                 a in ("install", "set_on") for _, a in pending)
         except Exception as exc:  # noqa: BLE001
             ok_all = False
-            self._append(f"[插件] ✗ 保存失败：{exc}")
+            fail_msgs.append(str(exc))
+            self._plog(f"[插件] ✗ 保存失败：{exc}")
         finally:
-            self.after(0, lambda: self._plugin_save_done(ok_all, was_running))
+            self.after(0, lambda: self._plugin_save_done(ok_all, was_running,
+                                                         fail_msgs))
 
-    def _plugin_save_done(self, ok_all: bool, was_running: bool) -> None:
+    def _plugin_save_done(self, ok_all: bool, was_running: bool,
+                          fail_msgs: list[str]) -> None:
         self.plugin_pending.clear()
         self._set_plugin_busy(False)
-        if ok_all and (was_running or self.rollback_armed):
+        if not ok_all:
+            self._status("插件保存失败", "#b00000")
+            messagebox.showerror(
+                "插件保存失败",
+                "\n".join(fail_msgs) + "\n\n详情见 installer.log 与「安装与启动」页日志区。")
+            self._refresh_plugins()
+            return
+        if was_running or self.rollback_armed:
             # 确定性验证：重启 + 健康检查（失败自动回滚）
-            self._append("[插件] 正在重启网页版以确认生效…")
+            self._plog("[插件] 正在重启网页版以确认生效…")
             self._stop_web_internal(quiet=True)
             if self._launch_web():
                 self._activation_checks = 0
                 self.after(600, self._activation_poll)
-        elif ok_all:
-            self._status("已保存（补丁已热应用；未运行服务，下次启动生效）")
-            self._append("[插件] 已保存：改动已热应用；下次启动生效。")
+            else:
+                self._status("补丁已保存，但网页版启动失败（见弹窗/日志）", "#b00000")
         else:
-            self._status("保存失败，见日志", "#b00000")
+            self._status("已保存（补丁已热应用；未运行服务，下次启动生效）")
+            self._plog("[插件] 已保存：改动已热应用；下次启动生效。")
         self._refresh_plugins()
 
     def _activation_poll(self) -> None:
