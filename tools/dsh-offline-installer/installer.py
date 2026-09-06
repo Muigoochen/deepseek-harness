@@ -1151,12 +1151,15 @@ class App(tk.Tk):
                 if errs:
                     raise pstore.PluginError(
                         f"{name or value} 校验未通过：\n" + "\n".join(errs))
-                self._plog(f"[市场] ✓ 校验通过：{name}")
+                _n, notes = pstore.bundle_notes(local)
+                note = f"；{ '；'.join(notes) }" if notes else ""
+                self._plog(f"[市场] ✓ 校验通过：{name}{note}")
                 self._status(f"校验通过：{name}")
             elif action == "check_update":
                 spec = pstore._spec_pkg_name(value)
                 ver = pstore.bundle_latest_version(spec)
-                cur = self._local_version(spec, project)
+                cur = (self._local_version(spec, project)
+                       or pstore.bundle_installed_version(home, spec))
                 self.market_updates[value] = \
                     "outdated" if (ver and cur and ver != cur) else "current"
                 self._plog(f"[市场] 更新检查 {spec}：latest={ver or '?'} 本地={cur or '?'}")
@@ -1200,8 +1203,8 @@ class App(tk.Tk):
             if not pstore._pkg_main_present(cand):
                 self._plog(f"[包] {cand.name} 未构建，用 pnpm 构建（需要 devDeps）…")
                 pstore.bundle_build(cand)
-            if not (cand / "lib" / "index.js").exists():
-                raise pstore.PluginError(f"{cand.name} 构建后仍缺 lib/index.js")
+            if not pstore._pkg_main_present(cand):
+                raise pstore.PluginError(f"{cand.name} 构建后仍缺入口 {pkg.get('main') or 'lib/index.js'}")
             pkg = pstore._pkg_json(cand) or {}
             name = pstore._bundle_name(cand)
             tgz_out = ASSETS / ".cache" / f"{name}-{pkg.get('version', '')}.tgz"

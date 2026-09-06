@@ -231,9 +231,12 @@ class MarketTest(unittest.TestCase):
         name, errs = ps.bundle_check(good)
         self.assertEqual(name, "ok")
         self.assertEqual(errs, [])
+        # 未构建不算错误（安装前置合格），只在 notes 提示
         broken = make_bundle(Path(tempfile.mkdtemp()), "broken", built=False, patch=True)
         _, errs = ps.bundle_check(broken)
-        self.assertTrue(any("未构建" in x for x in errs))
+        self.assertEqual(errs, [])
+        _n, notes = ps.bundle_notes(broken)
+        self.assertTrue(any("未构建" in x for x in notes))
         tgz = Path(tempfile.mkdtemp()) / "x.tgz"
         ps.bundle_pack(good, tgz, name="ok", version="1")
         _, errs = ps.bundle_check(tgz)
@@ -273,6 +276,31 @@ class MarketTest(unittest.TestCase):
         name = ps.bundle_update(home, "dshmarket", project=Path.home(), run_dsh=fake)
         self.assertEqual(name, "dshmarket")
         self.assertEqual(fake.calls[0][:2], ["add", "dshmarket@latest"])
+
+    def test_bundle_check_patch_file_missing(self) -> None:
+        d = make_bundle(Path(tempfile.mkdtemp()), "odd", built=True, patch=True)
+        # 让 patch 指向不存在的文件
+        pkg = (json.loads((d / "package.json").read_text(encoding="utf-8")) or {})
+        pkg["dsh"]["bundle"]["patch"] = "./patch/other.yml"
+        (d / "package.json").write_text(json.dumps(pkg), encoding="utf-8")
+        _, errs = ps.bundle_check(d)
+        self.assertTrue(any("patch/other.yml" in x for x in errs))
+
+    def test_install_reinstall_same_name_succeeds(self) -> None:
+        home = make_home()
+        ps.profile_manifest_write(home, {"dsh": {"profile": {
+            "bundles": ["dshmarket"]}}})
+        fake = FakeDsh(home)
+        src = make_bundle(Path(tempfile.mkdtemp()), "dshmarket", built=True, patch=True)
+        name = ps.bundle_install(home, src, run_dsh=fake)
+        self.assertEqual(name, "dshmarket")       # 同名重装不误判失败
+        self.assertIn("dshmarket", dict(ps.bundle_installed(home)))
+
+    def test_installed_version(self) -> None:
+        home = make_home()
+        ps.profile_manifest_write(home, {"dependencies": {"dshmarket": "1.44.0"}})
+        self.assertEqual(ps.bundle_installed_version(home, "dshmarket"), "1.44.0")
+        self.assertEqual(ps.bundle_installed_version(home, "nope"), "")
 
 
 if __name__ == "__main__":

@@ -1181,22 +1181,40 @@ def bundle_build(dir_: Path, *,
         raise PluginError(
             "插件构建失败：\n" + _build_report(o, e)
             + "\n\n若为依赖/类型问题，可改用 npm 包安装：`dsh plugin add <包名>`（用预构建产物，无需本地构建）。")
-    return (dir_ / "lib" / "index.js").exists()
+    return _pkg_main_present(dir_)
 
 
-def _backup_manifest(home: Path) -> tuple[Path, Optional[bytes]]:
+def bundle_installed_version(home: Path, name: str) -> str:
+    """从 profile package.json 的 dependencies 读已安装版本（无则 ''）。"""
+    data = profile_manifest(home)
+    deps = data.get("dependencies") or {}
+    v = deps.get(name)
+    return v if isinstance(v, str) else ""
+
+
+def _backup_manifest(home: Path) -> tuple[Path, Optional[bytes], Path, Optional[bytes]]:
+    """备份 profile 的 package.json 与 pnpm-lock.yaml（add/remove 会同时改动它们）。"""
     p = _web_pkg_json(home)
-    return p, (p.read_bytes() if p.exists() else None)
+    lock = p.parent / "pnpm-lock.yaml"
+    return p, (p.read_bytes() if p.exists() else None), \
+        lock, (lock.read_bytes() if lock.exists() else None)
 
 
-def _restore_manifest(home: Path, backup: tuple[Path, Optional[bytes]]) -> None:
-    p, data = backup
+def _restore_manifest(home: Path,
+                      backup: tuple[Path, Optional[bytes], Path, Optional[bytes]]) -> None:
+    p, data, lock, ldata = backup
     if data is None:
         if p.exists():
             p.unlink()
-        return
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(data)
+    else:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+    if ldata is None:
+        if lock.exists():
+            lock.unlink()
+    else:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_bytes(ldata)
 
 
 def _dsh_fail_msg(code: int, out: str, err: str, args: Sequence[str]) -> str:
@@ -1260,11 +1278,12 @@ def bundle_install(home: Path, source: "Path | str", *,
     if code != 0:
         _restore_manifest(home, backup)
         raise PluginError(_dsh_fail_msg(code, out, err, argv))
-    added = {n for n, _ in bundle_installed(home)} - before
-    if not added:
+    after_names = {n for n, _ in bundle_installed(home)}
+    # 成功判定：目标包名出现在 bundles（覆盖全新安装 + 同名重装），或确有新增
+    if not ((expected and expected in after_names) or (after_names - before)):
         _restore_manifest(home, backup)
-        raise PluginError(f"安装后未发现新增 bundle（预期 {expected}），见日志")
-    return sorted(added)[0]
+        raise PluginError(f"安装后未在 dsh.profile.bundles 发现 {expected}（见日志）")
+    return expected or sorted(after_names - before)[0]
 
 
 def bundle_remove(home: Path, name: str, *, project: Optional[Path] = None,
@@ -1357,61 +1376,85 @@ def _pkg_from_tgz(tgz: Path) -> Optional[dict]:
 
 
 def _client_resolved(pkg: dict) -> Optional[str]:
-    """dsh.client 客户端模块路径：优先 exports['./client']；否则常见位置。"""
+    """dsh.client 客户端模块路径：优先 exports['./client']。"""
     exp = pkg.get("exports", {})
     if isinstance(exp, dict) and isinstance(exp.get("./client"), str):
         return exp["./client"].lstrip("./")
     return None
 
 
+def _client_present_dir(pkg: dict, source: Path) -> bool:
+    cpath = _client_resolved(pkg)
+    if cpath is not None:
+        return (source / cpath).exists()
+    return any((source / c).exists() for c in ("lib/client.js", "client/client.js"))
+
+
+def _client_present_tgz(pkg: dict, names: set[str]) -> bool:
+    cpath = _client_resolved(pkg)
+    if cpath is not None:
+        return f"package/{cpath}" in names
+    return any(f"package/{c}" in names for c in ("lib/client.js", "client/client.js"))
+
+
+def _read_pkg(source: Path) -> Optional[dict]:
+    return _pkg_json(source) if source.is_dir() else _pkg_from_tgz(source)
+
+
 def bundle_check(source: Path) -> tuple[str, list[str]]:
-    """校验 bundle 源（目录或 tgz）：返回 (包名, 错误列表)。"""
-    if source.is_dir():
-        pkg = _pkg_json(source)
-        try:
-            name = _bundle_name(source)
-        except PluginError:
-            name = ""
-    else:
-        pkg = _pkg_from_tgz(source)
-        name = (pkg or {}).get("name", "")
+    """校验 bundle 的**安装前置要求**（缺了会导致 `dsh plugin add` 不作为 bundle 层/激活失败）。
+
+    只报真正的阻断项：缺 package.json、未声明 dsh.bundle.patch、缺 cordis.patch.yml。
+    「未构建 lib/」「客户端未产出」属于**状态**，见 bundle_notes，不算错误——装 registry
+    预构建包或安装时自动构建会补齐。
+    """
+    pkg = _read_pkg(source)
+    name = (pkg or {}).get("name", "")
     errs: list[str] = []
     if pkg is None:
         return name, ["缺 package.json"]
-    if not pkg.get("dsh", {}).get("bundle", {}).get("patch"):
-        errs.append("未声明 dsh.bundle.patch（不是 bundle 插件）")
-    has_client = bool(pkg.get("dsh", {}).get("client"))
+    patch = (pkg.get("dsh", {}).get("bundle", {}) or {}).get("patch")
+    if not patch:
+        errs.append("未声明 dsh.bundle.patch（不能作为 bundle 层激活，只会当普通依赖装）")
     if source.is_dir():
+        if patch is not None and not (source / patch.lstrip("./")).exists():
+            errs.append(f"dsh.bundle.patch 指向 {patch} 不存在")
         if not (source / "cordis.patch.yml").exists():
-            errs.append("缺 cordis.patch.yml")
-        main = (pkg.get("main") or "lib/index.js").lstrip("./")
-        if not (source / main).exists():
-            errs.append(f"未构建：缺入口 {main}")
-        elif has_client:
-            cpath = _client_resolved(pkg)
-            if cpath is not None:
-                if not (source / cpath).exists():
-                    errs.append(f"声明 dsh.client 但缺 {cpath}")
-            elif not any((source / c).exists()
-                         for c in ("lib/client.js", "client/client.js")):
-                errs.append("声明 dsh.client 但缺客户端模块（lib/client.js 或 client/client.js）")
+            errs.append("缺 cordis.patch.yml（bundle.patch 引用但缺失，激活会失败）")
     else:
         with tarfile.open(source, "r:gz") as tf:
             names = {m.name for m in tf.getmembers()}
+        if patch is not None and f"package/{patch.lstrip('./')}" not in names:
+            errs.append(f"tgz 缺 package/{patch.lstrip('./')}")
         if "package/cordis.patch.yml" not in names:
             errs.append("tgz 缺 package/cordis.patch.yml")
+    return name, errs
+
+
+def bundle_notes(source: Path) -> tuple[str, list[str]]:
+    """返回 (包名, 非阻断说明)：未构建、客户端未产出等**状态**提示（不是错误）。"""
+    pkg = _read_pkg(source)
+    name = (pkg or {}).get("name", "")
+    if pkg is None:
+        return name, []
+    notes: list[str] = []
+    has_client = bool(pkg.get("dsh", {}).get("client"))
+    if source.is_dir():
+        main = (pkg.get("main") or "lib/index.js").lstrip("./")
+        if not (source / main).exists():
+            notes.append(f"本地未构建（缺入口 {main}）：安装时会自动构建或走 npm 预构建包")
+        elif has_client and not _client_present_dir(pkg, source):
+            cpath = _client_resolved(pkg) or ""
+            notes.append(f"客户端模块 {cpath or '未知'} 未检出（装好会随包带上）")
+    else:
+        with tarfile.open(source, "r:gz") as tf:
+            names = {m.name for m in tf.getmembers()}
         main = (pkg.get("main") or "lib/index.js").lstrip("./")
         if f"package/{main}" not in names:
-            errs.append(f"tgz 缺 package/{main}（未构建）")
-        elif has_client:
-            cpath = _client_resolved(pkg)
-            if cpath is not None:
-                if f"package/{cpath}" not in names:
-                    errs.append(f"tgz 缺 package/{cpath}")
-            elif not any(f"package/{c}" in names
-                         for c in ("lib/client.js", "client/client.js")):
-                errs.append("tgz 缺客户端模块（lib/client.js 或 client/client.js）")
-    return name, errs
+            notes.append(f"tgz 缺 package/{main}")
+        elif has_client and not _client_present_tgz(pkg, names):
+            notes.append("tgz 缺客户端模块")
+    return name, notes
 
 
 def bundle_latest_version(spec: str, *,
