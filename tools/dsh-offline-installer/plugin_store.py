@@ -1099,6 +1099,12 @@ def _tail(o: str, e: str) -> str:
     return "\n".join(lines[-8:])
 
 
+def _build_report(o: str, e: str) -> str:
+    """构建失败：合并 stdout+stderr，取末尾较完整的一段（tsc 诊断通常在 stdout）。"""
+    lines = (e or "").strip().splitlines() + (o or "").strip().splitlines()
+    return "\n".join([ln for ln in lines if ln.strip()][-24:])
+
+
 def bundle_fetch(spec: str, dest_dir: Path, *,
                  run_git: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
                  ) -> Path:
@@ -1137,6 +1143,19 @@ def _spec_name(spec: str) -> str:
     return spec
 
 
+def _spec_pkg_name(spec: str) -> str:
+    """规格对应的**npm 包名**（用于提示；真正判定用安装前后 bundle 集合差）。"""
+    for c in CURATED_BUNDLES:
+        if spec in (c["name"], c["npm"]):
+            return c["npm"]
+    if spec.startswith("github:"):
+        tail = spec[7:].rstrip("/").split("/")[1] if "/" in spec[7:] else spec[7:]
+        return tail.lower()
+    if "://" in spec:
+        return spec.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git").lower()
+    return spec
+
+
 def bundle_build(dir_: Path, *,
                  run_pnpm: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
                  ) -> bool:
@@ -1159,7 +1178,9 @@ def bundle_build(dir_: Path, *,
             raise PluginError(f"插件依赖安装失败：\n{_tail(o, e)}")
     code, o, e = run([env_pnpm, "run", "build"])
     if code != 0:
-        raise PluginError(f"插件构建失败：\n{_tail(o, e)}")
+        raise PluginError(
+            "插件构建失败：\n" + _build_report(o, e)
+            + "\n\n若为依赖/类型问题，可改用 npm 包安装：`dsh plugin add <包名>`（用预构建产物，无需本地构建）。")
     return (dir_ / "lib" / "index.js").exists()
 
 
@@ -1205,31 +1226,45 @@ def _run_dsh_plugin(args: Sequence[str], *, project: Path,
     return r.returncode, r.stdout, r.stderr
 
 
-def bundle_install(home: Path, source: Path, *, project: Optional[Path] = None,
+def bundle_install(home: Path, source: "Path | str", *,
+                   project: Optional[Path] = None,
                    run_dsh: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
                    dsh_command: Optional[Sequence[str]] = None,
                    env: Optional[dict] = None) -> str:
-    """真实安装 bundle：`dsh plugin --profile web add <绝对路径>`，备份可回滚。"""
-    source = Path(source)
-    if not source.exists():
-        raise PluginError(f"插件源不存在：{source}")
-    name = _bundle_name(source)
-    if not name:
-        raise PluginError(f"无法识别 {source} 的包名")
-    if name in BUNDLE_BUILTIN:
-        raise PluginError(f"{name} 是内置模板 bundle，无需安装")
+    """真实安装 bundle：`dsh plugin --profile web add <源>`，备份可回滚。
+
+    source 若是存在的本地目录/.tgz → 以绝对路径安装；否则视为**远程规格**
+    （npm 包名 / github:xxx / git URL），原样转发给 `dsh plugin add`
+    （走 registry，无需本地构建）。成功判定 = 安装前后 `dsh.profile.bundles`
+    出现新 bundle。
+    """
+    before = {n for n, _ in bundle_installed(home)}
+    if isinstance(source, str) and not Path(source).exists():
+        spec = source
+        expected = _spec_pkg_name(spec)
+        argv = ["add", spec]
+    else:
+        src = Path(source)
+        if not src.exists():
+            raise PluginError(f"插件源不存在：{src}")
+        expected = _bundle_name(src)
+        if not expected:
+            raise PluginError(f"无法识别 {src} 的包名")
+        argv = ["add", str(src.resolve())]
+    if expected and expected in BUNDLE_BUILTIN:
+        raise PluginError(f"{expected} 是内置模板 bundle，无需安装")
     backup = _backup_manifest(home)
     project = project or Path.cwd()
-    argv = ["add", str(source.resolve())]
     code, out, err = _run_dsh_plugin(argv, project=project, run_dsh=run_dsh,
                                      dsh_command=dsh_command, env=env)
     if code != 0:
         _restore_manifest(home, backup)
         raise PluginError(_dsh_fail_msg(code, out, err, argv))
-    if name not in {n for n, _ in bundle_installed(home)}:
+    added = {n for n, _ in bundle_installed(home)} - before
+    if not added:
         _restore_manifest(home, backup)
-        raise PluginError(f"安装后未在 dsh.profile.bundles 发现 {name}（见日志）")
-    return name
+        raise PluginError(f"安装后未发现新增 bundle（预期 {expected}），见日志")
+    return sorted(added)[0]
 
 
 def bundle_remove(home: Path, name: str, *, project: Optional[Path] = None,

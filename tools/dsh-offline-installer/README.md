@@ -31,12 +31,13 @@
      （写盘前自动跑结构门校验；若补丁写坏或未生效，自动回滚 `.bak` 再重启）
    - v0.1 限制：不改插件 config；内置行只读展示；详见 docs/插件管理-设计.md
 8. 「市场/包插件（dsh plugin 安装）」：装 `dsh plugin add` 那一类 bundle 插件（如 dsh-market）：
-   - 源填本地目录 / `.tgz` / 收录名（内置 dsh-market、dsh-lsp-actions）/ git URL
-   - 小助手一条龙：本地没有则抓取 → 缺 `lib/` 则用自带 pnpm 构建 → 打包成 tgz →
-     `dsh plugin --profile web add <tgz>` 装进 profile → 核对 `dsh.profile.bundles` → 重启验证
+   - 源填本地目录 / `.tgz` / 收录名（内置 dsh-market、dsh-lsp-actions）/ npm 包名 / git URL
+   - **收录名 / npm 包名 / URL 走 registry 直接安装**（用预构建产物，不克隆不构建）；
+     本地目录缺 `lib/` 才会用自带 pnpm 构建，失败会给出完整报错并提示改用 npm 包
+   - `dsh plugin --profile web add <源>` 装进 profile → 核对 `dsh.profile.bundles` 新增 → 重启验证
    - 已装的 bundle 会列出并支持【移除】（内置 `@deepseek-ai/dsh-base` 等标「内置」不可删）
    - 安装是**真实写入** `$DSH_HOME/profiles/web`（会备份 package.json、失败自动回滚）；
-     需要网络与 pnpm 的步骤（抓取/构建/装运行依赖）在目标机上跑
+     需要网络与 pnpm 的步骤（registry 拉取/构建）在目标机上跑
 
 ## 目录结构
 

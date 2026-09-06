@@ -1137,27 +1137,28 @@ class App(tk.Tk):
             self.after(0, self._refresh_bundles)
             self._set_plugin_busy(False)
 
-    def _resolve_bundle_source(self, spec: str, project: Path) -> Path:
+    def _resolve_bundle_source(self, spec: str, project: Path) -> "Path | str":
         cand = Path(spec)
+        # 本地目录（含 package.json）：缺 lib 先构建，再打包成 tgz
         if cand.exists() and (cand / "package.json").exists():
-            return cand
+            if not pstore._pkg_main_present(cand):
+                self._plog(f"[包] {cand.name} 未构建，用 pnpm 构建（需要 devDeps）…")
+                pstore.bundle_build(cand)
+            if not (cand / "lib" / "index.js").exists():
+                raise pstore.PluginError(f"{cand.name} 构建后仍缺 lib/index.js")
+            pkg = pstore._pkg_json(cand) or {}
+            name = pstore._bundle_name(cand)
+            tgz_out = ASSETS / ".cache" / f"{name}-{pkg.get('version', '')}.tgz"
+            pstore.bundle_pack(cand, tgz_out, name=name,
+                               version=pkg.get("version", ""))
+            return tgz_out
         if cand.exists() and cand.suffix == ".tgz":
             return cand
         tgz = ASSETS / f"{spec}.tgz"
         if tgz.exists():
             return tgz
-        # 收录名/URL → 抓取到项目 plugins/，缺 lib 则构建，再打包
-        self._plog(f"[包] {spec} 本地未找到，尝试从仓库抓取…")
-        dest = pstore.bundle_fetch(spec, project / "plugins")
-        if not (dest / "lib" / "index.js").exists():
-            self._plog(f"[包] {spec} 未构建，用 pnpm 构建（需能装 devDeps）…")
-            pstore.bundle_build(dest)
-        pkg = pstore._pkg_json(dest) or {}
-        name = pstore._bundle_name(dest)
-        tgz_out = ASSETS / ".cache" / f"{name}-{pkg.get('version', '')}.tgz"
-        pstore.bundle_pack(dest, tgz_out, name=name,
-                           version=pkg.get("version", ""))
-        return tgz_out
+        # 收录名/URL/npm 包名 → 交给 dsh plugin add 走 registry（预构建产物，不克隆不构建）
+        return spec
 
     def _bundle_env(self) -> dict:
         env = dict(os.environ)

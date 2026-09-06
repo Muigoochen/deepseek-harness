@@ -55,7 +55,16 @@ class FakeDsh:
         if self.fail_code:
             return self.fail_code, "", "pnpm failed"
         verb = args[0]
-        name = (ps._bundle_name(Path(args[1])) if verb == "add" else args[1])
+        if verb == "add":
+            p = Path(args[1])
+            if p.exists() and (p / "package.json").exists():
+                name = ps._bundle_name(p)
+            elif p.exists() and p.suffix == ".tgz":
+                name = ps._bundle_name(p)
+            else:
+                name = args[1]           # 远程规格：包名
+        else:
+            name = args[1]
         data = self._manifest()
         bundles = data.setdefault("dsh", {}).setdefault("profile", {}) \
             .setdefault("bundles", [])
@@ -132,6 +141,14 @@ class InstallRemoveTest(unittest.TestCase):
         self.assertEqual(name, "dshmarket")
         self.assertIn("dshmarket", dict(ps.bundle_installed(home)))
         self.assertEqual(fake.calls[0][:2], ["add", str(src.resolve())])
+
+    def test_install_remote_spec(self) -> None:
+        home = make_home()
+        fake = FakeDsh(home)
+        name = ps.bundle_install(home, "dshmarket", project=Path.home(),
+                                 run_dsh=fake)
+        self.assertEqual(name, "dshmarket")
+        self.assertEqual(fake.calls[0][:2], ["add", "dshmarket"])
 
     def test_install_absent_rolls_back(self) -> None:
         home = make_home()
