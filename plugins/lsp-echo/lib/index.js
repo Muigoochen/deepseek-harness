@@ -714,6 +714,39 @@ export function apply(ctx, config) {
           }
           return json(res, 200, { ok: true, candidates: out })
         }
+        // Diagnostics is a pure read of the latest snapshot and must not depend
+        // on engine resolution: a registered project with no engines bound (an
+        // empty manual shell) still polls its header badge every 3 s — refusing
+        // it with 400 there spams the browser console on every tick.
+        if (action === 'diagnostics') {
+          let abs
+          if (project) abs = path.resolve(project)
+          else {
+            const first = [...known.values()][0]
+            abs = first && first.path
+          }
+          if (!abs) return json(res, 400, { ok: false, error: 'diagnostics requires project=<abs> (none registered)' })
+          try {
+            const raw = fs.readFileSync(diagnosticsPath(abs), 'utf8')
+            const parsed = JSON.parse(raw)
+            return json(res, 200, {
+              ok: true,
+              project: abs,
+              updated_at: parsed.updated_at || null,
+              summary: parsed.summary || null,
+              files: parsed.files || {},
+            })
+          } catch {
+            return json(res, 200, {
+              ok: true,
+              project: abs,
+              updated_at: null,
+              summary: null,
+              files: {},
+              empty: true,
+            })
+          }
+        }
 
         // Helpers shared by the project-edit actions below.
         const requireProject = (p) => {
@@ -904,30 +937,6 @@ export function apply(ctx, config) {
             project: proj,
             summary: payload && payload.summary ? payload.summary : { files_checked: 0, errors: 0, warnings: 0, files_with_errors: [] },
           })
-        } else if (action === 'diagnostics') {
-          // Read the latest diagnostics snapshot for a project (GUI view).
-          // Pure read: never starts an engine. Returns the stored JSON or an
-          // explicit "no snapshot yet" state so the GUI can prompt a baseline.
-          try {
-            const raw = fs.readFileSync(diagnosticsPath(proj), 'utf8')
-            const parsed = JSON.parse(raw)
-            return json(res, 200, {
-              ok: true,
-              project: proj,
-              updated_at: parsed.updated_at || null,
-              summary: parsed.summary || null,
-              files: parsed.files || {},
-            })
-          } catch {
-            return json(res, 200, {
-              ok: true,
-              project: proj,
-              updated_at: null,
-              summary: null,
-              files: {},
-              empty: true,
-            })
-          }
         } else {
           return json(res, 400, { ok: false, error: `unknown action ${action}` })
         }
