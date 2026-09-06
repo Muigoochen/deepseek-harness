@@ -1025,6 +1025,16 @@ export function apply(ctx, config) {
     trace('pre-step', agentId, `checked ${checked} changed file(s): ${totalErrors} error(s); inject=${!!text}`)
     if (!text) {
       lastInjected.set(rec.path, { text: '', at: Date.now() })
+      // 本轮确有改动文件被引擎检查且全部通过 → 仍注入一句确认,AI 知道
+      // 改动是干净的,不必自己再调工具去查。
+      if (checked > 0) {
+        const okText = `[lsp-echo] 已检查本轮改动的 ${checked} 个文件：编译通过，0 错误。`
+        const okMsg = createUserMessage({
+          content: [{ type: 'text', text: okText }],
+          source: { kind: 'plugin', plugin: name, form: 'snapshot', sections: [{ name, text: okText }] },
+        })
+        return { ...decision, messages: [...(decision.messages || []), okMsg] }
+      }
       return decision
     }
     const prev = lastInjected.get(rec.path)
@@ -1112,11 +1122,13 @@ export function apply(ctx, config) {
       return out
     }
     const noFilesDone = () => {
+      // 项目没有任何引擎文件(空项目/误绑):自动 baseline 不往对话注入
+      // 「没有可检查的文件」这类无信息量消息,只 toast 提示一次。
       state.status = 'done'
-      state.doneText = '[lsp-echo] 首次全量诊断完成：项目中没有可检查的文件'
-      trace('baseline', 'done', 'no files')
+      state.doneText = ''
+      trace('baseline', 'done', 'no engine files — auto baseline skipped, nothing injected')
       dismissToast(`lsp-echo-baseline:${key}`)
-      showToast('info', '首次全量诊断完成', '项目中没有可检查的文件', `lsp-echo-baseline-done:${key}`, 4000)
+      showToast('info', '首次全量诊断完成', '项目中没有可检查的文件(无引擎文件,自动诊断已跳过)', `lsp-echo-baseline-done:${key}`, 4000)
     }
     // Single engine: unchanged fast path (one sweep, original report text).
     if (boundEngines.length === 1) {
