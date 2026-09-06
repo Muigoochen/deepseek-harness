@@ -1356,6 +1356,14 @@ def _pkg_from_tgz(tgz: Path) -> Optional[dict]:
     return None
 
 
+def _client_resolved(pkg: dict) -> Optional[str]:
+    """dsh.client 客户端模块路径：优先 exports['./client']；否则常见位置。"""
+    exp = pkg.get("exports", {})
+    if isinstance(exp, dict) and isinstance(exp.get("./client"), str):
+        return exp["./client"].lstrip("./")
+    return None
+
+
 def bundle_check(source: Path) -> tuple[str, list[str]]:
     """校验 bundle 源（目录或 tgz）：返回 (包名, 错误列表)。"""
     if source.is_dir():
@@ -1372,21 +1380,37 @@ def bundle_check(source: Path) -> tuple[str, list[str]]:
         return name, ["缺 package.json"]
     if not pkg.get("dsh", {}).get("bundle", {}).get("patch"):
         errs.append("未声明 dsh.bundle.patch（不是 bundle 插件）")
+    has_client = bool(pkg.get("dsh", {}).get("client"))
     if source.is_dir():
         if not (source / "cordis.patch.yml").exists():
             errs.append("缺 cordis.patch.yml")
         main = (pkg.get("main") or "lib/index.js").lstrip("./")
         if not (source / main).exists():
-            errs.append(f"入口 {main} 缺失（未构建 lib/）")
-        if pkg.get("dsh", {}).get("client") and not (source / "lib" / "client.js").exists():
-            errs.append("声明 dsh.client 但缺 lib/client.js")
+            errs.append(f"未构建：缺入口 {main}")
+        elif has_client:
+            cpath = _client_resolved(pkg)
+            if cpath is not None:
+                if not (source / cpath).exists():
+                    errs.append(f"声明 dsh.client 但缺 {cpath}")
+            elif not any((source / c).exists()
+                         for c in ("lib/client.js", "client/client.js")):
+                errs.append("声明 dsh.client 但缺客户端模块（lib/client.js 或 client/client.js）")
     else:
         with tarfile.open(source, "r:gz") as tf:
             names = {m.name for m in tf.getmembers()}
         if "package/cordis.patch.yml" not in names:
             errs.append("tgz 缺 package/cordis.patch.yml")
-        if "package/lib/index.js" not in names and not pkg.get("main", "").endswith("index.js"):
-            errs.append("tgz 缺 package/lib/index.js（未构建）")
+        main = (pkg.get("main") or "lib/index.js").lstrip("./")
+        if f"package/{main}" not in names:
+            errs.append(f"tgz 缺 package/{main}（未构建）")
+        elif has_client:
+            cpath = _client_resolved(pkg)
+            if cpath is not None:
+                if f"package/{cpath}" not in names:
+                    errs.append(f"tgz 缺 package/{cpath}")
+            elif not any(f"package/{c}" in names
+                         for c in ("lib/client.js", "client/client.js")):
+                errs.append("tgz 缺客户端模块（lib/client.js 或 client/client.js）")
     return name, errs
 
 

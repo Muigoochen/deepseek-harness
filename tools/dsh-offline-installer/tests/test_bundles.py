@@ -239,6 +239,23 @@ class MarketTest(unittest.TestCase):
         _, errs = ps.bundle_check(tgz)
         self.assertEqual(errs, [])
 
+    def test_bundle_check_client_in_exports(self) -> None:
+        # dsh-market 形态：客户端在 client/client.js，exports["./client"] 指向它
+        d = Path(tempfile.mkdtemp()) / "dsh-market"
+        (d / "lib").mkdir(parents=True)
+        (d / "lib" / "index.js").write_text("export const x = 1\n", encoding="utf-8")
+        (d / "client").mkdir(parents=True)
+        (d / "client" / "client.js").write_text("export const c = 1\n", encoding="utf-8")
+        pkg = {"name": "dshmarket", "version": "1", "main": "./lib/index.js",
+               "dsh": {"bundle": {"patch": "./cordis.patch.yml"},
+                       "client": {"platform": "web"}},
+               "exports": {"./client": "./client/client.js"}}
+        (d / "package.json").write_text(json.dumps(pkg), encoding="utf-8")
+        (d / "cordis.patch.yml").write_text("- insert: []\n", encoding="utf-8")
+        name, errs = ps.bundle_check(d)
+        self.assertEqual(name, "dshmarket")
+        self.assertEqual(errs, [])
+
     def test_latest_version(self) -> None:
         def fake(_a: list[str]) -> tuple[int, str, str]:
             return 0, "1.44.1\n", ""
