@@ -528,10 +528,13 @@ window.__ModuleLoader__.load({
         projects: [],        // [{path, source, engine, lsp:[ids], autoInject}]
         engines: [],         // [{id, name, marker, extensions}]
         autoInject: true,    // 全局自动注入开关
+        enginePorts: {},     // engineId -> 编辑器 LSP 端口(仅含显式覆盖)
+        engPortDraft: {},    // 引擎卡端口输入草稿 engineId -> string|''
         busy: '',            // busy token(单飞行)
         note: null,
-        newPath: '',         // 添加项目输入
-        newEngine: null,     // 添加项目下拉
+        newEngine: null,     // 添加项目引擎下拉
+        candidates: [],      // DSH 工作区可登记项目 [{path,title,registered}]
+        addSelPath: '',      // 登记下拉当前选中的项目 path
         addSel: {},          // 每卡「手动添加」下拉当前选值 path -> engineId
       })
       var s = state[0]
@@ -539,6 +542,11 @@ window.__ModuleLoader__.load({
 
       function reloadProjects() {
         apiGet('projects').then(function (d) { if (d && d.ok) set({ projects: d.projects || [] }) })
+      }
+      function loadCandidates() {
+        apiGet('addCandidates').then(function (d) {
+          if (d && d.ok && Array.isArray(d.candidates)) set({ candidates: d.candidates })
+        })
       }
       function loadAll() {
         apiGet('projects').then(function (d) {
@@ -552,8 +560,18 @@ window.__ModuleLoader__.load({
           }
         })
         apiGet('config').then(function (c) {
-          if (c && c.ok && typeof c.autoInject === 'boolean') set({ autoInject: c.autoInject })
+          if (c && c.ok && typeof c.autoInject === 'boolean') {
+            var map = {}
+            if (Array.isArray(c.enginePorts)) {
+              for (var i = 0; i < c.enginePorts.length; i++) {
+                var ep = c.enginePorts[i]
+                if (ep && ep.engine) map[ep.engine] = ep.port
+              }
+            }
+            set({ autoInject: c.autoInject, enginePorts: map })
+          }
         })
+        loadCandidates()
       }
 
       React.useEffect(function () { loadAll() /* eslint-disable-line react-hooks/exhaustive-deps */ }, [])
@@ -626,14 +644,15 @@ window.__ModuleLoader__.load({
         })
       }
       function doAddProject() {
-        var p = s.newPath.trim()
+        var p = s.addSelPath
         if (!p || s.busy) return
         set({ busy: 'add:' + p })
         apiGet('setProject', p, { engine: s.newEngine }).then(function (d) {
-          set({ busy: '', newPath: '' })
+          set({ busy: '', addSelPath: '' })
           reloadProjects()
-          if (d && d.ok) set({ note: '已添加项目 ' + p + '(注入 LSP:' + s.newEngine + ')' })
-          else set({ note: '添加失败(路径需存在)' })
+          loadCandidates()
+          if (d && d.ok) set({ note: '已登记项目 ' + p + '(绑定 LSP:' + s.newEngine + ')' })
+          else set({ note: '登记失败' })
         })
       }
       function doSmartAll() {
@@ -649,6 +668,29 @@ window.__ModuleLoader__.load({
           set({ busy: '', note: null })
           reloadProjects()
           set({ note: '已对 ' + pending.length + ' 个非手动项目执行智能配置(补充缺失 LSP,不动手动配置)' })
+        })
+      }
+
+      function saveEnginePort(engineId) {
+        if (s.busy) return
+        var drafts0 = s.engPortDraft || {}
+        // 没编辑过的引擎(输入框 = 已存值/占位),点了保存也不提交。
+        if (!Object.prototype.hasOwnProperty.call(drafts0, engineId)) return
+        var v = String(drafts0[engineId] || '').trim()
+        set({ busy: 'enginePort:' + engineId })
+        apiGet('enginePort', null, { engine: engineId, port: v }).then(function (d) {
+          set({ busy: '' })
+          if (d && d.ok) {
+            var map = Object.assign({}, s.enginePorts)
+            var drafts = Object.assign({}, drafts0)
+            if (d.port > 0) map[engineId] = d.port
+            else delete map[engineId]
+            delete drafts[engineId] // 保存完回到「未编辑」态:回显已存值 / 空 + 占位
+            set({
+              enginePorts: map, engPortDraft: drafts,
+              note: d.port > 0 ? '引擎 ' + engineId + ' 的编辑器端口已设为 ' + d.port : '引擎 ' + engineId + ' 已恢复默认端口(自动探测)',
+            })
+          } else set({ note: (d && d.error) || '保存端口失败' })
         })
       }
 
@@ -709,6 +751,40 @@ window.__ModuleLoader__.load({
         return [picker, addBtn]
       }
 
+      // 引擎(LSP)卡的一行:引擎标识 + 编辑器 LSP 端口输入(空 = 默认自动)
+      function engineRow(e) {
+        var saved = s.enginePorts[e.id] // number | undefined
+        var drafts = s.engPortDraft || {}
+        // draft 有无(而非值)区分「未编辑」与「显式清空」:这样有覆盖值时
+        // 也能清空输入并保存,真正恢复默认(否则永远回显已存值,清不掉)。
+        var hasEdit = Object.prototype.hasOwnProperty.call(drafts, e.id)
+        var inputVal = hasEdit ? drafts[e.id] : (saved ? String(saved) : '')
+        var busyPort = s.busy === 'enginePort:' + e.id
+        return React.createElement('div', { key: e.id, style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } }, [
+          React.createElement('span', { key: 'c', className: 'lspi-chip', title: 'marker:' + e.marker }, [
+            React.createElement('span', { key: 'n', className: 'lspi-chip-name' }, e.name),
+            React.createElement('span', { key: 'e', className: 'lspi-chip-ext' }, (e.extensions || []).join(' ')),
+          ]),
+          React.createElement('span', { key: 'lab', className: 'lspi-set-hint', style: { flex: 'none' } }, '编辑器 LSP 端口'),
+          React.createElement('input', {
+            key: 'port', className: 'lspi-set-input', type: 'number', min: 1, max: 65535,
+            placeholder: '6005', style: { width: 76 },
+            value: inputVal, disabled: !!s.busy,
+            title: 'attach 你打开的 Godot 编辑器时探测的端口。默认 6005;若你在 编辑器设置 → Network → Language Server → Remote Port 改过端口,在这里填并保存,插件就不再盲找 6005。',
+            onChange: function (ev) {
+              var nd = Object.assign({}, s.engPortDraft)
+              nd[e.id] = ev.target.value
+              set({ engPortDraft: nd })
+            },
+          }),
+          React.createElement('button', {
+            key: 'save', type: 'button', className: 'lspi-set-btn', disabled: !!s.busy || !hasEdit,
+            title: hasEdit ? '保存端口设置(留空 = 恢复默认)' : '先修改端口再保存',
+            onClick: function () { saveEnginePort(e.id) },
+          }, busyPort ? '保存中…' : '保存'),
+        ])
+      }
+
       var cards = s.projects.map(function (p) {
         var lspList = p.lsp || []
         var chips = []
@@ -755,6 +831,21 @@ window.__ModuleLoader__.load({
       var addEngineOptions = s.engines.map(function (e) {
         return React.createElement('option', { key: e.id, value: e.id }, e.name + ' (' + e.extensions.join(' ') + ')')
       })
+      // 登记下拉:DSH 工作区全部根 + 根下命中引擎的项目(已登记的在选项里禁用)
+      var candidateOpts = (function () {
+        var opts = []
+        if (!s.candidates.length) {
+          opts.push(React.createElement('option', { key: '_none', value: '', disabled: true }, 'DSH 没有可登记的工作区项目'))
+        } else {
+          opts.push(React.createElement('option', { key: '_ph', value: '', disabled: true }, '选择工作区项目…'))
+          for (var ci = 0; ci < s.candidates.length; ci++) {
+            var cand = s.candidates[ci]
+            opts.push(React.createElement('option', { key: cand.path, value: cand.path, disabled: !!cand.registered },
+              (cand.title || cand.path) + (cand.registered ? '(已登记)' : '')))
+          }
+        }
+        return opts
+      })()
 
       return React.createElement('div', { className: 'lspi-set' }, [
         // 全局自动注入开关
@@ -770,6 +861,8 @@ window.__ModuleLoader__.load({
             '开:项目第一次加入 DSH 时自动智能配置 LSP,并在编辑后把编译错误反馈给 AI。'
             + '关:新项目只登记不自动注入,需手动配置。'),
         ]),
+        // 操作结果提示:放整页顶部,引擎卡/项目卡的操作都能看到
+        s.note ? React.createElement('p', { key: 'note', className: 'lspi-set-hint', style: { color: '#1d4ed8', margin: '0 0 6px' } }, s.note) : null,
         // 说明(独立卡):项目 = 目录,含语言,每语言一个 LSP
         React.createElement('div', { key: 'about', className: 'lspi-set-card' }, [
           React.createElement('h3', null, '工作原理'),
@@ -783,22 +876,23 @@ window.__ModuleLoader__.load({
         // 项目卡片(项目为主:一项目一卡)
         React.createElement('div', { key: 'projects', className: 'lspi-set-card' }, [
           React.createElement('h3', null, '项目'),
-          s.note ? React.createElement('p', { className: 'lspi-set-hint', style: { color: '#1d4ed8' } }, s.note) : null,
           cards.length ? React.createElement('div', { key: 'cards', style: { display: 'flex', flexDirection: 'column', gap: 8 } }, cards) : null,
           React.createElement('div', { key: 'addrow', className: 'lspi-set-row', style: { marginTop: 10, borderBottom: 0 } }, [
-            React.createElement('input', {
-              className: 'lspi-set-input', type: 'text',
-              placeholder: '添加项目:绝对路径',
-              value: s.newPath,
-              onChange: function (ev) { set({ newPath: ev.target.value }) },
-              onKeyDown: function (ev) { if (ev.key === 'Enter') doAddProject() },
-            }),
+            React.createElement('span', { key: 'lab', className: 'lspi-set-hint', style: { flex: 'none' } }, '登记 DSH 项目'),
+            React.createElement('select', {
+              className: 'lspi-set-select', style: { maxWidth: 300 },
+              value: s.addSelPath || '',
+              disabled: !!s.busy || !s.candidates.length,
+              title: '选择要登记的 DSH 工作区项目(含无 GDScript 的项目;登记不产生引擎文件的项目只是占位,无诊断)',
+              onChange: function (ev) { set({ addSelPath: ev.target.value }) },
+            }, candidateOpts),
             React.createElement('select', {
               className: 'lspi-set-select', value: s.newEngine,
               onChange: function (ev) { set({ newEngine: ev.target.value }) },
             }, addEngineOptions),
             React.createElement('button', {
-              type: 'button', className: 'lspi-set-btn', disabled: !!s.busy || !s.newPath.trim(),
+              type: 'button', className: 'lspi-set-btn', disabled: !!s.busy || !s.addSelPath,
+              title: '把选中的 DSH 项目登记到列表(绑定所选引擎)',
               onClick: doAddProject,
             }, s.busy.indexOf('add:') === 0 ? '添加中…' : '添加项目'),
             React.createElement('button', {
@@ -808,19 +902,16 @@ window.__ModuleLoader__.load({
             }, s.busy.indexOf('smart-all') === 0 ? '配置中…' : '全部智能配置'),
           ]),
         ]),
-        // 引擎列表
+        // 引擎列表(每引擎一行:标识 + 编辑器 LSP 端口)
         React.createElement('div', { key: 'eng', className: 'lspi-set-card' }, [
           React.createElement('h3', null, '引擎(LSP)'),
-          React.createElement('div', { className: 'lspi-chips' }, s.engines.map(function (e) {
-            return React.createElement('span', { key: e.id, className: 'lspi-chip', title: 'marker:' + e.marker }, [
-              React.createElement('span', { key: 'n', className: 'lspi-chip-name' }, e.name),
-              React.createElement('span', { key: 'e', className: 'lspi-chip-ext' }, (e.extensions || []).join(' ')),
-            ])
-          })),
+          React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+            s.engines.map(engineRow)),
           React.createElement('p', { className: 'lspi-set-hint', style: { marginTop: 8 } },
             '引擎(LSP)即 checkers/ 下注册的语言服务器;添加新引擎 = 在插件 checkers/ 加目录(自动出现)。'
-            + '智能连接(attach 你打开的编辑器 / 自起 headless)与编辑器端口属机器配置,'
-            + '在 checkers/<engine>/godot-lsp.config.json 调整后重启生效。'),
+            + '「编辑器 LSP 端口」是 attach 你已打开的 Godot 编辑器时探测的端口(默认 6005)。'
+            + '若你的 Godot 在 编辑器设置 → Network → Language Server → Remote Port 改过端口,'
+            + '在这里填上并保存即可,插件 attach 时用你填的端口,不再盲找。清空后保存 = 恢复默认。'),
         ]),
       ])
     }

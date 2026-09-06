@@ -192,9 +192,10 @@ const MODE_EDITOR = 'editor';
 // editor on the configured editor LSP port IS the current project's editor
 // (single-editor setups). Our own headless engines always bind free random
 // ports, so a live peer on the editor port can only be the user's editor.
-// Port source: bridge config `editorPort` (or legacy array `editorPorts`) >
-// --editor-port flag > default 6005. Users with non-default editor ports put
-// theirs in the plugin config.
+// Port source: explicit --editor-port flag (the GUI settings override, passed
+// by the host) > bridge config `editorPort` (or legacy array `editorPorts`) >
+// default 6005. Users with non-default editor ports set theirs in the plugin's
+// settings page, which the host forwards as --editor-port.
 const DEFAULT_EDITOR_PORTS = [6005];
 const EDITOR_PROBE_TIMEOUT_MS = 2500;
 function tailFile(p, n) {
@@ -205,14 +206,18 @@ function tailFile(p, n) {
 }
 
 function editorProbePorts(flags) {
+  // 1) explicit --editor-port (the host forwards the settings-page override).
+  //    parseArgs keeps the dashed key verbatim ('editor-port', not editorPort).
+  const dashed = flags && (flags['editor-port'] || flags.editorPort);
+  if (dashed) {
+    const n = Number(dashed);
+    if (n > 0) return [n];
+  }
+  // 2) bridge config file (machine-level default when no GUI override is set)
   const cfg = readJsonSafe(CONFIG_PATH);
   if (cfg) {
     if (typeof cfg.editorPort === 'number' && cfg.editorPort > 0) return [cfg.editorPort];
     if (Array.isArray(cfg.editorPorts) && cfg.editorPorts.length) return cfg.editorPorts;
-  }
-  if (flags.editorPort) {
-    const n = Number(flags.editorPort);
-    if (n > 0) return [n];
   }
   return DEFAULT_EDITOR_PORTS;
 }

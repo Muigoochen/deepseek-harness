@@ -22,8 +22,9 @@
 「只保留一个引擎」:若用户已打开该项目的 Godot 编辑器,直接 **attach 它的 LSP 端口**
 (像官方 godot-vscode-plugin 一样,零额外内存、引擎恒热),否则才自起 headless。
 
-- **端口来源(降序)**:桥 config `editorPort`(默认 `6005`,用户非默认端口改这里)→
-  `--editor-port` flag → 内置默认 `6005`。不盲扫端口,避免误连别的服务。
+- **端口来源(降序)**:设置页引擎卡「编辑器 LSP 端口」(存 harness settings `enginePorts`,
+  host 转成 `--editor-port` flag 传给桥)→ 桥 config `editorPort`(默认 `6005`,无 GUI 时兜底)
+  → 内置默认 `6005`。不盲扫端口,避免误连别的服务。
 - **归属判定**:信任模型与官方 VSCode 插件一致——单开场景下编辑器端口即当前项目编辑器;
   我们自己 headless 用随机端口,不会占编辑器端口,故 TCP 可连即视为命中
   (实测:attach 0.1s;`gdscript_client/changeWorkspace`/`capabilities` 握手不稳定,
@@ -146,7 +147,8 @@ lsp-echo 带**静态 client 半**(`lib/client.js`,toast/workspace-files 同款:
 
 - 引擎需写项目 `.godot/`(权限不足会 signal 11);GUI 编辑器与 headless 并存注意缓存;
 - `settings.register` schema 必须 schemastery;Windows PS5.1 写文件带 BOM(已容忍);
-- **智能连接**:单开编辑器默认 attach 6005;多编辑器/非默认端口用户通过 config
-  `editorPort` 指定或 `attachEditor:false` 关闭;attach 模式下编辑器关闭会自动 fallback headless;
+- **智能连接**:单开编辑器默认 attach 6005;多编辑器/非默认端口用户通过**设置页引擎卡
+  「编辑器 LSP 端口」**指定(settings `enginePorts`,优先于 config `editorPort`)或
+  `attachEditor:false` 关闭;attach 模式下编辑器关闭会自动 fallback headless;
 - 增量改动检查(role=main)保留 per-file settle(级联诊断语义),全量(sweep)才无 settle;
 - `.gdshader` 无 LSP 诊断(引擎不发 publish),结果带 `engine_note` 说明,不报错。

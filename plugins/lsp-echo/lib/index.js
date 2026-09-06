@@ -60,6 +60,14 @@ const REGISTRY_SCHEMA = z.object({
   // Global auto-inject switch (RFC §7): persisted here so the settings GUI can
   // toggle it at runtime; absent = fall back to Config.autoInject (default true).
   autoInjectGlobal: z.boolean(),
+  // Engine-level editor-attach port overrides: engineId -> editor LSP port the
+  // bridge probes when attaching to a user's running Godot editor. Absent =
+  // engine default (Godot editor LSP default 6005). Stored as an array to keep
+  // the schemastery schema portable. GUI: 设置页「引擎(LSP)」卡.
+  enginePorts: z.array(z.object({
+    engine: z.string(),
+    port: z.number(),
+  })).default([]),
 })
 
 const DEFAULT_SKIP = ['.godot', 'addons']
@@ -291,15 +299,34 @@ export function apply(ctx, config) {
     // Normalize v1 {path, engine} entries to v2 {path, lsp:[{engine}]} here, so
     // every consumer below only sees lsp arrays (dual-shape compatibility).
     const manual = rawM.map(normalizeProjectEntry).filter(Boolean)
-    return { discovered: [...rawD], manual, autoInjectGlobal: v && typeof v.autoInjectGlobal === 'boolean' ? v.autoInjectGlobal : undefined }
+    return {
+      discovered: [...rawD],
+      manual,
+      autoInjectGlobal: v && typeof v.autoInjectGlobal === 'boolean' ? v.autoInjectGlobal : undefined,
+      enginePorts: v && Array.isArray(v.enginePorts) ? v.enginePorts : [],
+    }
   }
   let store = readStore()
   const persist = async () => {
     if (!scope) return
-    const out = { discovered: store.discovered, manual: store.manual }
+    const out = { discovered: store.discovered, manual: store.manual, enginePorts: store.enginePorts }
     if (typeof store.autoInjectGlobal === 'boolean') out.autoInjectGlobal = store.autoInjectGlobal
     await scope.replace(out)
     store = readStore() // refresh local snapshot after the durable commit
+  }
+  /** Editor-attach port configured for an engine id (undefined = engine default). */
+  const enginePortOf = (engineId) => {
+    const list = store.enginePorts || []
+    for (const e of list) {
+      const p = e && e.port
+      if (e && e.engine === engineId && typeof p === 'number' && Number.isInteger(p) && p >= 1 && p <= 65535) return p
+    }
+    return undefined
+  }
+  /** Editor-attach port for a bridge path (resolve its owning engine id). */
+  const portForBridge = (bridge) => {
+    const eng = engineByBridge(bridge)
+    return eng ? enginePortOf(eng.id) : undefined
   }
   /** Global auto-inject: settings toggle when set, else the Config seed (default true). */
   const globalAutoInject = () => (typeof store.autoInjectGlobal === 'boolean' ? store.autoInjectGlobal : config.autoInject !== false)
@@ -477,7 +504,7 @@ export function apply(ctx, config) {
       try { files = [...scanFiles(rec.path, config.watchSkip || DEFAULT_SKIP, eng.extensions).keys()] } catch { /* keep [] */ }
       if (!files.length) { rows.push({ eng: eng.id, empty: true }); return }
       try {
-        const payload = await checkFiles(eng.bridge, rec.path, files, timeoutMs, 'baseline', eng.extensions, keepExts)
+        const payload = await checkFiles(eng.bridge, rec.path, files, timeoutMs, 'baseline', eng.extensions, keepExts, enginePortOf(eng.id))
         // merged snapshot holds every engine's keyspace; per-engine view only
         const scope = engineScope(payload, eng.extensions)
         rows.push({ eng: eng.id, payload, scope: scope.summary, files: scope.files })
@@ -525,7 +552,7 @@ export function apply(ctx, config) {
       return { project: root, engineId, bridge: eng.bridge }
     },
     abs: absPath,
-    ensure: ensureHost,
+    ensure: (bridge, project) => ensureHost(bridge, project, portForBridge(bridge)),
     stop: stopHost,
     stopClient: stopClientd,
     status,
@@ -535,10 +562,10 @@ export function apply(ctx, config) {
     // ownedExts/keepExts); unknown projects fall back to bare checkFiles.
     check: async (bridge, project, files, timeoutMs) => {
       const rec = known.get(path.resolve(project).toLowerCase())
-      if (!rec) return checkFiles(bridge, project, files, timeoutMs)
+      if (!rec) return checkFiles(bridge, project, files, timeoutMs, 'main', undefined, undefined, portForBridge(bridge))
       const keepExts = boundExtensions(rec)
       const ownExts = engineByBridge(bridge) ? engineByBridge(bridge).extensions : boundExtensions(rec)
-      return checkFiles(bridge, project, files, timeoutMs || 120_000, 'main', ownExts, keepExts)
+      return checkFiles(bridge, project, files, timeoutMs || 120_000, 'main', ownExts, keepExts, portForBridge(bridge))
     },
     projectsList: () => [...known.values()].map((r) => `${r.source}\t${primaryEngine(r) || '?'}\t${r.path}`),
     scanWorkspace: async (root) => {
@@ -581,7 +608,7 @@ export function apply(ctx, config) {
       let all = []
       try { all = [...scanFiles(project, config.watchSkip || DEFAULT_SKIP).keys()] } catch { /* ignore */ }
       if (!all.length) return '[lsp-echo] 项目里没有可检查的文件'
-      const payload = await checkFiles(bridge, project, all, 200_000, 'baseline', ownExts)
+      const payload = await checkFiles(bridge, project, all, 200_000, 'baseline', ownExts, undefined, portForBridge(bridge))
       const scanned = payload && payload.summary ? payload.summary.files_checked : all.length
       return baselineDoneText(payload, scanned)
     },
@@ -631,9 +658,61 @@ export function apply(ctx, config) {
             store.autoInjectGlobal = ai === '1'
             await persist()
             seedKnown()
-            return json(res, 200, { ok: true, autoInject: store.autoInjectGlobal })
+            return json(res, 200, { ok: true, autoInject: store.autoInjectGlobal, enginePorts: store.enginePorts })
           }
-          return json(res, 200, { ok: true, autoInject: globalAutoInject() })
+          return json(res, 200, { ok: true, autoInject: globalAutoInject(), enginePorts: store.enginePorts })
+        }
+        // Engine editor-attach port override (编辑器 LSP 端口). GET engine=<id>
+        // with port=<n> persists; an empty/missing port clears the override.
+        // No project required — the port belongs to the engine on this machine.
+        if (action === 'enginePort') {
+          const eng = url.searchParams.get('engine')
+          if (!eng || !engine(eng)) return json(res, 400, { ok: false, error: `enginePort requires engine=<id>; available: ${enginesList().join(', ')}` })
+          let port = 0
+          if (url.searchParams.has('port')) {
+            const raw = url.searchParams.get('port')
+            if (raw !== '') {
+              port = Number(raw)
+              if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+                return json(res, 400, { ok: false, error: 'port must be an integer 1..65535 (empty or missing clears the override)' })
+              }
+            }
+          }
+          const list = (store.enginePorts || []).filter((x) => x.engine !== eng)
+          if (port > 0) list.push({ engine: eng, port })
+          store.enginePorts = list
+          await persist()
+          return json(res, 200, { ok: true, engine: eng, port, enginePorts: store.enginePorts })
+        }
+        // DSH workspace projects the settings board can still register. Every
+        // workspace root is a candidate (a project outside a workspace cannot
+        // host a conversation; the board must not second-guess the user about
+        // which DSH project matters), plus engine-marker hits nested under it.
+        if (action === 'addCandidates') {
+          const svc = ctx.get('workspaceRegistry')
+          const out = []
+          const push = (root, title) => {
+            const ap = path.resolve(root)
+            if (!out.some((c) => c.path === ap)) out.push({ path: ap, title: title || path.basename(ap), registered: known.has(ap.toLowerCase()) })
+          }
+          if (svc && typeof svc.list === 'function') {
+            try {
+              const wsList = await svc.list()
+              for (const w of wsList || []) {
+                const wsPath = w && w.path
+                if (!wsPath || typeof wsPath !== 'string') continue
+                const title = (w && w.title) || ''
+                push(wsPath, title) // the workspace root itself
+                let roots = []
+                try {
+                  roots = scanProjectRoots(path.resolve(wsPath), { markers: markerList() })
+                } catch { /* unreadable workspace, skip */ }
+                for (const r of roots) push(r, title)
+              }
+              out.sort((a, b) => (a.registered === b.registered ? 0 : a.registered ? 1 : -1))
+            } catch { /* candidates are best effort */ }
+          }
+          return json(res, 200, { ok: true, candidates: out })
         }
 
         // Helpers shared by the project-edit actions below.
@@ -792,7 +871,7 @@ export function apply(ctx, config) {
         if (!found) return json(res, 400, { ok: false, error: `no project resolved for action=${action}; pass project or register projects first` })
         const { project: proj, bridge } = found
         let r
-        if (action === 'host') r = await ensureHost(bridge, proj)
+        if (action === 'host') r = await ensureHost(bridge, proj, enginePortOf(found.engineId))
         else if (action === 'stop') r = await stopHost(bridge, proj)
         else if (action === 'status') {
           r = await status(bridge, proj)
@@ -819,7 +898,7 @@ export function apply(ctx, config) {
           const ownExts = engineByBridge(bridge) ? engineByBridge(bridge).extensions : undefined
           let all = []
           try { all = [...scanFiles(proj, config.watchSkip || DEFAULT_SKIP).keys()] } catch { /* ignore */ }
-          const payload = await checkFiles(bridge, proj, all, 200_000, 'baseline', ownExts)
+          const payload = await checkFiles(bridge, proj, all, 200_000, 'baseline', ownExts, undefined, enginePortOf(found.engineId))
           return json(res, 200, {
             ok: true,
             project: proj,
@@ -918,7 +997,7 @@ export function apply(ctx, config) {
       const files = byEngine.get(eng.id) || []
       if (!files.length) continue
       tasks.push(
-        checkFiles(eng.bridge, rec.path, files, 120_000, 'main', eng.extensions, keepExts)
+        checkFiles(eng.bridge, rec.path, files, 120_000, 'main', eng.extensions, keepExts, enginePortOf(eng.id))
           .then((payload) => ({ engineId: eng.id, eng, payload }))
           .catch((error) => {
             console.error(`[lsp-echo] check failed (${eng.id}): ${(error && error.message) || error}`)
@@ -1044,7 +1123,7 @@ export function apply(ctx, config) {
       const eng = boundEngines[0]
       const all = scanAll(eng)
       if (!all.length) return noFilesDone()
-      checkFiles(eng.bridge, rec.path, all, 200_000, 'baseline', eng.extensions, boundExtensions(rec))
+      checkFiles(eng.bridge, rec.path, all, 200_000, 'baseline', eng.extensions, boundExtensions(rec), enginePortOf(eng.id))
         .then((payload) => {
           state.status = 'done'
           state.scanned = payload && payload.summary ? payload.summary.files_checked : all.length
@@ -1074,7 +1153,7 @@ export function apply(ctx, config) {
     Promise.all(all.map(async ({ eng, files }) => {
       if (!files.length) return { eng: eng.id, empty: true }
       try {
-        const payload = await checkFiles(eng.bridge, rec.path, files, 200_000, 'baseline', eng.extensions, keepExtsM)
+        const payload = await checkFiles(eng.bridge, rec.path, files, 200_000, 'baseline', eng.extensions, keepExtsM, enginePortOf(eng.id))
         return { eng: eng.id, payload }
       } catch (e) {
         return { eng: eng.id, error: (e && e.message) || String(e) }

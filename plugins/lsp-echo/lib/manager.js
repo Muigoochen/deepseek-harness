@@ -217,17 +217,39 @@ function runBridge(bridge, args, timeoutMs = 240_000) {
 // batched parallel. Protocol: request/reply JSON lines over stdio.
 const liveClients = new Map() // bridge -> Map(projectLower -> state)
 
-function ensureClientd(bridge, project, role = 'main') {
+function ensureClientd(bridge, project, role = 'main', editorPort) {
   const byProject = liveClients.get(bridge) || new Map()
   liveClients.set(bridge, byProject)
-  const key = `${path.resolve(project).toLowerCase()}::${role}`
+  const projLower = path.resolve(project).toLowerCase()
+  const rolePrefix = `${projLower}::${role}`
+  // The attach port is part of the identity: a clientd started with one port
+  // must not be reused after the user changes the override (its host decision
+  // already ran inside the bridge process).
+  const portKey = editorPort ? `:p${editorPort}` : ':auto'
+  const key = `${rolePrefix}${portKey}`
   const existing = byProject.get(key)
   if (existing && existing.child.exitCode === null && existing.child.stdin && existing.child.stdin.writable) return existing
   if (existing) {
     try { existing.child.kill() } catch { /* gone */ }
     byProject.delete(key)
   }
-  const child = spawn(process.execPath, [bridge, 'clientd', '--project', project], {
+  // A port/override change for the same role supersedes every older clientd:
+  // retire stale ones so only one engine session (and at most one editor
+  // attach) lives per role.
+  for (const [oldKey, old] of [...byProject]) {
+    if (oldKey !== key && oldKey.startsWith(rolePrefix)) {
+      byProject.delete(oldKey)
+      for (const [, entry] of old.pending) {
+        clearTimeout(entry.timer)
+        try { entry.reject(new Error('clientd superseded by editor-port change')) } catch { /* settled */ }
+      }
+      try { if (old.child.stdin) old.child.stdin.end() } catch { /* closed */ }
+      try { old.child.kill() } catch { /* gone */ }
+    }
+  }
+  const args = [bridge, 'clientd', '--project', project]
+  if (editorPort) args.push('--editor-port', String(editorPort))
+  const child = spawn(process.execPath, args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   })
@@ -259,16 +281,18 @@ function ensureClientd(bridge, project, role = 'main') {
       clearTimeout(entry.timer)
       entry.reject(new Error('clientd exited'))
     }
-    byProject.delete(key)
+    // Identity guard: a port change may have already replaced this key with a
+    // newer clientd; only drop the map entry when it still points at us.
+    if (byProject.get(key) === state) byProject.delete(key)
   })
   byProject.set(key, state)
   return state
 }
 
-function clientdRequest(bridge, project, files, timeoutMs, role = 'main') {
+function clientdRequest(bridge, project, files, timeoutMs, role = 'main', editorPort) {
   return new Promise((resolve, reject) => {
     let state
-    try { state = ensureClientd(bridge, project, role) } catch (e) { reject(e); return }
+    try { state = ensureClientd(bridge, project, role, editorPort) } catch (e) { reject(e); return }
     const id = state.nextId++
     const timer = setTimeout(() => {
       if (state.pending.delete(id)) reject(new Error(`clientd request timed out (${timeoutMs}ms)`))
@@ -299,8 +323,10 @@ export function stopClientd(bridge, project) {
 }
 
 /** Ensure a host is running for a project (bridge `host`); reuses a live host. */
-export function ensureHost(bridge, project) {
-  return runBridge(bridge, ['host', '--project', project])
+export function ensureHost(bridge, project, editorPort) {
+  const args = ['host', '--project', project]
+  if (editorPort) args.push('--editor-port', String(editorPort))
+  return runBridge(bridge, args)
 }
 
 export function stopHost(bridge, project) {
@@ -324,9 +350,9 @@ export function status(bridge, project) {
  * @param {string[]} [keepExts] extensions still bound to the project in the
  *        current config; stale keys outside it are evicted on write (RFC §8)
  */
-export async function checkFiles(bridge, project, files, timeoutMs = 120_000, role = 'main', ownedExts, keepExts) {
+export async function checkFiles(bridge, project, files, timeoutMs = 120_000, role = 'main', ownedExts, keepExts, editorPort) {
   try {
-    const reply = await clientdRequest(bridge, project, files, timeoutMs, role)
+    const reply = await clientdRequest(bridge, project, files, timeoutMs, role, editorPort)
     if (reply && reply.ok && reply.payload) {
       return writeSnapshot(project, reply.payload, ownedExts, keepExts)
     }
@@ -336,7 +362,8 @@ export async function checkFiles(bridge, project, files, timeoutMs = 120_000, ro
     // inside the bridge), we read it back and persist through the same writer.
     const tmpOut = path.join(runtimeRoot(), `.tmp-check-${safeName(project)}-${role}-${process.pid}-${Date.now()}.json`)
     const sweepArgs = role === 'baseline' ? ['--sweep'] : []
-    const r = await runBridge(bridge, ['check', ...sweepArgs, ...files, '--project', project, '--out', tmpOut], timeoutMs)
+    const portArgs = editorPort ? ['--editor-port', String(editorPort)] : []
+    const r = await runBridge(bridge, ['check', ...sweepArgs, ...portArgs, ...files, '--project', project, '--out', tmpOut], timeoutMs)
     if (r.fatal) {
       try { fs.unlinkSync(tmpOut) } catch { /* best effort */ }
       throw new Error(r.stderr.trim() || r.stdout.trim() || 'bridge check failed')

@@ -105,11 +105,11 @@ node "$env:DSH_HOME\profiles\node_modules\@dsh-user\lsp-echo\checkers\godot-lsp\
 `lsp-echo` 命名空间**(manual 层),与装载行 config 种子叠加(config → discovered → manual
 优先级)。
 
-引擎自身的 Godot exe / 默认项目 / **编辑器端口**等**机器配置**在引擎自己的 `godot-lsp.config.json`(由安装脚本生成),与插件配置分离。智能连接相关:
+引擎自身的 Godot exe / 默认项目等**机器配置**在引擎自己的 `godot-lsp.config.json`(由安装脚本生成),与插件配置分离。**编辑器 LSP 端口**建议在**设置页 → LSP 诊断 → 引擎(LSP)卡**直接填(存入 harness settings `enginePorts`,attach 时优先于此 config),config 仅作兜底:
 
 ```jsonc
 // checkers/godot-lsp/godot-lsp.config.json
-{ "editorPort": 6005,     // 你已打开的 Godot 编辑器 LSP 端口;非默认端口改这里
+{ "editorPort": 6005,     // 兜底:设置页没填「编辑器 LSP 端口」时用这个(默认 6005)
   "attachEditor": true }  // false = 不 attach,始终自起 headless
 ```
 
@@ -133,11 +133,14 @@ node "$env:DSH_HOME\profiles\node_modules\@dsh-user\lsp-echo\checkers\godot-lsp\
 - 顶部**自动注入(全局)**开关:新项目第一次加入 DSH 时自动智能配置并在编辑后反馈;
 - 每张项目卡 = 项目目录名 + 已绑定引擎 chips(✕ 移除)+ 常驻**手动添加引擎**下拉/按钮 +
   **智能配置**(扫描项目补缺失引擎,只补充不覆盖)+ 还原种子/移除手动配置;
-- 底部可手动添加项目(绝对路径 + 引擎),也可对全部非手动项目一次智能配置。
+- **登记行**:从 **DSH 工作区项目下拉**选择登记(已登记的选项禁用,含无 GDScript 的
+  工作区根——登记仅占位,不会产生诊断;无需手输绝对路径);
+- 引擎(LSP)卡:每引擎一行(名称+扩展名)+「编辑器 LSP 端口」输入(留空保存 = 恢复默认自动);
+- 操作结果提示显示在设置页顶部;无引擎文件的项目首次全量只提示一次。
 
 实现:静态 client 半(`lib/client.js`),挂 `conversation.session.header.actions` + `shell.overlay`
 + `settings.section`;数据/控制走 host 路由 `GET /lsp-echo/api`
-(action:`projects|engines|config|smart|setProject|addLsp|delLsp|resetProject|delProject|host|stop|status|baseline|diagnostics`)。
+(action:`projects|engines|config|enginePort|addCandidates|smart|setProject|addLsp|delLsp|resetProject|delProject|host|stop|status|baseline|diagnostics`)。
 详见 `docs/design.md` §8。
 
 ## 扩展其它语言(路线)
