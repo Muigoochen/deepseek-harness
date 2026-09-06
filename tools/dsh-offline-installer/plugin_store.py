@@ -921,25 +921,44 @@ def list_archive_plugins(archive: Path) -> list[tuple[str, Validation]]:
 
 # ---------------------------------------------------------------- 状态合成
 
+def web_patch_declared_ids(home: Path) -> set[str]:
+    """返回用户在 web 补丁里声明的 id 集合（自有段 + 外部 + 第一方行）。
+
+    dump 输出是整套 web profile（bundles+profile+用户补丁）的全量清单；插件区
+    只应展示**用户补丁声明过**的行，否则会把全部内置 `@deepseek-ai/*` 插件
+    当成"内置(只读)"罗列出来（表现为"150 个插件"）。
+    """
+    patch = web_patch(home)
+    if not patch.exists():
+        return set()
+    ids: set[str] = set()
+    for ln in patch.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^    - id: ([A-Za-z0-9-]+)$", ln)
+        if m:
+            ids.add(m.group(1))
+    return ids
+
+
 def status_view(home: Path, sources: Sequence[PluginSource],
                 dump: DumpResult) -> list[PluginCard]:
     ledger = ledger_load(home)
     by_slug = {s.slug: s for s in sources}
+    declared = web_patch_declared_ids(home)
     cards: list[PluginCard] = []
     slugs: set[str] = set()
 
-    # 第一方/外部：dump 里 @dsh-user 用户层条目（含不在台账的 → 外部）
+    # 第一方/外部：仅用户补丁声明的 @dsh-user 行（含不在台账的 → 外部）
     for e in dump.entries:
         m = NAME_RE.match(e.name)
         if m:
             slug = m.group(1)
+            if slug not in declared:
+                continue
             slugs.add(slug)
             src = by_slug.get(slug)
             managed = ledger.row(slug) is not None
-            if managed:
-                state = "enabled" if not e.disabled else "disabled"
-            else:
-                state = "enabled" if not e.disabled else "disabled"
+            state = "enabled" if not e.disabled else "disabled"
+            if not managed:
                 state = "external" if state == "enabled" else "external-disabled"
             cards.append(PluginCard(
                 slug=slug, name=e.name, state=state,
@@ -949,9 +968,10 @@ def status_view(home: Path, sources: Sequence[PluginSource],
                 source=src.path if src else None,
                 first_party=False,
                 validation_errors=src.validation.errors if src else ()))
-    # 第一方 @deepseek-ai 行只读展示
+    # 第一方 @deepseek-ai 行只读展示（仅用户补丁里显式加过的那几条）
     for e in dump.entries:
-        if e.name.startswith("@deepseek-ai/") and e.name not in {c.name for c in cards}:
+        if e.id in declared and e.name.startswith("@deepseek-ai/") \
+                and e.name not in {c.name for c in cards}:
             cards.append(PluginCard(
                 slug=e.id, name=e.name,
                 state="first_party" if not e.disabled else "first_party-disabled",

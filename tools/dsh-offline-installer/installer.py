@@ -532,12 +532,17 @@ class App(tk.Tk):
         # 日志（终端）
         lf = ttk.LabelFrame(tab_run, text="日志（终端输出实时显示在此）")
         lf.pack(fill="both", expand=True, pady=(4, 0))
-        self.txt = tk.Text(lf, height=12, wrap="word", state="disabled",
+        self.txt = tk.Text(lf, height=12, wrap="word",
                            font=("Microsoft YaHei UI", 9))
         sb = ttk.Scrollbar(lf, command=self.txt.yview)
         self.txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.txt.pack(fill="both", expand=True)
+        # 只读但可选中/复制：拦截编辑类按键，保留 Ctrl 快捷键与鼠标选择
+        self.txt.bind("<Key>", self._ro_key)
+        self.txt.bind("<<Paste>>", lambda e: "break")
+        self.txt.bind("<<Cut>>", lambda e: "break")
+        self.txt.bind("<Button-3>", self._log_popup)
 
         # ---------------- Tab 2：插件 ----------------
         self._build_plugin_ui(tab_plug)
@@ -550,14 +555,51 @@ class App(tk.Tk):
 
     def _append(self, msg: str) -> None:
         def write():
-            self.txt.configure(state="normal")
             self.txt.insert("end", str(msg) + "\n")
             self.txt.see("end")
-            self.txt.configure(state="disabled")
         try:
             self.after(0, write)
         except Exception:  # noqa: BLE001
             pass
+
+    def _ro_key(self, e) -> str | None:
+        """只读保护：拦截会改动文本的按键，保留方向键与 Ctrl 组合（复制/全选）。"""
+        if e.state & 0x0004:            # Control
+            return None
+        if e.keysym in ("Left", "Right", "Up", "Down", "Home", "End",
+                        "Prior", "Next"):
+            return None
+        return "break"
+
+    def _log_popup(self, e) -> None:
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="复制选中", command=self._log_copy_sel)
+        m.add_command(label="复制全部", command=self._log_copy_all)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def _log_copy_sel(self) -> None:
+        try:
+            txt = self.txt.get("sel.first", "sel.last")
+        except Exception:  # noqa: BLE001
+            txt = ""
+        if not txt:
+            self._log_copy_all()
+            return
+        self.clipboard_clear()
+        self.clipboard_append(txt)
+        self._status("已复制选中内容")
+
+    def _log_copy_all(self) -> None:
+        try:
+            txt = self.txt.get("1.0", "end-1c")
+        except Exception:  # noqa: BLE001
+            txt = ""
+        self.clipboard_clear()
+        self.clipboard_append(txt or "（空）")
+        self._status("已复制全部日志")
 
     def _plog(self, msg: str) -> None:
         """插件操作消息：UI 日志区 + installer.log 双写。"""
@@ -870,10 +912,29 @@ class App(tk.Tk):
                    width=10).pack(side="left")
         ttk.Button(bar, text="从文件夹导入…", command=self._plugin_import,
                    width=14).pack(side="left", padx=6)
+        ttk.Button(bar, text="复制清单", command=self._plugin_copy_list,
+                   width=9).pack(side="left", padx=4)
         self.plugin_hint_lbl = ttk.Label(bar, text="扫描中…", foreground="#666")
         self.plugin_hint_lbl.pack(side="left", padx=6)
-        self.plugin_rows = ttk.Frame(box)
-        self.plugin_rows.pack(fill="both", expand=True, pady=(6, 0))
+        # 滚动容器
+        wrap = ttk.Frame(box)
+        wrap.pack(fill="both", expand=True, pady=(6, 0))
+        self.plugin_cv = tk.Canvas(wrap, highlightthickness=0)
+        self.plugin_sb = ttk.Scrollbar(wrap, orient="vertical",
+                                       command=self.plugin_cv.yview)
+        self.plugin_cv.configure(yscrollcommand=self.plugin_sb.set)
+        self.plugin_sb.pack(side="right", fill="y")
+        self.plugin_cv.pack(side="left", fill="both", expand=True)
+        self.plugin_rows = ttk.Frame(self.plugin_cv)
+        self._plugin_cw = self.plugin_cv.create_window((0, 0), window=self.plugin_rows,
+                                                       anchor="nw")
+        self.plugin_rows.bind("<Configure>", self._plugin_scroll_update)
+        self.plugin_cv.bind("<Configure>", self._plugin_canvas_width)
+        self.plugin_cv.bind("<Enter>",
+                            lambda e: self.plugin_cv.bind_all("<MouseWheel>",
+                                                              self._on_plugin_wheel))
+        self.plugin_cv.bind("<Leave>",
+                            lambda e: self.plugin_cv.unbind_all("<MouseWheel>"))
         self.plugin_btns: list[ttk.Button] = []
         self.plugin_note = ttk.Label(
             box, text="外部行可【接管】（限无 config 的独立行）；内置行只读。"
@@ -972,7 +1033,38 @@ class App(tk.Tk):
                 self.plugin_btns.append(btn)
         self.plugin_hint_lbl.configure(text=f"{len(cards)} 个插件"
                                        if cards else "无插件")
+        self._plugin_scroll_update()
+        try:
+            self.plugin_cv.yview_moveto(0)
+        except Exception:  # noqa: BLE001
+            pass
         self._set_plugin_busy(self.plugin_busy)
+
+    def _plugin_canvas_width(self, _e=None) -> None:
+        try:
+            self.plugin_cv.itemconfigure(self._plugin_cw,
+                                         width=self.plugin_cv.winfo_width())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _plugin_scroll_update(self, _e=None) -> None:
+        try:
+            self.plugin_cv.configure(scrollregion=self.plugin_cv.bbox("all"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_plugin_wheel(self, e) -> None:
+        try:
+            self.plugin_cv.yview_scroll(int(-e.delta / 120), "units")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _plugin_copy_list(self) -> None:
+        lines = [f"{c.slug}\t{self.STATE_CN.get(c.state, c.state)}"
+                 for c in getattr(self, "plugin_cards", [])]
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines) or "（空）")
+        self._status(f"已复制 {len(lines)} 行插件清单")
 
     @staticmethod
     def _row_actions(card: pstore.PluginCard) -> list[tuple[str, str, bool]]:

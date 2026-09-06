@@ -175,5 +175,35 @@ class PackTest(unittest.TestCase):
         self.assertTrue(out.exists())
 
 
+class StatusFilterTest(unittest.TestCase):
+    def test_status_view_excludes_undeclared_builtins(self) -> None:
+        home = make_home()
+        ps.commit_patch(home, (
+            "- insert:\n    - id: hello\n      name: '@dsh-user/hello'\n"
+            "- insert:\n    - id: time-context\n"
+            "      name: '@deepseek-ai/dsh-time-context'\n"))
+        dump = ps.parse_dump((
+            "# == C:\\home\\profiles\\web\\cordis.patch.yml\n"
+            "- id: hello\n  name: '@dsh-user/hello'\n"
+            "- id: time-context\n  name: '@deepseek-ai/dsh-time-context'\n"
+            "# == C:\\bundle\n"
+            "- id: agent\n  name: '@deepseek-ai/dsh-agent'\n"
+            "- id: timer\n  name: '@deepseek-ai/dsh-timer'\n"
+            "- id: hmr\n  name: '@deepseek-ai/dsh-client-hmr'\n"))
+        cards = ps.status_view(home, [], dump)
+        slugs = {c.slug for c in cards}
+        self.assertEqual(slugs, {"hello", "time-context"})
+        states = {c.slug: c.state for c in cards}
+        self.assertEqual(states["hello"], "external")
+        self.assertEqual(states["time-context"], "first_party")
+
+    def test_status_view_shows_only_downloaded_when_no_patch(self) -> None:
+        home = make_home()
+        dump = ps.parse_dump((
+            "- id: agent\n  name: '@deepseek-ai/dsh-agent'\n"))
+        cards = ps.status_view(home, [], dump)
+        self.assertEqual(cards, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

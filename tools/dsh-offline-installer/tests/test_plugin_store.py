@@ -280,6 +280,10 @@ class OperationTest(unittest.TestCase):
 
     def test_external_row_read_only_status(self) -> None:
         home = make_home()
+        ps.commit_patch(home, (
+            "- insert:\n    - id: lsp-echo\n      name: '@dsh-user/lsp-echo'\n"
+            "- insert:\n    - id: time-context\n"
+            "      name: '@deepseek-ai/dsh-time-context'\n"))
         dump = ps.parse_dump(
             "# == web\\cordis.patch.yml\n"
             "- id: lsp-echo\n  name: '@dsh-user/lsp-echo'\n"
