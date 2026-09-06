@@ -37,7 +37,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
@@ -1285,6 +1285,152 @@ def bundle_remove(home: Path, name: str, *, project: Optional[Path] = None,
         raise PluginError(_dsh_fail_msg(code, out, err, argv))
     if name in {n for n, _ in bundle_installed(home)}:
         raise PluginError(f"移除后仍在 dsh.profile.bundles：{name}")
+
+
+# ---------------------------------------------------------------- 插件市场（收录 + 本地 + 已装）
+
+@dataclass(frozen=True)
+class MarketEntry:
+    name: str            # 展示名（收录=目录名，否则=包名）
+    version: str
+    downloaded: bool     # 本地已有源码/tgz
+    installed: bool      # 已在 dsh.profile.bundles
+    builtin: bool
+    spec: str            # 用于 下载/安装 的 registry 规格（npm 名 / git url）
+    local: Optional[Path]
+    description: str
+
+
+def _curated_spec(name_or_npm: str) -> Optional[str]:
+    for c in CURATED_BUNDLES:
+        if name_or_npm in (c["npm"], c["name"]):
+            return c["npm"]
+    return None
+
+
+def market_entries(home: Path, project: Path,
+                   assets_dir: Optional[Path] = None) -> list[MarketEntry]:
+    """合并 收录清单 + 本地 bundle 候选 + 已安装 bundle，剔除内置模板。"""
+    row: dict[str, MarketEntry] = {}
+    for c in CURATED_BUNDLES:
+        row[c["npm"]] = MarketEntry(name=c["name"], version="", downloaded=False,
+                                    installed=False, builtin=False, spec=c["npm"],
+                                    local=None, description=c["description"])
+    for cand in bundle_candidates(project, assets_dir):
+        if cand.name in BUNDLE_BUILTIN:
+            continue
+        base = row.get(cand.name)
+        if base is None:
+            row[cand.name] = MarketEntry(name=cand.name, version=cand.version,
+                                         downloaded=True, installed=False,
+                                         builtin=False,
+                                         spec=_curated_spec(cand.name) or cand.name,
+                                         local=cand.path, description="")
+        else:
+            row[cand.name] = replace(base, downloaded=True, version=cand.version,
+                                     local=cand.path)
+    for name, builtin in bundle_installed(home):
+        if builtin:
+            continue
+        base = row.get(name)
+        if base is None:
+            row[name] = MarketEntry(name=name, version="", downloaded=False,
+                                    installed=True, builtin=False, spec=name,
+                                    local=None, description="")
+        else:
+            row[name] = replace(base, installed=True)
+    return list(row.values())
+
+
+def _pkg_from_tgz(tgz: Path) -> Optional[dict]:
+    try:
+        with tarfile.open(tgz, "r:gz") as tf:
+            for m in tf.getmembers():
+                if m.name in ("package/package.json", "package.json"):
+                    raw = tf.extractfile(m)
+                    if raw is None:
+                        return None
+                    return json.loads(raw.read().decode("utf-8"))
+    except (OSError, tarfile.TarError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def bundle_check(source: Path) -> tuple[str, list[str]]:
+    """校验 bundle 源（目录或 tgz）：返回 (包名, 错误列表)。"""
+    if source.is_dir():
+        pkg = _pkg_json(source)
+        try:
+            name = _bundle_name(source)
+        except PluginError:
+            name = ""
+    else:
+        pkg = _pkg_from_tgz(source)
+        name = (pkg or {}).get("name", "")
+    errs: list[str] = []
+    if pkg is None:
+        return name, ["缺 package.json"]
+    if not pkg.get("dsh", {}).get("bundle", {}).get("patch"):
+        errs.append("未声明 dsh.bundle.patch（不是 bundle 插件）")
+    if source.is_dir():
+        if not (source / "cordis.patch.yml").exists():
+            errs.append("缺 cordis.patch.yml")
+        main = (pkg.get("main") or "lib/index.js").lstrip("./")
+        if not (source / main).exists():
+            errs.append(f"入口 {main} 缺失（未构建 lib/）")
+        if pkg.get("dsh", {}).get("client") and not (source / "lib" / "client.js").exists():
+            errs.append("声明 dsh.client 但缺 lib/client.js")
+    else:
+        with tarfile.open(source, "r:gz") as tf:
+            names = {m.name for m in tf.getmembers()}
+        if "package/cordis.patch.yml" not in names:
+            errs.append("tgz 缺 package/cordis.patch.yml")
+        if "package/lib/index.js" not in names and not pkg.get("main", "").endswith("index.js"):
+            errs.append("tgz 缺 package/lib/index.js（未构建）")
+    return name, errs
+
+
+def bundle_latest_version(spec: str, *,
+                          run_npm: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
+                          ) -> Optional[str]:
+    """查 registry 最新版本（best-effort，npm view 需网络）。失败/无 npm 返回 None。"""
+    def npm(args: list[str]) -> tuple[int, str, str]:
+        if run_npm is not None:
+            return run_npm(args)
+        try:
+            r = subprocess.run(["npm", "view", spec, "version"],
+                               capture_output=True, text=True)
+            return r.returncode, r.stdout, r.stderr
+        except OSError:
+            return 127, "", "npm 不可用"
+    code, o, _e = npm(["view", spec, "version"])
+    if code != 0 or not o.strip():
+        return None
+    return o.strip().splitlines()[-1].strip()
+
+
+def bundle_update(home: Path, spec: str, *, project: Optional[Path] = None,
+                  run_dsh: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
+                  dsh_command: Optional[Sequence[str]] = None,
+                  env: Optional[dict] = None) -> str:
+    """更新已安装 bundle：registry 源 `dsh plugin add <spec>@latest`，备份可回滚。"""
+    name = _spec_pkg_name(spec)
+    if name in BUNDLE_BUILTIN:
+        raise PluginError(f"{name} 是内置模板 bundle，不可更新")
+    if name not in {n for n, _ in bundle_installed(home)}:
+        raise PluginError(f"{name} 未安装，无法更新")
+    backup = _backup_manifest(home)
+    project = project or Path.cwd()
+    argv = ["add", f"{spec}@latest"]
+    code, out, err = _run_dsh_plugin(argv, project=project, run_dsh=run_dsh,
+                                     dsh_command=dsh_command, env=env)
+    if code != 0:
+        _restore_manifest(home, backup)
+        raise PluginError(_dsh_fail_msg(code, out, err, argv))
+    if name not in {n for n, _ in bundle_installed(home)}:
+        _restore_manifest(home, backup)
+        raise PluginError(f"更新后 {name} 不在 dsh.profile.bundles（见日志）")
+    return name
 
 
 # ---------------------------------------------------------------- 状态合成

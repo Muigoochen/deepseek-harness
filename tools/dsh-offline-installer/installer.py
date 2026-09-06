@@ -947,32 +947,42 @@ class App(tk.Tk):
         self.btn_save.pack(anchor="e", pady=(2, 0))
         self._plugin_btns = self.plugin_btns
 
-        # 市场/包插件（dsh plugin 安装）：本地目录 / URL / 收录名
-        bundle = ttk.LabelFrame(box, text="市场/包插件（dsh plugin 安装）", padding=6)
+        # 插件市场（bundle，走 dsh plugin）：链接下载行 + 每行一个插件
+        bundle = ttk.LabelFrame(box, text="插件市场（bundle，走 dsh plugin 安装）", padding=6)
         bundle.pack(fill="x", pady=(6, 0))
-        bar2 = ttk.Frame(bundle)
-        bar2.pack(fill="x")
-        ttk.Label(bar2, text="源：").pack(side="left")
-        self.bundle_spec = tk.StringVar(value="dshmarket")
-        ttk.Entry(bar2, textvariable=self.bundle_spec, width=22).pack(side="left", padx=2)
-        ttk.Button(bar2, text="安装", width=6,
-                   command=lambda: self._bundle_act("install")).pack(side="left", padx=4)
-        ttk.Label(bar2, text="收录：").pack(side="left", padx=(8, 0))
-        for cb in pstore.CURATED_BUNDLES:
-            ttk.Button(bar2, text=cb["name"], width=12,
-                       command=lambda s=cb["name"]: self._bundle_quick(s)
-                       ).pack(side="left", padx=2)
-        self.bundle_hint = ttk.Label(
-            bundle, text="本地目录 / .tgz / 收录名：小助手抓取→构建→打包→装进 profile（需重启生效）",
-            foreground="#666", font=("Microsoft YaHei UI", 8))
-        self.bundle_hint.pack(anchor="w", pady=(4, 0))
-        self.bundle_rows = ttk.Frame(bundle)
-        self.bundle_rows.pack(fill="x", pady=(4, 0))
-        self._plugin_bundle_rows = self.bundle_rows
+        dl = ttk.Frame(bundle)
+        dl.pack(fill="x")
+        ttk.Label(dl, text="链接下载：").pack(side="left")
+        self.market_spec = tk.StringVar(value="dshmarket")
+        ttk.Entry(dl, textvariable=self.market_spec, width=26).pack(side="left", padx=2)
+        ttk.Button(dl, text="下载", width=6,
+                   command=lambda: self._market_act("download")).pack(side="left", padx=4)
+        ttk.Label(bundle, text="以 URL / npm 包名 / git 源下载到本地；行内再安装 / 卸载 / 更新",
+                  foreground="#666", font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(2, 0))
+        mwrap = ttk.Frame(bundle)
+        mwrap.pack(fill="x", pady=(4, 0))
+        self.market_cv = tk.Canvas(mwrap, height=150, highlightthickness=0)
+        self.market_sb = ttk.Scrollbar(mwrap, orient="vertical",
+                                       command=self.market_cv.yview)
+        self.market_cv.configure(yscrollcommand=self.market_sb.set)
+        self.market_sb.pack(side="right", fill="y")
+        self.market_cv.pack(side="left", fill="both", expand=True)
+        self.market_rows = ttk.Frame(self.market_cv)
+        self._market_cw = self.market_cv.create_window((0, 0), window=self.market_rows,
+                                                       anchor="nw")
+        self.market_rows.bind("<Configure>", self._market_scroll_update)
+        self.market_cv.bind("<Configure>", self._market_canvas_width)
+        self.market_cv.bind(
+            "<Enter>", lambda e: self.market_cv.bind_all("<MouseWheel>",
+                                                         self._on_market_wheel))
+        self.market_cv.bind("<Leave>",
+                            lambda e: self.market_cv.unbind_all("<MouseWheel>"))
+        self.market_btns: list[ttk.Button] = []
+        self.market_updates: dict[str, str] = {}
 
     def _set_plugin_busy(self, busy: bool) -> None:
         self.plugin_busy = busy
-        for b in self.plugin_btns:
+        for b in self.plugin_btns + list(getattr(self, "market_btns", [])):
             try:
                 b.configure(state="disabled" if busy or self.busy else "normal")
             except Exception:  # noqa: BLE001
@@ -1066,7 +1076,7 @@ class App(tk.Tk):
         except Exception:  # noqa: BLE001
             pass
         self._set_plugin_busy(self.plugin_busy)
-        self._refresh_bundles()
+        self._refresh_market()
 
     def _plugin_canvas_width(self, _e=None) -> None:
         try:
@@ -1094,48 +1104,94 @@ class App(tk.Tk):
         self.clipboard_append("\n".join(lines) or "（空）")
         self._status(f"已复制 {len(lines)} 行插件清单")
 
-    # ---------- 市场/包插件（dsh plugin 安装） ----------
+    # ---------- 插件市场（bundle，走 dsh plugin） ----------
 
-    def _bundle_quick(self, spec: str) -> None:
-        self.bundle_spec.set(spec)
-        self._bundle_act("install")
+    def _market_act(self, action: str) -> None:
+        spec = self.market_spec.get().strip()
+        if not spec:
+            self._append("[市场] 请先填 URL / npm 包名 / git 源")
+            return
+        self._market_run(spec, action)
 
-    def _bundle_act(self, kind: str) -> None:
+    def _market_run(self, value: str, action: str) -> None:
         if self.plugin_busy:
             return
-        spec = self.bundle_spec.get().strip()
-        if not spec:
-            self._append("[包] 请先填一个源：本地目录/.tgz/收录名/URL")
-            return
         self._set_plugin_busy(True)
-        self._append(f"[包] 待办：{kind} {spec}")
-        threading.Thread(target=self._bundle_worker, args=(kind, spec),
+        self._append(f"[市场] 待办：{action} {value}")
+        threading.Thread(target=self._market_worker, args=(action, value),
                          daemon=True).start()
 
-    def _bundle_worker(self, kind: str, spec: str) -> None:
+    def _market_worker(self, action: str, value: str) -> None:
         try:
             env = self._plugin_env()
             if env is None:
                 return
             home, project = env
-            if kind == "remove":
-                pstore.bundle_remove(home, spec, project=project,
-                                     env=self._bundle_env())
-                self._plog(f"[包] ✓ 已移除 {spec}")
-                self._status(f"已移除 bundle：{spec}（重启生效）")
-            else:
-                source = self._resolve_bundle_source(spec, project)
+            if action == "download":
+                pstore.bundle_fetch(value, project / "plugins")
+                self._plog(f"[市场] ✓ 已下载 {value} 到 plugins/")
+                self._status(f"已下载 {value}（可安装）")
+            elif action == "install":
+                source = self._resolve_bundle_source(value, project)
                 name = pstore.bundle_install(home, source, project=project,
                                              env=self._bundle_env())
-                self._plog(f"[包] ✓ 已安装 {name}（重启后生效）")
-                self._status(f"已安装 bundle：{name}（需重启网页版生效）")
+                self._plog(f"[市场] ✓ 已安装 {name}（重启生效）")
+                self._status(f"已安装 {name}（需重启网页版生效）")
+            elif action == "uninstall":
+                name = pstore._spec_pkg_name(value)
+                pstore.bundle_remove(home, name, project=project,
+                                     env=self._bundle_env())
+                self._plog(f"[市场] ✓ 已卸载 {name}（重启生效）")
+                self._status(f"已卸载 {name}")
+            elif action == "check":
+                local = self._market_local(value, project)
+                if local is None:
+                    raise pstore.PluginError(f"{value} 未下载，无法校验")
+                name, errs = pstore.bundle_check(local)
+                if errs:
+                    raise pstore.PluginError(
+                        f"{name or value} 校验未通过：\n" + "\n".join(errs))
+                self._plog(f"[市场] ✓ 校验通过：{name}")
+                self._status(f"校验通过：{name}")
+            elif action == "check_update":
+                spec = pstore._spec_pkg_name(value)
+                ver = pstore.bundle_latest_version(spec)
+                cur = self._local_version(spec, project)
+                self.market_updates[value] = \
+                    "outdated" if (ver and cur and ver != cur) else "current"
+                self._plog(f"[市场] 更新检查 {spec}：latest={ver or '?'} 本地={cur or '?'}")
+            elif action == "update":
+                spec = pstore._spec_pkg_name(value)
+                pstore.bundle_update(home, spec, project=project,
+                                     env=self._bundle_env())
+                self._plog(f"[市场] ✓ 已更新 {spec}（重启生效）")
+                self._status(f"已更新 {spec}")
         except (pstore.PluginError, pstore.GateError) as exc:
-            self._plog(f"[包] ✗ {spec}：{exc}")
-            self._status(f"包插件操作失败：{exc}", "#b00000")
-            messagebox.showerror("包插件操作失败", str(exc))
+            self._plog(f"[市场] ✗ {value}：{exc}")
+            self._status(f"市场操作失败：{exc}", "#b00000")
+            messagebox.showerror("市场操作失败", str(exc))
         finally:
-            self.after(0, self._refresh_bundles)
+            self.after(0, self._refresh_market)
             self._set_plugin_busy(False)
+
+    def _market_local(self, value: str, project: Path):
+        p = Path(value)
+        if p.exists() and (p / "package.json").exists():
+            return p
+        name = pstore._spec_pkg_name(value)
+        for c in pstore.bundle_candidates(project, ASSETS):
+            if c.name == name:
+                return c.path
+        cand = Path(project) / "plugins" / pstore._spec_name(value)
+        if (cand / "package.json").exists():
+            return cand
+        return None
+
+    def _local_version(self, spec: str, project: Path) -> str:
+        for c in pstore.bundle_candidates(project, ASSETS):
+            if c.name == pstore._spec_pkg_name(spec):
+                return c.version
+        return ""
 
     def _resolve_bundle_source(self, spec: str, project: Path) -> "Path | str":
         cand = Path(spec)
@@ -1167,45 +1223,89 @@ class App(tk.Tk):
             env["PATH"] = str(Path(pnpm).parent) + os.pathsep + env.get("PATH", "")
         return env
 
-    def _refresh_bundles(self) -> None:
+    def _refresh_market(self) -> None:
         def run():
             try:
-                home = plugin_home()
-                installed = pstore.bundle_installed(home)
-                self.after(0, lambda: self._apply_bundle_installed(installed))
+                env = self._plugin_env()
+                if env is None:
+                    return
+                home, project = env
+                entries = pstore.market_entries(home, project, ASSETS)
+                self.after(0, lambda: self._apply_market(entries))
             except Exception as exc:  # noqa: BLE001
-                self._append(f"[包] 刷新失败：{exc}")
+                self._append(f"[市场] 刷新失败：{exc}")
         threading.Thread(target=run, daemon=True).start()
 
-    def _apply_bundle_installed(self, installed) -> None:
-        for child in self.bundle_rows.winfo_children():
+    def _apply_market(self, entries) -> None:
+        for child in self.market_rows.winfo_children():
             child.destroy()
-        if not installed:
-            ttk.Label(self.bundle_rows, text="（未安装 bundle 插件）",
+        self.market_btns.clear()
+        if not entries:
+            ttk.Label(self.market_rows,
+                      text="（市场为空：在 plugins/ 放声明 dsh.bundle 的插件，或用上面链接下载）",
                       foreground="#888").pack(anchor="w")
             return
-        for name, builtin in installed:
-            row = ttk.Frame(self.bundle_rows)
+        for e in sorted(entries, key=lambda x: (not x.installed, x.name)):
+            row = ttk.Frame(self.market_rows)
             row.pack(fill="x", pady=1)
-            ttk.Label(row, text=name, width=26,
+            ttk.Label(row, text=e.name, width=20,
                       font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
-            tag = "内置" if builtin else "已安装"
-            ttk.Label(row, text=tag, width=6,
-                      foreground="#999" if builtin else "#2a6b2a"
-                      ).pack(side="left")
-            btn = ttk.Button(row, text="移除", width=6,
-                             command=lambda n=name: self._request_remove(n))
-            if builtin:
-                btn.configure(state="disabled")
-            btn.pack(side="left", padx=4)
+            ttk.Label(row, text=e.version or "—", width=9,
+                      foreground="#888").pack(side="left")
+            state, color = ("已安装", "#2a6b2a") if e.installed else \
+                (("已下载", "#1a6bb0") if e.downloaded else ("未下载", "#999"))
+            ttk.Label(row, text=state, width=8, foreground=color).pack(side="left")
+            ttk.Label(row, text=(e.description or "")[:22],
+                      foreground="#666").pack(side="left", fill="x", expand=True)
+            self._market_buttons(row, e)
+        self._market_scroll_update()
+        try:
+            self.market_cv.yview_moveto(0)
+        except Exception:  # noqa: BLE001
+            pass
 
-    def _request_remove(self, name: str) -> None:
-        if not messagebox.askyesno("移除确认",
-                                   f"移除 bundle 插件 {name}？\n"
-                                   f"（从 profile 卸载并更新 dsh.profile.bundles）"):
-            return
-        self.bundle_spec.set(name)
-        self._bundle_act("remove")
+    def _market_buttons(self, row, e) -> None:
+        local = str(e.local) if e.local else e.spec
+        if not e.installed and not e.downloaded:
+            self._mk_mkbtn(row, "下载", "download", e.spec)
+        if not e.installed and e.downloaded:
+            self._mk_mkbtn(row, "安装", "install", local)
+        if not e.installed:
+            self._mk_mkbtn(row, "校验", "check", local)
+        if e.installed:
+            self._mk_mkbtn(row, "卸载", "uninstall", e.spec)
+            self._mk_mkbtn(row, "校验", "check", local)
+            upd = self.market_updates.get(e.spec, "unknown")
+            label = {"unknown": "查看更新", "outdated": "可更新",
+                     "current": "已最新"}.get(upd, "查看更新")
+            act = {"unknown": "check_update", "outdated": "update",
+                   "current": "check_update"}.get(upd, "check_update")
+            self._mk_mkbtn(row, label, act, e.spec)
+
+    def _mk_mkbtn(self, row, text: str, action: str, value: str) -> None:
+        btn = ttk.Button(row, text=text, width=8,
+                         command=lambda v=value, a=action: self._market_run(v, a))
+        btn.pack(side="left", padx=2)
+        self.market_btns.append(btn)
+
+    def _market_scroll_update(self, _e=None) -> None:
+        try:
+            self.market_cv.configure(scrollregion=self.market_cv.bbox("all"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _market_canvas_width(self, _e=None) -> None:
+        try:
+            self.market_cv.itemconfigure(self._market_cw,
+                                         width=self.market_cv.winfo_width())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_market_wheel(self, e) -> None:
+        try:
+            self.market_cv.yview_scroll(int(-e.delta / 120), "units")
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     def _row_actions(card: pstore.PluginCard) -> list[tuple[str, str, bool]]:

@@ -30,14 +30,16 @@
    - 安装/停用/启用/卸载先记为草稿；点【全部保存并重启网页版】才落盘并重启验证
      （写盘前自动跑结构门校验；若补丁写坏或未生效，自动回滚 `.bak` 再重启）
    - v0.1 限制：不改插件 config；内置行只读展示；详见 docs/插件管理-设计.md
-8. 「市场/包插件（dsh plugin 安装）」：装 `dsh plugin add` 那一类 bundle 插件（如 dsh-market）：
-   - 源填本地目录 / `.tgz` / 收录名（内置 dsh-market、dsh-lsp-actions）/ npm 包名 / git URL
+8. 「插件市场」（bundle，走 `dsh plugin add`）：装 `dsh-market` 这类 bundle 插件
+   - **列表 = 收录（dsh-market、dsh-lsp-actions）+ 本地 bundle + 已安装合并**，每行一个插件，
+     按状态显示操作：**未下载→【下载】**、**已下载未装→【安装】**、**已安装→【卸载】**+【校验】+【查看更新】
+   - 【查看更新】→ 查 registry 最新版；有更新变【可更新】→ 点【可更新】升级；无更新/查不到显示【已最新】
+   - 顶部「链接下载」行可输入 URL / npm 包名 / git 源下载到本地
    - **收录名 / npm 包名 / URL 走 registry 直接安装**（用预构建产物，不克隆不构建）；
      本地目录缺 `lib/` 才会用自带 pnpm 构建，失败会给出完整报错并提示改用 npm 包
-   - `dsh plugin --profile web add <源>` 装进 profile → 核对 `dsh.profile.bundles` 新增 → 重启验证
-   - 已装的 bundle 会列出并支持【移除】（内置 `@deepseek-ai/dsh-base` 等标「内置」不可删）
-   - 安装是**真实写入** `$DSH_HOME/profiles/web`（会备份 package.json、失败自动回滚）；
-     需要网络与 pnpm 的步骤（registry 拉取/构建）在目标机上跑
+   - 校验/安装后核对 `dsh.profile.bundles`；装/卸/更新都**真实写入** `$DSH_HOME/profiles/web`
+     （会备份 package.json、失败自动回滚；内置 `@deepseek-ai/dsh-base` 等不列、不可删）；
+     需重启网页版生效
 
 ## 目录结构
 

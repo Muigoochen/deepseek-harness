@@ -209,5 +209,54 @@ class FetchSpecTest(unittest.TestCase):
         self.assertEqual(out.name, "dsh-market")
 
 
+class MarketTest(unittest.TestCase):
+    def test_market_entry_states(self) -> None:
+        home = make_home()
+        project = Path(tempfile.mkdtemp())
+        make_bundle(project / "plugins", "dsh-market", built=True, patch=True,
+                    name="dshmarket")
+        ps.profile_manifest_write(home, {"dsh": {"profile": {
+            "bundles": ["@deepseek-ai/dsh-base", "dshmarket"]}}})
+        entries = ps.market_entries(home, project)
+        by = {e.spec: e for e in entries}
+        e = by["dshmarket"]
+        self.assertTrue(e.downloaded)
+        self.assertTrue(e.installed)
+        self.assertIn("dsh-lsp-actions", by)           # 收录未下载
+        self.assertFalse(by["dsh-lsp-actions"].downloaded)
+        self.assertNotIn("@deepseek-ai/dsh-base", by)  # 内置不列
+
+    def test_bundle_check(self) -> None:
+        good = make_bundle(Path(tempfile.mkdtemp()), "ok", built=True, patch=True)
+        name, errs = ps.bundle_check(good)
+        self.assertEqual(name, "ok")
+        self.assertEqual(errs, [])
+        broken = make_bundle(Path(tempfile.mkdtemp()), "broken", built=False, patch=True)
+        _, errs = ps.bundle_check(broken)
+        self.assertTrue(any("未构建" in x for x in errs))
+        tgz = Path(tempfile.mkdtemp()) / "x.tgz"
+        ps.bundle_pack(good, tgz, name="ok", version="1")
+        _, errs = ps.bundle_check(tgz)
+        self.assertEqual(errs, [])
+
+    def test_latest_version(self) -> None:
+        def fake(_a: list[str]) -> tuple[int, str, str]:
+            return 0, "1.44.1\n", ""
+        self.assertEqual(ps.bundle_latest_version("dshmarket", run_npm=fake), "1.44.1")
+
+        def fake_err(_a: list[str]) -> tuple[int, str, str]:
+            return 1, "", "err"
+        self.assertIsNone(ps.bundle_latest_version("dshmarket", run_npm=fake_err))
+
+    def test_update(self) -> None:
+        home = make_home()
+        ps.profile_manifest_write(home, {"dsh": {"profile": {
+            "bundles": ["dshmarket"]}}})
+        fake = FakeDsh(home)
+        name = ps.bundle_update(home, "dshmarket", project=Path.home(), run_dsh=fake)
+        self.assertEqual(name, "dshmarket")
+        self.assertEqual(fake.calls[0][:2], ["add", "dshmarket@latest"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
