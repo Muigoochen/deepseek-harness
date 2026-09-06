@@ -1047,6 +1047,10 @@ class App(tk.Tk):
                       ).pack(side="left")
             desc = (card.description or "")[:40]
             ttk.Label(row, text=desc, foreground="#666").pack(side="left", fill="x", expand=True)
+            if card.validation_errors:
+                ttk.Label(row, text="⚠ " + card.validation_errors[0][:24],
+                          foreground="#b00000", font=("Microsoft YaHei UI", 8)
+                          ).pack(side="left")
             for text, act, enabled in self._row_actions(card):
                 btn = ttk.Button(row, text=text, width=8,
                                  command=lambda s=card.slug, a=act: self._plugin_act(s, a))
@@ -1206,8 +1210,9 @@ class App(tk.Tk):
     def _row_actions(card: pstore.PluginCard) -> list[tuple[str, str, bool]]:
         st = card.state
         if st == "downloaded":
-            return [("安装", "install", card.validation_errors == ()),
-                    ("校验失败", "none", card.validation_errors != ())]
+            if card.validation_errors:
+                return [("看原因", "none", True)]
+            return [("安装", "install", True)]
         if st == "enabled":
             return [("停用", "set_off", True), ("卸载", "uninstall", True)]
         if st == "disabled":
@@ -1219,8 +1224,15 @@ class App(tk.Tk):
     def _plugin_act(self, slug: str, action: str) -> None:
         if self.plugin_busy or action == "none":
             if action == "none":
-                messagebox.showinfo("校验失败",
-                                    "该插件未通过安装前置校验（name/lib/client 等），见日志。")
+                card = next((c for c in getattr(self, "plugin_cards", [])
+                             if c.slug == slug), None)
+                errs = list(card.validation_errors) if card and card.validation_errors \
+                    else ["未通过安装前置校验（name/lib/client 等）。"]
+                messagebox.showinfo(
+                    "未通过校验",
+                    f"{slug} 未通过安装前置校验：\n\n" + "\n".join(errs)
+                    + "\n\n修正后点「重新扫描」再试。")
+                self._plog(f"[插件] '看原因'：{slug} → {'；'.join(errs)}")
             return
         if action == "uninstall":
             if not messagebox.askyesno("卸载确认",
