@@ -21,9 +21,15 @@
   status_view(home, sources, dump)           -> list[PluginCard]
   structure_gate(home, patch_text, run_dump) -> DumpResult（失败抛 GateError）
   parse_dump(text)                           -> DumpResult（dump 输出解析）
+  bundle_candidates(project)                 -> list[BundleCandidate]（dsh.bundle 插件）
+  bundle_installed(home)                     -> list[(name, builtin)]
+  bundle_pack(dir, tgz, ...)                 # 把已构建 bundle 打成 npm 风格 tgz
+  bundle_install(home, source, ...)          # dsh plugin add 真实写入 + 备份回滚
+  bundle_remove(home, name, ...)
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -917,6 +923,333 @@ def list_archive_plugins(archive: Path) -> list[tuple[str, Validation]]:
         raise PluginError(f"无法读取离线包 {archive}：{exc}") from exc
     out.sort(key=lambda t: t[0])
     return out
+
+
+# ---------------------------------------------------------------- 市场/包插件（dsh plugin，v0.3）
+
+# 内置模板 bundle：由 profile 模板提供、不是依赖，不可安装/移除。
+BUNDLE_BUILTIN = ("@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app",
+                  "@deepseek-ai/dsh-acp-app", "@deepseek-ai/dsh-headless",
+                  "@deepseek-ai/dsh-sdk-app", "@deepseek-ai/dsh-sdk-minimal")
+
+# 收录清单：小助手认识的常用 bundle 插件（未下载可先抓取）。
+CURATED_BUNDLES = (
+    {"name": "dsh-market", "npm": "dshmarket",
+     "git": "https://github.com/dsh-market/dsh-market.git",
+     "description": "可视化插件市场（内含 dsh plugin 一键装社区插件）"},
+    {"name": "dsh-lsp-actions", "npm": "dsh-lsp-actions",
+     "git": "https://github.com/PerryLink/dsh-lsp-actions.git",
+     "description": "LSP 动作（打开文件、运行测试等）"},
+)
+
+
+@dataclass(frozen=True)
+class BundleCandidate:
+    path: Path
+    name: str
+    version: str
+    built: bool            # lib/index.js 已构建
+    has_client: bool
+
+
+def _web_pkg_json(home: Path) -> Path:
+    return home / "profiles" / "web" / "package.json"
+
+
+def profile_manifest(home: Path) -> dict:
+    p = _web_pkg_json(home)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PluginError(f"profile package.json 损坏：{p}") from exc
+
+
+def profile_manifest_write(home: Path, data: dict) -> None:
+    p = _web_pkg_json(home)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                 encoding="utf-8")
+
+
+def bundle_installed(home: Path) -> list[tuple[str, bool]]:
+    """web profile 已安装的 bundle 层（dsh.profile.bundles）；bool=是否内置模板。"""
+    data = profile_manifest(home)
+    names = data.get("dsh", {}).get("profile", {}).get("bundles", []) or []
+    return [(n, n in BUNDLE_BUILTIN) for n in names]
+
+
+def bundle_candidates(project: Path,
+                      assets_dir: Optional[Path] = None) -> list[BundleCandidate]:
+    """扫描项目 plugins/ 与 assets/plugins/ 里声明 `dsh.bundle.patch` 的目录。"""
+    roots = [project / "plugins"]
+    if assets_dir is not None:
+        roots.append(assets_dir / "plugins")
+    out: list[BundleCandidate] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            pkg = _pkg_json(d)
+            if pkg is None or pkg.get("dsh", {}).get("bundle", {}).get("patch") is None:
+                continue
+            name = pkg.get("name") or d.name
+            if name in seen:
+                continue
+            seen.add(name)
+            main = (pkg.get("main") or "lib/index.js").lstrip("./")
+            out.append(BundleCandidate(
+                path=d, name=name, version=pkg.get("version", ""),
+                built=(d / main).exists() or (d / "lib" / "index.js").exists(),
+                has_client=bool(pkg.get("dsh", {}).get("client"))))
+    out.sort(key=lambda b: (not b.built, b.name))
+    return out
+
+
+_PACK_EXCLUDE_DIRS = {"node_modules", ".git", "dist", "__pycache__", "tmp", ".dsh"}
+_PACK_MUST = {"package.json", "cordis.patch.yml", "lib", "client", "LICENSE"}
+
+
+def _bundle_members(dir_: Path) -> list[str]:
+    """按 package.json.files（缺省用默认集合）收集要进 tgz 的相对路径；跳过坏目录。"""
+    pkg = _pkg_json(dir_) or {}
+    want = set(pkg.get("files") or []) | _PACK_MUST
+    members: list[str] = []
+    for entry in sorted(want):
+        p = dir_ / entry
+        if not p.exists():
+            continue
+        if p.is_file():
+            members.append(entry)
+            continue
+        for root, dirs, files in os.walk(p, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in _PACK_EXCLUDE_DIRS]
+            rel = Path(root).relative_to(dir_)
+            for f in files:
+                members.append((rel / f).as_posix())
+    return [m for m in dict.fromkeys(members) if m]
+
+
+def bundle_pack(dir_: Path, out: Path, *, name: str, version: str) -> Path:
+    """把**已构建**的 bundle 打成 npm 风格 tgz（`package/` 前缀，省 npm/pnpm）。"""
+    if not (dir_ / "cordis.patch.yml").exists():
+        raise PluginError(f"{name} 缺 cordis.patch.yml，不能作为 bundle 安装")
+    if not (dir_ / "lib" / "index.js").exists() and not _pkg_main_present(dir_):
+        raise PluginError(f"{name} 未构建（缺 lib/index.js）——先构建，或改用现成 .tgz")
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    with tarfile.open(tmp, "w:gz") as tf:
+        for rel in _bundle_members(dir_):
+            p = dir_ / rel
+            if not p.is_file():
+                continue
+            data = p.read_bytes()
+            info = tarfile.TarInfo(f"package/{rel}")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    os.replace(tmp, out)
+    return out
+
+
+def _pkg_main_present(dir_: Path) -> bool:
+    pkg = _pkg_json(dir_) or {}
+    main = (pkg.get("main") or "lib/index.js").lstrip("./")
+    return (dir_ / main).exists()
+
+
+def _bundle_name(source: Path) -> str:
+    if source.is_dir():
+        pkg = _pkg_json(source)
+        if pkg is None:
+            raise PluginError(f"{source} 缺 package.json")
+        return pkg.get("name") or ""
+    with tarfile.open(source, "r:gz") as tf:
+        for m in tf.getmembers():
+            if m.name in ("package/package.json", "package.json"):
+                raw = tf.extractfile(m)
+                if raw is None:
+                    continue
+                return (json.loads(raw.read().decode("utf-8")) or {}).get("name") or ""
+    raise PluginError(f"无法从 {source} 识别包名")
+
+
+def _spec_url(spec: str) -> str:
+    for c in CURATED_BUNDLES:
+        if spec in (c["name"], c["npm"]):
+            return c["git"]
+    if spec.startswith("github:"):
+        return "https://github.com/" + spec[7:].rstrip("/") + ".git"
+    if "://" in spec:
+        base = spec.rstrip("/")
+        if "github.com" in base and not base.endswith(".git"):
+            return base + ".git"
+        return base
+    return spec
+
+
+def _tail(o: str, e: str) -> str:
+    lines = (e or o or "").strip().splitlines()
+    return "\n".join(lines[-8:])
+
+
+def bundle_fetch(spec: str, dest_dir: Path, *,
+                 run_git: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
+                 ) -> Path:
+    """抓取 bundle 源到 dest_dir/<name>（git clone 浅克隆）。已在本地则复用。"""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    name = _spec_name(spec)
+    target = dest_dir / name
+    if (target / "package.json").exists():
+        return target
+
+    def git(args: list[str]) -> tuple[int, str, str]:
+        if run_git is not None:
+            return run_git(args)
+        try:
+            r = subprocess.run(["git"] + args, capture_output=True, text=True)
+            return r.returncode, r.stdout, r.stderr
+        except OSError as exc:
+            raise PluginError(f"无法运行 git（抓取 {spec}）：{exc}") from exc
+
+    url = _spec_url(spec)
+    code, o, e = git(["clone", "--depth", "1", url, str(target)])
+    if code != 0:
+        raise PluginError(f"git clone 失败（{url}）：\n{_tail(o, e)}")
+    return target
+
+
+def _spec_name(spec: str) -> str:
+    for c in CURATED_BUNDLES:
+        if spec in (c["name"], c["npm"]):
+            return c["name"]
+    if spec.startswith("github:"):
+        tail = spec[7:].split("/")[1] if "/" in spec[7:] else spec[7:]
+        return tail.rstrip("/").lower()
+    if "://" in spec:
+        return spec.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git").lower()
+    return spec
+
+
+def bundle_build(dir_: Path, *,
+                 run_pnpm: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
+                 ) -> bool:
+    """用 pnpm 构建 bundle 到 lib/（需目标机有 pnpm；缺 node_modules 先装依赖）。"""
+    env_pnpm = shutil.which("pnpm") or "pnpm"
+
+    def run(args: list[str]) -> tuple[int, str, str]:
+        if run_pnpm is not None:
+            return run_pnpm(args)
+        try:
+            r = subprocess.run(args, cwd=str(dir_), shell=(os.name == "nt"),
+                               capture_output=True, text=True)
+            return r.returncode, r.stdout, r.stderr
+        except OSError as exc:
+            raise PluginError(f"无法运行 pnpm：{exc}") from exc
+
+    if not (dir_ / "node_modules").exists():
+        code, o, e = run([env_pnpm, "install"])
+        if code != 0:
+            raise PluginError(f"插件依赖安装失败：\n{_tail(o, e)}")
+    code, o, e = run([env_pnpm, "run", "build"])
+    if code != 0:
+        raise PluginError(f"插件构建失败：\n{_tail(o, e)}")
+    return (dir_ / "lib" / "index.js").exists()
+
+
+def _backup_manifest(home: Path) -> tuple[Path, Optional[bytes]]:
+    p = _web_pkg_json(home)
+    return p, (p.read_bytes() if p.exists() else None)
+
+
+def _restore_manifest(home: Path, backup: tuple[Path, Optional[bytes]]) -> None:
+    p, data = backup
+    if data is None:
+        if p.exists():
+            p.unlink()
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+
+
+def _dsh_fail_msg(code: int, out: str, err: str, args: Sequence[str]) -> str:
+    reason = ""
+    comb = (err or out or "")
+    if "pnpm not found" in comb or "pnpm not found on PATH" in comb:
+        reason = "未检测到 pnpm（小助手构建需要它）"
+    elif "allowBuilds" in comb:
+        reason = "git 源构建被 pnpm 拦截（allowBuilds）"
+    return (f"dsh plugin {' '.join(args)} 失败(exit {code})："
+            f"{reason}\n{_tail(out, err)}")
+
+
+def _run_dsh_plugin(args: Sequence[str], *, project: Path,
+                    run_dsh: Optional[Callable[[list[str]], tuple[int, str, str]]],
+                    dsh_command: Optional[Sequence[str]] = None,
+                    env: Optional[dict] = None) -> tuple[int, str, str]:
+    if run_dsh is not None:
+        return run_dsh(list(args))
+    cmd = (resolve_dsh_command(project) if not dsh_command else list(dsh_command)) \
+        + ["plugin", "--profile", "web"] + list(args)
+    try:
+        r = subprocess.run(cmd, cwd=str(project), env=env,
+                           capture_output=True, text=True)
+    except OSError as exc:
+        raise PluginError(f"无法运行 dsh plugin：{exc}") from exc
+    return r.returncode, r.stdout, r.stderr
+
+
+def bundle_install(home: Path, source: Path, *, project: Optional[Path] = None,
+                   run_dsh: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
+                   dsh_command: Optional[Sequence[str]] = None,
+                   env: Optional[dict] = None) -> str:
+    """真实安装 bundle：`dsh plugin --profile web add <绝对路径>`，备份可回滚。"""
+    source = Path(source)
+    if not source.exists():
+        raise PluginError(f"插件源不存在：{source}")
+    name = _bundle_name(source)
+    if not name:
+        raise PluginError(f"无法识别 {source} 的包名")
+    if name in BUNDLE_BUILTIN:
+        raise PluginError(f"{name} 是内置模板 bundle，无需安装")
+    backup = _backup_manifest(home)
+    project = project or Path.cwd()
+    argv = ["add", str(source.resolve())]
+    code, out, err = _run_dsh_plugin(argv, project=project, run_dsh=run_dsh,
+                                     dsh_command=dsh_command, env=env)
+    if code != 0:
+        _restore_manifest(home, backup)
+        raise PluginError(_dsh_fail_msg(code, out, err, argv))
+    if name not in {n for n, _ in bundle_installed(home)}:
+        _restore_manifest(home, backup)
+        raise PluginError(f"安装后未在 dsh.profile.bundles 发现 {name}（见日志）")
+    return name
+
+
+def bundle_remove(home: Path, name: str, *, project: Optional[Path] = None,
+                  run_dsh: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
+                  dsh_command: Optional[Sequence[str]] = None,
+                  env: Optional[dict] = None) -> None:
+    if name in BUNDLE_BUILTIN:
+        raise PluginError(f"{name} 是内置模板 bundle，不可移除")
+    if name not in {n for n, _ in bundle_installed(home)}:
+        raise PluginError(f"{name} 未安装")
+    backup = _backup_manifest(home)
+    project = project or Path.cwd()
+    argv = ["remove", name]
+    code, out, err = _run_dsh_plugin(argv, project=project, run_dsh=run_dsh,
+                                     dsh_command=dsh_command, env=env)
+    if code != 0:
+        _restore_manifest(home, backup)
+        raise PluginError(_dsh_fail_msg(code, out, err, argv))
+    if name in {n for n, _ in bundle_installed(home)}:
+        raise PluginError(f"移除后仍在 dsh.profile.bundles：{name}")
 
 
 # ---------------------------------------------------------------- 状态合成

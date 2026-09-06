@@ -947,6 +947,29 @@ class App(tk.Tk):
         self.btn_save.pack(anchor="e", pady=(2, 0))
         self._plugin_btns = self.plugin_btns
 
+        # 市场/包插件（dsh plugin 安装）：本地目录 / URL / 收录名
+        bundle = ttk.LabelFrame(box, text="市场/包插件（dsh plugin 安装）", padding=6)
+        bundle.pack(fill="x", pady=(6, 0))
+        bar2 = ttk.Frame(bundle)
+        bar2.pack(fill="x")
+        ttk.Label(bar2, text="源：").pack(side="left")
+        self.bundle_spec = tk.StringVar(value="dshmarket")
+        ttk.Entry(bar2, textvariable=self.bundle_spec, width=22).pack(side="left", padx=2)
+        ttk.Button(bar2, text="安装", width=6,
+                   command=lambda: self._bundle_act("install")).pack(side="left", padx=4)
+        ttk.Label(bar2, text="收录：").pack(side="left", padx=(8, 0))
+        for cb in pstore.CURATED_BUNDLES:
+            ttk.Button(bar2, text=cb["name"], width=12,
+                       command=lambda s=cb["name"]: self._bundle_quick(s)
+                       ).pack(side="left", padx=2)
+        self.bundle_hint = ttk.Label(
+            bundle, text="本地目录 / .tgz / 收录名：小助手抓取→构建→打包→装进 profile（需重启生效）",
+            foreground="#666", font=("Microsoft YaHei UI", 8))
+        self.bundle_hint.pack(anchor="w", pady=(4, 0))
+        self.bundle_rows = ttk.Frame(bundle)
+        self.bundle_rows.pack(fill="x", pady=(4, 0))
+        self._plugin_bundle_rows = self.bundle_rows
+
     def _set_plugin_busy(self, busy: bool) -> None:
         self.plugin_busy = busy
         for b in self.plugin_btns:
@@ -1039,6 +1062,7 @@ class App(tk.Tk):
         except Exception:  # noqa: BLE001
             pass
         self._set_plugin_busy(self.plugin_busy)
+        self._refresh_bundles()
 
     def _plugin_canvas_width(self, _e=None) -> None:
         try:
@@ -1065,6 +1089,118 @@ class App(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append("\n".join(lines) or "（空）")
         self._status(f"已复制 {len(lines)} 行插件清单")
+
+    # ---------- 市场/包插件（dsh plugin 安装） ----------
+
+    def _bundle_quick(self, spec: str) -> None:
+        self.bundle_spec.set(spec)
+        self._bundle_act("install")
+
+    def _bundle_act(self, kind: str) -> None:
+        if self.plugin_busy:
+            return
+        spec = self.bundle_spec.get().strip()
+        if not spec:
+            self._append("[包] 请先填一个源：本地目录/.tgz/收录名/URL")
+            return
+        self._set_plugin_busy(True)
+        self._append(f"[包] 待办：{kind} {spec}")
+        threading.Thread(target=self._bundle_worker, args=(kind, spec),
+                         daemon=True).start()
+
+    def _bundle_worker(self, kind: str, spec: str) -> None:
+        try:
+            env = self._plugin_env()
+            if env is None:
+                return
+            home, project = env
+            if kind == "remove":
+                pstore.bundle_remove(home, spec, project=project,
+                                     env=self._bundle_env())
+                self._plog(f"[包] ✓ 已移除 {spec}")
+                self._status(f"已移除 bundle：{spec}（重启生效）")
+            else:
+                source = self._resolve_bundle_source(spec, project)
+                name = pstore.bundle_install(home, source, project=project,
+                                             env=self._bundle_env())
+                self._plog(f"[包] ✓ 已安装 {name}（重启后生效）")
+                self._status(f"已安装 bundle：{name}（需重启网页版生效）")
+        except (pstore.PluginError, pstore.GateError) as exc:
+            self._plog(f"[包] ✗ {spec}：{exc}")
+            self._status(f"包插件操作失败：{exc}", "#b00000")
+            messagebox.showerror("包插件操作失败", str(exc))
+        finally:
+            self.after(0, self._refresh_bundles)
+            self._set_plugin_busy(False)
+
+    def _resolve_bundle_source(self, spec: str, project: Path) -> Path:
+        cand = Path(spec)
+        if cand.exists() and (cand / "package.json").exists():
+            return cand
+        if cand.exists() and cand.suffix == ".tgz":
+            return cand
+        tgz = ASSETS / f"{spec}.tgz"
+        if tgz.exists():
+            return tgz
+        # 收录名/URL → 抓取到项目 plugins/，缺 lib 则构建，再打包
+        self._plog(f"[包] {spec} 本地未找到，尝试从仓库抓取…")
+        dest = pstore.bundle_fetch(spec, project / "plugins")
+        if not (dest / "lib" / "index.js").exists():
+            self._plog(f"[包] {spec} 未构建，用 pnpm 构建（需能装 devDeps）…")
+            pstore.bundle_build(dest)
+        pkg = pstore._pkg_json(dest) or {}
+        name = pstore._bundle_name(dest)
+        tgz_out = ASSETS / ".cache" / f"{name}-{pkg.get('version', '')}.tgz"
+        pstore.bundle_pack(dest, tgz_out, name=name,
+                           version=pkg.get("version", ""))
+        return tgz_out
+
+    def _bundle_env(self) -> dict:
+        env = dict(os.environ)
+        pnpm = find_pnpm()
+        if pnpm:
+            env["PATH"] = str(Path(pnpm).parent) + os.pathsep + env.get("PATH", "")
+        return env
+
+    def _refresh_bundles(self) -> None:
+        def run():
+            try:
+                home = plugin_home()
+                installed = pstore.bundle_installed(home)
+                self.after(0, lambda: self._apply_bundle_installed(installed))
+            except Exception as exc:  # noqa: BLE001
+                self._append(f"[包] 刷新失败：{exc}")
+        threading.Thread(target=run, daemon=True).start()
+
+    def _apply_bundle_installed(self, installed) -> None:
+        for child in self.bundle_rows.winfo_children():
+            child.destroy()
+        if not installed:
+            ttk.Label(self.bundle_rows, text="（未安装 bundle 插件）",
+                      foreground="#888").pack(anchor="w")
+            return
+        for name, builtin in installed:
+            row = ttk.Frame(self.bundle_rows)
+            row.pack(fill="x", pady=1)
+            ttk.Label(row, text=name, width=26,
+                      font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
+            tag = "内置" if builtin else "已安装"
+            ttk.Label(row, text=tag, width=6,
+                      foreground="#999" if builtin else "#2a6b2a"
+                      ).pack(side="left")
+            btn = ttk.Button(row, text="移除", width=6,
+                             command=lambda n=name: self._request_remove(n))
+            if builtin:
+                btn.configure(state="disabled")
+            btn.pack(side="left", padx=4)
+
+    def _request_remove(self, name: str) -> None:
+        if not messagebox.askyesno("移除确认",
+                                   f"移除 bundle 插件 {name}？\n"
+                                   f"（从 profile 卸载并更新 dsh.profile.bundles）"):
+            return
+        self.bundle_spec.set(name)
+        self._bundle_act("remove")
 
     @staticmethod
     def _row_actions(card: pstore.PluginCard) -> list[tuple[str, str, bool]]:
