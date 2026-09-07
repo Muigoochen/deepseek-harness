@@ -482,7 +482,8 @@ def parse_dump(text: str) -> DumpResult:
 
 def clone_profile_files(home: Path, dst_profiles: Path) -> Path:
     """把 $DSH_HOME/profiles 的普通文件拷到 dst_profiles；跳过 junction/目录链接
-    与 node_modules（dump 不 import 模块，见 .probe 冒烟）。返回 dst_profiles。"""
+    与 node_modules（dump 不 import 模块，见 .probe 冒烟；已安装的 out-of-tree bundle
+    由 structure_gate 的 _stage_profile_bundles 另行按内容重建）。返回 dst_profiles。"""
     src = home / "profiles"
     if not src.is_dir():
         raise PluginError(f"缺少 profiles 目录：{src}")
@@ -530,6 +531,67 @@ def resolve_dsh_command(project: Optional[Path] = None) -> list[str]:
     raise PluginError("找不到 dsh CLI（结构门需要它）；请显式传 dsh_command/run_dump。")
 
 
+def _node_modules_walk(anchor: Path) -> list[Path]:
+    """Node `createRequire(anchor/package.json).resolve.paths` 的向上 node_modules 列表。"""
+    paths: list[Path] = []
+    cur = anchor
+    while True:
+        paths.append(cur / "node_modules")
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return paths
+
+
+def _bundle_real_dirs(home: Path) -> list[tuple[str, Path]]:
+    """web profile 声明、且能从 profile 的 node_modules 解析到的 out-of-tree bundle。
+
+    返回 [(name, 真实 bundle 包目录)]；内置模板 bundle（从安装锚解析）与未安装的跳过。
+    """
+    data = profile_manifest(home)
+    names = data.get("dsh", {}).get("profile", {}).get("bundles", []) or []
+    profile = home / "profiles" / "web"
+    out: list[tuple[str, Path]] = []
+    for name in names:
+        if not isinstance(name, str) or name in BUNDLE_BUILTIN:
+            continue
+        for nm in _node_modules_walk(profile):
+            cand = nm / name
+            if (cand / "package.json").is_file():
+                out.append((name, cand))
+                break
+    return out
+
+
+def _copy_bundle_content(src_pkg: Path, dst_pkg: Path) -> None:
+    """按真实内容拷贝一个 bundle 包目录：解引用 junction/symlink，裁剪依赖子目录。
+
+    dump 判 bundle 只需包目录 + package.json + 声明的 patch 文件，故不拷
+    node_modules/.pnpm/.bin，产物是自洽真实文件（无指向克隆 .pnpm 的悬挂链接）。
+    """
+    real = Path(os.path.realpath(src_pkg))
+    if not real.is_dir():
+        raise PluginError(f"无法解析 bundle 真实目录：{src_pkg}")
+    shutil.copytree(real, dst_pkg, symlinks=False,
+                    ignore=shutil.ignore_patterns("node_modules", ".pnpm", ".bin"),
+                    dirs_exist_ok=True)
+
+
+def _stage_profile_bundles(home: Path, clone_home: Path) -> None:
+    """结构门克隆自洽化：把声明到且真实安装的 out-of-tree bundle 按内容拷进克隆 node_modules，
+    使 `dsh --profile web --dump-config` 能像真实 home 一样解析这些 bundle。
+
+    `@dsh-user` 是 patch 行、dump 不 import，无需拷贝。任何 bundle 拷不出来都抛
+    PluginError（结构门失败不落盘，绝不静默跳过）。"""
+    profile = clone_home / "profiles" / "web"
+    for name, src in _bundle_real_dirs(home):
+        try:
+            _copy_bundle_content(src, profile / "node_modules" / name)
+        except (OSError, shutil.Error) as exc:
+            raise PluginError(
+                f"结构门无法在克隆中重建 bundle {name}（{src}）：{exc}") from exc
+
+
 def structure_gate(home: Path, patch_text: str,
                    run_dump: Optional[Callable[[Path], DumpResult]] = None,
                    *, project: Optional[Path] = None,
@@ -545,6 +607,7 @@ def structure_gate(home: Path, patch_text: str,
     tmp_home = Path(base)
     try:
         profiles = clone_profile_files(home, tmp_home / "profiles")
+        _stage_profile_bundles(home, tmp_home)   # 让克隆能解析声明到的 out-of-tree bundle
         patch = profiles / "web" / "cordis.patch.yml"
         patch.parent.mkdir(parents=True, exist_ok=True)
         patch.write_text(patch_text, encoding="utf-8")
@@ -1559,10 +1622,18 @@ def status_view(home: Path, sources: Sequence[PluginSource],
                 description="", origin="bundle/profile",
                 installed_dir=None, source=None, first_party=True))
 
-    # 已下载（来源有、组合无）
+    # 已下载（来源有、补丁没声明）→ 可安装；声明了但 dump 未带出（如结构门因 bundle 失败）→ 外部·只读
     for s in sources:
-        if s.slug not in slugs:
-            slugs.add(s.slug)
+        if s.slug in slugs:
+            continue
+        slugs.add(s.slug)
+        if s.slug in declared:
+            cards.append(PluginCard(
+                slug=s.slug, name=f"@dsh-user/{s.slug}", state="external",
+                description=s.description, origin=s.origin,
+                installed_dir=None, source=s.path,
+                first_party=False, validation_errors=s.validation.errors))
+        else:
             cards.append(PluginCard(
                 slug=s.slug, name=f"@dsh-user/{s.slug}", state="downloaded",
                 description=s.description, origin=s.origin,

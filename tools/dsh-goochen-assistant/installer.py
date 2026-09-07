@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DeepSeek Harness 安装助手（图形版 · 双模：离线/在线/自动）
+"""DSH-孤辰小助手（图形版 · 双模：离线/在线/自动）
 
 面向小白：双击 run.bat 或 installer.py 后按按钮即可。同一程序在
 assets/ 齐全时走『全离线零网络』，assets 缺失时自动走官方源 / 镜像
@@ -32,7 +32,7 @@ import plugin_store as pstore  # 插件管理原语（同目录模块）
 
 __version__ = "0.1.0"
 
-APP_TITLE = "DeepSeek Harness 安装助手 v0.1"
+APP_TITLE = "DSH-孤辰小助手 v0.1"
 REGISTRY_MIRROR = "https://registry.npmmirror.com"
 REGISTRY_OFFICIAL = "https://registry.npmjs.org"
 NODE_MSI_URL = "https://nodejs.org/dist/v24.20.0/node-v24.20.0-x64.msi"
@@ -410,17 +410,7 @@ class Engine:
         if start:
             self.start(project)
         else:
-            self.log("…安装/构建完成（未自动启动）；可点『只启动网页版』开始使用")
-
-    def run_start_only(self) -> None:
-        env = self.check_env()
-        if not env.get("node"):
-            raise InstallError("未检测到 Node.js；请先完成「一键完整安装」")
-        if not env.get("pnpm"):
-            raise InstallError("未检测到 pnpm；请先完成「一键完整安装」")
-        if not PROJECT_DIR.exists():
-            raise InstallError(f"未找到项目源码 {PROJECT_DIR}；请先完成「一键完整安装」")
-        self.start(PROJECT_DIR)
+            self.log("…安装/构建完成（未自动启动）；可点『运行』开始使用")
 
 
 # ---------------------------------------------------------------- GUI
@@ -450,6 +440,9 @@ class App(tk.Tk):
         self.web_tail: deque[str] = deque(maxlen=500)
         self.rollback_armed = False
         self._activation_checks = 0
+        # --- 会话迁移（v0.1）状态 ---
+        self.mig_busy = False
+        self.mig_rows: list[dict[str, str]] = []
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(400, self._refresh_plugins)
@@ -463,13 +456,15 @@ class App(tk.Tk):
         ttk.Label(root, text="自动：检测环境 → Node → pnpm → 源码 → 依赖 → 构建 → 打开网页版",
                   foreground="#555").pack(anchor="w", pady=(0, 6))
 
-        # 分页：安装与启动 / 插件
+        # 分页：安装与启动 / 插件 / 会话迁移
         nb = ttk.Notebook(root)
         nb.pack(fill="both", expand=True, pady=(2, 0))
         tab_run = ttk.Frame(nb, padding=8)
         nb.add(tab_run, text="安装与启动")
         tab_plug = ttk.Frame(nb, padding=8)
         nb.add(tab_plug, text="插件")
+        tab_mig = ttk.Frame(nb, padding=8)
+        nb.add(tab_mig, text="会话迁移")
 
         # ---------------- Tab 1：安装与启动 ----------------
         # 安装方式
@@ -495,10 +490,7 @@ class App(tk.Tk):
         btns.pack(fill="x", pady=6)
         self.btn_full = ttk.Button(btns, text="一键完整安装", command=self.on_full)
         self.btn_full.pack(side="left", ipadx=16, ipady=3)
-        self.btn_start = ttk.Button(btns, text="只启动网页版", command=self.on_start)
-        self.btn_start.pack(side="left", padx=8, ipadx=16, ipady=3)
-        self.btn_term = ttk.Button(btns, text="▶ 在窗口内运行 dsh web",
-                                   command=self.on_terminal)
+        self.btn_term = ttk.Button(btns, text="运行", command=self.on_terminal)
         self.btn_term.pack(side="left", padx=8, ipadx=16, ipady=3)
         self.btn_stop = ttk.Button(btns, text="⏹ 停止服务", command=self.on_stop_terminal,
                                    state="disabled")
@@ -526,7 +518,7 @@ class App(tk.Tk):
         self.btn_copy_url.pack(side="left", padx=8, ipadx=12, ipady=2)
         self.btn_copy_path = ttk.Button(row, text="复制项目路径", command=self.on_copy_path)
         self.btn_copy_path.pack(side="left", ipadx=12, ipady=2)
-        ttk.Label(ops, text="用「▶ 在窗口内运行 dsh web」启动后，可在此再次打开或复制带 token 的登录地址。",
+        ttk.Label(ops, text="用「运行」启动后，可在此再次打开或复制带 token 的登录地址。",
                   foreground="#666").pack(anchor="w", pady=(6, 0))
 
         # 日志（终端）
@@ -547,10 +539,14 @@ class App(tk.Tk):
         # ---------------- Tab 2：插件 ----------------
         self._build_plugin_ui(tab_plug)
 
+        # ---------------- Tab 3：会话迁移 ----------------
+        self._build_migrate_ui(tab_mig)
+
         self.status = ttk.Label(root, text="就绪", foreground="#1a6b1a")
         self.status.pack(anchor="w", pady=(6, 0))
 
-        self._append("欢迎！安装/启动/服务日志在「安装与启动」页；插件管理在「插件」页。")
+        self._append("欢迎！安装/启动/服务日志在「安装与启动」页；插件管理在「插件」页；"
+                     "会话迁移（换 preset）在「会话迁移」页。")
         self.log = self._append
 
     def _append(self, msg: str) -> None:
@@ -610,14 +606,29 @@ class App(tk.Tk):
         self.busy = busy
         state = "disabled" if busy else "normal"
         self.btn_full.configure(state=state)
-        self.btn_start.configure(state=state)
-        self.btn_term.configure(state=state)
         for b in getattr(self, "_plugin_btns", ()):
             try:
                 b.configure(state="disabled" if busy or self.plugin_busy else "normal")
             except Exception:  # noqa: BLE001
                 pass
         self.btn_open_page.configure(state=state)
+        self._update_run_buttons()
+
+    def _update_run_buttons(self) -> None:
+        """「运行」与「停止服务」互斥：运行中=运行灰、停止可用；否则反之。"""
+        def apply() -> None:
+            try:
+                running = self.web_proc is not None and self.web_proc.poll() is None
+                self.btn_term.configure(
+                    state="disabled" if (running or self.busy) else "normal")
+                self.btn_stop.configure(
+                    state="normal" if (running and not self.busy) else "disabled")
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self.after(0, apply)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _status(self, text: str, color: str = "#1a6b1a") -> None:
         def setit():
@@ -633,30 +644,15 @@ class App(tk.Tk):
         self._set_busy(True)
         eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
                      log=self._append)
-        threading.Thread(target=self._job, args=(eng, "full"), daemon=True).start()
+        threading.Thread(target=self._job, args=(eng,), daemon=True).start()
 
-    def on_start(self) -> None:
-        if self.busy:
-            return
-        self._set_busy(True)
-        eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
-                     log=self._append)
-        threading.Thread(target=self._job, args=(eng, "start"), daemon=True).start()
-
-    def _job(self, eng: Engine, which: str) -> None:
+    def _job(self, eng: Engine) -> None:
         try:
-            if which == "full":
-                self._status("安装进行中…", "#b36b00")
-                eng.run_full(headless=False, start=True)
-                self._status("完成 ✓ 已启动网页版", "#1a6b1a")
-                messagebox.showinfo("完成", f"安装完成！\n浏览器将打开 {WEB_URL}。\n"
-                                            "日常使用直接点『只启动网页版』。")
-            else:
-                self._status("启动中…", "#b36b00")
-                eng.run_start_only()
-                self._status("运行中 ✓ 网页版已启动", "#1a6b1a")
-                messagebox.showinfo("启动", f"网页版已启动：\n{WEB_URL}\n"
-                                            "（详情看日志，含带 token 的地址）")
+            self._status("安装进行中…", "#b36b00")
+            eng.run_full(headless=False, start=True)
+            self._status("完成 ✓ 已启动网页版", "#1a6b1a")
+            messagebox.showinfo("完成", f"安装完成！\n浏览器将打开 {WEB_URL}。\n"
+                                        "日常使用点「运行」。")
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             self._append(f"\n✗ 失败：{msg}")
@@ -726,7 +722,7 @@ class App(tk.Tk):
             self._append(f"[终端] ✗ 启动失败：{exc}")
             return False
         self.web_proc = proc
-        self.btn_stop.configure(state="normal")
+        self._update_run_buttons()
         self._status("dsh web 运行中（输出见日志区）", "#1a6b1a")
         threading.Thread(target=self._pump_web, args=(proc,), daemon=True).start()
         return True
@@ -754,7 +750,7 @@ class App(tk.Tk):
         if not alive or time.monotonic() > self._open_deadline:
             self._open_pending = False
             self._append("[浏览器] 未能捕获登录地址（服务未运行或超时）。"
-                         "请点『▶ 在窗口内运行 dsh web』后重试。")
+                         "请点『运行』后重试。")
             self._status("未捕获登录地址", "#b00000")
             return
         self.after(400, self._poll_pending_open)
@@ -853,7 +849,7 @@ class App(tk.Tk):
             self.web_auth_url = None
             self._update_web_buttons()
             self.after(0, self._poll_pending_open)
-            self.after(0, lambda: self.btn_stop.configure(state="disabled"))
+            self.after(0, self._update_run_buttons)
             self.after(0, lambda: self._status("就绪"))
 
     def on_stop_terminal(self) -> None:
@@ -866,7 +862,7 @@ class App(tk.Tk):
         if proc is None or proc.poll() is not None:
             if not quiet:
                 self._append("[终端] 当前没有运行中的服务。")
-                self.btn_stop.configure(state="disabled")
+                self._update_run_buttons()
             return
         if not quiet:
             self._append("[终端] 正在停止 dsh web …")
@@ -883,7 +879,7 @@ class App(tk.Tk):
         self._update_web_buttons()
         if not quiet:
             self._append("[终端] 已停止。")
-            self.btn_stop.configure(state="disabled")
+            self._update_run_buttons()
             self._status("已停止")
 
     # ------------------------------------------------------------------ 插件区
@@ -904,7 +900,7 @@ class App(tk.Tk):
     }
 
     def _build_plugin_ui(self, root: ttk.Frame) -> None:
-        box = ttk.LabelFrame(root, text="插件（@dsh-user 插件管理）", padding=8)
+        box = ttk.LabelFrame(root, text="插件", padding=8)
         box.pack(fill="both", expand=True)
         bar = ttk.Frame(box)
         bar.pack(fill="x")
@@ -916,7 +912,18 @@ class App(tk.Tk):
                    width=9).pack(side="left", padx=4)
         self.plugin_hint_lbl = ttk.Label(bar, text="扫描中…", foreground="#666")
         self.plugin_hint_lbl.pack(side="left", padx=6)
-        # 滚动容器
+        # 远程下载一行
+        dl = ttk.Frame(box)
+        dl.pack(fill="x", pady=(4, 0))
+        ttk.Label(dl, text="链接下载：").pack(side="left")
+        self.market_placeholder = "如 dshmarket / git 仓库 URL / npm 包名"
+        self.market_spec = tk.StringVar()
+        self.market_entry = ttk.Entry(dl, textvariable=self.market_spec, width=32)
+        self.market_entry.pack(side="left", padx=2)
+        self._placeholder(self.market_entry, self.market_placeholder)
+        ttk.Button(dl, text="下载", width=6,
+                   command=lambda: self._market_act("download")).pack(side="left", padx=4)
+        # 滚动列表
         wrap = ttk.Frame(box)
         wrap.pack(fill="both", expand=True, pady=(6, 0))
         self.plugin_cv = tk.Canvas(wrap, highlightthickness=0)
@@ -936,10 +943,12 @@ class App(tk.Tk):
         self.plugin_cv.bind("<Leave>",
                             lambda e: self.plugin_cv.unbind_all("<MouseWheel>"))
         self.plugin_btns: list[ttk.Button] = []
+        self.market_updates: dict[str, str] = {}
         self.plugin_note = ttk.Label(
-            box, text="外部行可【接管】（限无 config 的独立行）；内置行只读。"
-                      "改动为草稿，点「保存」落盘；结果提示见窗口底部状态栏与弹窗，"
-                      "详情写入 installer.log。",
+            box,
+            text="一行一个插件，安装/卸载/启用/停用按类型自动处理；"
+                 "本地插件为草稿，点「全部保存并重启网页版」落盘；"
+                 "在线插件真实安装到 profile，需重启网页版生效。",
             foreground="#888", font=("Microsoft YaHei UI", 8), justify="left")
         self.plugin_note.pack(anchor="w", pady=(4, 0))
         self.btn_save = ttk.Button(box, text="全部保存并重启网页版",
@@ -947,42 +956,9 @@ class App(tk.Tk):
         self.btn_save.pack(anchor="e", pady=(2, 0))
         self._plugin_btns = self.plugin_btns
 
-        # 插件市场（bundle，走 dsh plugin）：链接下载行 + 每行一个插件
-        bundle = ttk.LabelFrame(box, text="插件市场（bundle，走 dsh plugin 安装）", padding=6)
-        bundle.pack(fill="x", pady=(6, 0))
-        dl = ttk.Frame(bundle)
-        dl.pack(fill="x")
-        ttk.Label(dl, text="链接下载：").pack(side="left")
-        self.market_spec = tk.StringVar(value="dshmarket")
-        ttk.Entry(dl, textvariable=self.market_spec, width=26).pack(side="left", padx=2)
-        ttk.Button(dl, text="下载", width=6,
-                   command=lambda: self._market_act("download")).pack(side="left", padx=4)
-        ttk.Label(bundle, text="以 URL / npm 包名 / git 源下载到本地；行内再安装 / 卸载 / 更新",
-                  foreground="#666", font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(2, 0))
-        mwrap = ttk.Frame(bundle)
-        mwrap.pack(fill="x", pady=(4, 0))
-        self.market_cv = tk.Canvas(mwrap, height=150, highlightthickness=0)
-        self.market_sb = ttk.Scrollbar(mwrap, orient="vertical",
-                                       command=self.market_cv.yview)
-        self.market_cv.configure(yscrollcommand=self.market_sb.set)
-        self.market_sb.pack(side="right", fill="y")
-        self.market_cv.pack(side="left", fill="both", expand=True)
-        self.market_rows = ttk.Frame(self.market_cv)
-        self._market_cw = self.market_cv.create_window((0, 0), window=self.market_rows,
-                                                       anchor="nw")
-        self.market_rows.bind("<Configure>", self._market_scroll_update)
-        self.market_cv.bind("<Configure>", self._market_canvas_width)
-        self.market_cv.bind(
-            "<Enter>", lambda e: self.market_cv.bind_all("<MouseWheel>",
-                                                         self._on_market_wheel))
-        self.market_cv.bind("<Leave>",
-                            lambda e: self.market_cv.unbind_all("<MouseWheel>"))
-        self.market_btns: list[ttk.Button] = []
-        self.market_updates: dict[str, str] = {}
-
     def _set_plugin_busy(self, busy: bool) -> None:
         self.plugin_busy = busy
-        for b in self.plugin_btns + list(getattr(self, "market_btns", [])):
+        for b in self.plugin_btns:
             try:
                 b.configure(state="disabled" if busy or self.busy else "normal")
             except Exception:  # noqa: BLE001
@@ -1028,55 +1004,37 @@ class App(tk.Tk):
                 self._append(f"[插件] 当前补丁结构门未过：{exc}")
                 dump = pstore.parse_dump("")
             cards = pstore.status_view(home, sources, dump)
-            self.after(0, lambda: self._apply_plugin_view(cards, home, project))
+            entries = pstore.market_entries(home, project, ASSETS)
+            self.after(0, lambda: self._apply_plugins(cards, entries, home, project))
         except Exception as exc:  # noqa: BLE001
             self._append(f"[插件] 刷新失败：{exc}")
 
-    def _apply_plugin_view(self, cards, home: Path, project: Path) -> None:
+    def _apply_plugins(self, cards, entries, home: Path, project: Path) -> None:
         self.plugin_cards = cards
         self.plugin_home_dir, self.plugin_project = home, project
+        items = self._merge_plugins(cards, entries)
+        self.plugin_items = items
         for child in self.plugin_rows.winfo_children():
             child.destroy()
         self.plugin_btns.clear()
-        if not cards:
-            ttk.Label(self.plugin_rows, text="（未发现插件：可在项目 plugins/ 或 assets/plugins/ 放置，或「从文件夹导入」）",
+        if not items:
+            ttk.Label(self.plugin_rows,
+                      text="（没有插件：可在项目 plugins/ 或 assets/plugins/ 放置，"
+                           "或「从文件夹导入」「链接下载」添加）",
                       foreground="#888").pack(anchor="w")
-        for card in cards:
-            row = ttk.Frame(self.plugin_rows)
-            row.pack(fill="x", pady=1)
-            pending = self.plugin_pending.get(card.slug)
-            mark = {"install": "待安装", "uninstall": "待卸载",
-                    "set_on": "待启用", "set_off": "待停用",
-                    "adopt": "待接管"}.get(pending, "")
-            tail = f"  [{mark}]" if mark else ""
-            ttk.Label(row, text=card.slug, width=20,
-                      font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
-            st = self.STATE_CN.get(card.state, card.state)
-            ttk.Label(row, text=st + tail, width=22,
-                      foreground=self.STATE_COLOR.get(card.state, "#000")
-                      ).pack(side="left")
-            desc = (card.description or "")[:40]
-            ttk.Label(row, text=desc, foreground="#666").pack(side="left", fill="x", expand=True)
-            if card.validation_errors:
-                ttk.Label(row, text="⚠ " + card.validation_errors[0][:24],
-                          foreground="#b00000", font=("Microsoft YaHei UI", 8)
-                          ).pack(side="left")
-            for text, act, enabled in self._row_actions(card):
-                btn = ttk.Button(row, text=text, width=8,
-                                 command=lambda s=card.slug, a=act: self._plugin_act(s, a))
-                if not enabled:
-                    btn.configure(state="disabled")
-                btn.pack(side="left", padx=2)
-                self.plugin_btns.append(btn)
-        self.plugin_hint_lbl.configure(text=f"{len(cards)} 个插件"
-                                       if cards else "无插件")
+            self.plugin_hint_lbl.configure(text="无插件")
+        else:
+            for it in items:
+                row = ttk.Frame(self.plugin_rows)
+                row.pack(fill="x", pady=1)
+                self._render_plugin_row(row, it)
+            self.plugin_hint_lbl.configure(text=f"{len(items)} 个插件")
         self._plugin_scroll_update()
         try:
             self.plugin_cv.yview_moveto(0)
         except Exception:  # noqa: BLE001
             pass
         self._set_plugin_busy(self.plugin_busy)
-        self._refresh_market()
 
     def _plugin_canvas_width(self, _e=None) -> None:
         try:
@@ -1098,17 +1056,33 @@ class App(tk.Tk):
             pass
 
     def _plugin_copy_list(self) -> None:
-        lines = [f"{c.slug}\t{self.STATE_CN.get(c.state, c.state)}"
-                 for c in getattr(self, "plugin_cards", [])]
+        items = getattr(self, "plugin_items", None) or []
+        lines = [f"{it['name']}\t{self._state_display(it)[0]}" for it in items]
         self.clipboard_clear()
         self.clipboard_append("\n".join(lines) or "（空）")
         self._status(f"已复制 {len(lines)} 行插件清单")
 
     # ---------- 插件市场（bundle，走 dsh plugin） ----------
 
+    def _placeholder(self, entry: ttk.Entry, text: str) -> None:
+        """让 Entry 显示灰色占位提示；聚焦/点击后清空，失焦为空时恢复。"""
+        def _clear(_e=None) -> None:
+            if entry.get() == text:
+                entry.delete(0, "end")
+                entry.configure(foreground="#000")
+        def _refill(_e=None) -> None:
+            if not entry.get():
+                entry.insert(0, text)
+                entry.configure(foreground="#888")
+        entry.configure(foreground="#888")
+        entry.insert(0, text)
+        entry.bind("<FocusIn>", _clear)
+        entry.bind("<Button-1>", _clear)
+        entry.bind("<FocusOut>", _refill)
+
     def _market_act(self, action: str) -> None:
         spec = self.market_spec.get().strip()
-        if not spec:
+        if not spec or spec == getattr(self, "market_placeholder", None):
             self._append("[市场] 请先填 URL / npm 包名 / git 源")
             return
         self._market_run(spec, action)
@@ -1174,7 +1148,7 @@ class App(tk.Tk):
             self._status(f"市场操作失败：{exc}", "#b00000")
             messagebox.showerror("市场操作失败", str(exc))
         finally:
-            self.after(0, self._refresh_market)
+            self.after(0, self._refresh_plugins)
             self._set_plugin_busy(False)
 
     def _market_local(self, value: str, project: Path):
@@ -1226,104 +1200,99 @@ class App(tk.Tk):
             env["PATH"] = str(Path(pnpm).parent) + os.pathsep + env.get("PATH", "")
         return env
 
-    def _refresh_market(self) -> None:
-        def run():
-            try:
-                env = self._plugin_env()
-                if env is None:
-                    return
-                home, project = env
-                entries = pstore.market_entries(home, project, ASSETS)
-                self.after(0, lambda: self._apply_market(entries))
-            except Exception as exc:  # noqa: BLE001
-                self._append(f"[市场] 刷新失败：{exc}")
-        threading.Thread(target=run, daemon=True).start()
+    def _merge_plugins(self, cards, entries) -> list[dict]:
+        items: list[dict] = []
+        for card in cards:
+            items.append({
+                "kind": "managed", "name": card.slug, "version": "",
+                "state": card.state, "desc": (card.description or "")[:40],
+                "warning": card.validation_errors[0][:24] if card.validation_errors else "",
+                "value": card.slug, "spec": card.slug,
+            })
+        for e in entries:
+            st = "installed" if e.installed else ("downloaded" if e.downloaded else "nodl")
+            items.append({
+                "kind": "bundle", "name": e.name, "version": e.version, "state": st,
+                "desc": (e.description or "")[:22], "warning": "",
+                "value": str(e.local) if e.local else e.spec, "spec": e.spec,
+            })
+        items.sort(key=lambda it: (self._plugin_rank(it), it["name"]))
+        return items
 
-    def _apply_market(self, entries) -> None:
-        for child in self.market_rows.winfo_children():
-            child.destroy()
-        self.market_btns.clear()
-        if not entries:
-            ttk.Label(self.market_rows,
-                      text="（市场为空：在 plugins/ 放声明 dsh.bundle 的插件，或用上面链接下载）",
-                      foreground="#888").pack(anchor="w")
-            return
-        for e in sorted(entries, key=lambda x: (not x.installed, x.name)):
-            row = ttk.Frame(self.market_rows)
-            row.pack(fill="x", pady=1)
-            ttk.Label(row, text=e.name, width=20,
-                      font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
-            ttk.Label(row, text=e.version or "—", width=9,
-                      foreground="#888").pack(side="left")
-            state, color = ("已安装", "#2a6b2a") if e.installed else \
-                (("已下载", "#1a6bb0") if e.downloaded else ("未下载", "#999"))
-            ttk.Label(row, text=state, width=8, foreground=color).pack(side="left")
-            ttk.Label(row, text=(e.description or "")[:22],
-                      foreground="#666").pack(side="left", fill="x", expand=True)
-            self._market_buttons(row, e)
-        self._market_scroll_update()
-        try:
-            self.market_cv.yview_moveto(0)
-        except Exception:  # noqa: BLE001
-            pass
+    @staticmethod
+    def _plugin_rank(it: dict) -> int:
+        return {"enabled": 0, "installed": 0, "disabled": 1, "downloaded": 1,
+                "external": 2, "external-disabled": 2, "nodl": 3,
+                "first_party": 4, "first_party-disabled": 4}.get(it["state"], 5)
 
-    def _market_buttons(self, row, e) -> None:
-        local = str(e.local) if e.local else e.spec
-        if not e.installed and not e.downloaded:
-            self._mk_mkbtn(row, "下载", "download", e.spec)
-        if not e.installed and e.downloaded:
-            self._mk_mkbtn(row, "安装", "install", local)
-        if not e.installed:
-            self._mk_mkbtn(row, "校验", "check", local)
-        if e.installed:
-            self._mk_mkbtn(row, "卸载", "uninstall", e.spec)
-            self._mk_mkbtn(row, "校验", "check", local)
-            upd = self.market_updates.get(e.spec, "unknown")
+    def _render_plugin_row(self, row, it) -> None:
+        ttk.Label(row, text=it["name"], width=20,
+                  font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
+        ttk.Label(row, text=it["version"] or "—", width=9,
+                  foreground="#888").pack(side="left")
+        st, color = self._state_display(it)
+        ttk.Label(row, text=st, width=12, foreground=color).pack(side="left")
+        ttk.Label(row, text=it["desc"], foreground="#666").pack(side="left", fill="x", expand=True)
+        if it["warning"]:
+            ttk.Label(row, text="⚠ " + it["warning"], foreground="#b00000",
+                      font=("Microsoft YaHei UI", 8)).pack(side="left")
+        for text, act, val in self._actions_for(it):
+            btn = ttk.Button(row, text=text, width=8,
+                             command=lambda k=it["kind"], v=val, a=act:
+                                 self._act(k, v, a))
+            btn.pack(side="left", padx=2)
+            self.plugin_btns.append(btn)
+
+    def _state_display(self, it) -> tuple[str, str]:
+        s = it["state"]
+        if it["kind"] == "managed":
+            return self.STATE_CN.get(s, s), self.STATE_COLOR.get(s, "#000")
+        return {"installed": ("已安装", "#2a6b2a"),
+                "downloaded": ("已下载", "#1a6bb0"),
+                "nodl": ("可下载", "#999")}.get(s, (s, "#000"))
+
+    def _actions_for(self, it) -> list[tuple[str, str, str]]:
+        if it["kind"] == "managed":
+            return self._managed_actions(it)
+        return self._bundle_actions(it)
+
+    def _managed_actions(self, it) -> list[tuple[str, str, str]]:
+        st, warn, slug = it["state"], it["warning"], it["value"]
+        if st == "downloaded":
+            return [("看原因", "none", slug)] if warn else [("安装", "install", slug)]
+        if st == "enabled":
+            return [("停用", "set_off", slug), ("卸载", "uninstall", slug)]
+        if st == "disabled":
+            return [("启用", "set_on", slug), ("卸载", "uninstall", slug)]
+        if st in ("external", "external-disabled"):
+            return [("接管", "adopt", slug)]
+        return []
+
+    def _bundle_actions(self, it) -> list[tuple[str, str, str]]:
+        s, spec, local = it["state"], it["spec"], it["value"]
+        acts: list[tuple[str, str, str]] = []
+        if s == "nodl":
+            acts.append(("下载", "download", spec))
+        if s == "downloaded":
+            acts.append(("安装", "install", local))
+        if s in ("nodl", "downloaded"):
+            acts.append(("校验", "check", local))
+        if s == "installed":
+            acts.append(("卸载", "uninstall", spec))
+            acts.append(("校验", "check", local))
+            upd = self.market_updates.get(spec, "unknown")
             label = {"unknown": "查看更新", "outdated": "可更新",
                      "current": "已最新"}.get(upd, "查看更新")
             act = {"unknown": "check_update", "outdated": "update",
                    "current": "check_update"}.get(upd, "check_update")
-            self._mk_mkbtn(row, label, act, e.spec)
+            acts.append((label, act, spec))
+        return acts
 
-    def _mk_mkbtn(self, row, text: str, action: str, value: str) -> None:
-        btn = ttk.Button(row, text=text, width=8,
-                         command=lambda v=value, a=action: self._market_run(v, a))
-        btn.pack(side="left", padx=2)
-        self.market_btns.append(btn)
-
-    def _market_scroll_update(self, _e=None) -> None:
-        try:
-            self.market_cv.configure(scrollregion=self.market_cv.bbox("all"))
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _market_canvas_width(self, _e=None) -> None:
-        try:
-            self.market_cv.itemconfigure(self._market_cw,
-                                         width=self.market_cv.winfo_width())
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _on_market_wheel(self, e) -> None:
-        try:
-            self.market_cv.yview_scroll(int(-e.delta / 120), "units")
-        except Exception:  # noqa: BLE001
-            pass
-
-    @staticmethod
-    def _row_actions(card: pstore.PluginCard) -> list[tuple[str, str, bool]]:
-        st = card.state
-        if st == "downloaded":
-            if card.validation_errors:
-                return [("看原因", "none", True)]
-            return [("安装", "install", True)]
-        if st == "enabled":
-            return [("停用", "set_off", True), ("卸载", "uninstall", True)]
-        if st == "disabled":
-            return [("启用", "set_on", True), ("卸载", "uninstall", True)]
-        if st in ("external", "external-disabled"):
-            return [("接管", "adopt", True)]
-        return []          # first_party：只读展示
+    def _act(self, kind: str, value: str, action: str) -> None:
+        if kind == "managed":
+            self._plugin_act(value, action)
+        else:
+            self._market_run(value, action)
 
     def _plugin_act(self, slug: str, action: str) -> None:
         if self.plugin_busy or action == "none":
@@ -1494,6 +1463,247 @@ class App(tk.Tk):
         self._append(f"[插件] 已导入到 {dst}（重新扫描后即可安装）")
         self._refresh_plugins()
 
+    # ---------------- Tab 3：会话迁移 ----------------
+
+    def _build_migrate_ui(self, root: ttk.Frame) -> None:
+        ttk.Label(root,
+                  text="把「已开始的会话」迁到别的 preset（例：cordis-director 可给旧会话启用引擎热切）。"
+                       "只改两个文件的单个字段并自动备份这两个文件本身，绝不整目录备份。",
+                  foreground="#555", wraplength=790).pack(anchor="w")
+
+        bar = ttk.Frame(root)
+        bar.pack(fill="x", pady=(6, 2))
+        ttk.Label(bar, text="目标 preset：").pack(side="left")
+        self.mig_preset_var = tk.StringVar(value="cordis-director")
+        ttk.Combobox(bar, textvariable=self.mig_preset_var, width=22,
+                     values=("cordis-director", "director-test", "cordis",
+                             "standard", "ptc", "minimal")).pack(side="left", padx=(0, 12))
+        self.btn_mig_scan = ttk.Button(bar, text="重新扫描", command=self._mig_scan)
+        self.btn_mig_scan.pack(side="left", ipadx=8)
+        self.btn_mig_inject = ttk.Button(bar, text="写入（迁移）所选",
+                                         command=self._mig_inject_click)
+        self.btn_mig_inject.pack(side="left", padx=8, ipadx=8)
+        self.btn_mig_verify = ttk.Button(bar, text="校验所选", command=self._mig_verify)
+        self.btn_mig_verify.pack(side="left", ipadx=8)
+        self.btn_mig_restore = ttk.Button(bar, text="从备份恢复…", command=self._mig_restore_click)
+        self.btn_mig_restore.pack(side="left", padx=8, ipadx=8)
+        self.btn_mig_open = ttk.Button(bar, text="打开备份文件夹", command=self._mig_open_backups)
+        self.btn_mig_open.pack(side="left", ipadx=8)
+
+        fbar = ttk.Frame(root)
+        fbar.pack(fill="x", pady=(2, 2))
+        ttk.Label(fbar, text="按名称/ID 过滤：").pack(side="left")
+        self.mig_filter_var = tk.StringVar()
+        self.mig_filter_var.trace_add("write", lambda *_: self._mig_render())
+        filt = ttk.Entry(fbar, textvariable=self.mig_filter_var, width=44)
+        filt.pack(side="left", padx=(0, 8))
+        self.mig_show_sub = tk.BooleanVar(value=False)
+        self.mig_show_sub.trace_add("write", lambda *_: self._mig_render())
+        ttk.Checkbutton(fbar, text="显示子代理", variable=self.mig_show_sub,
+                        command=self._mig_render).pack(side="left", padx=(0, 8))
+        ttk.Label(fbar, text="（默认只看主对话；子代理默认隐藏）",
+                  foreground="#888").pack(side="left")
+
+        lf = ttk.LabelFrame(root, text="会话（header preset / 缓存 preset）", padding=4)
+        lf.pack(fill="both", expand=True, pady=(4, 0))
+        cols = ("title", "preset", "cache", "bytes", "id", "ws")
+        tree = ttk.Treeview(lf, columns=cols, show="headings", height=11)
+        for key, text, width in (("title", "会话名称", 360), ("preset", "preset(头)", 90),
+                                 ("cache", "preset(缓存)", 110), ("bytes", "大小", 85),
+                                 ("id", "会话 ID", 240), ("ws", "工作区", 150)):
+            tree.heading(key, text=text)
+            tree.column(key, width=width, anchor="w" if key in ("title", "id", "ws") else "center")
+        ysb = ttk.Scrollbar(lf, command=tree.yview)
+        tree.configure(yscrollcommand=ysb.set)
+        ysb.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+        self.mig_tree = tree
+
+        self.mig_status = ttk.Label(root, text="就绪。先【重新扫描】查看会话。",
+                                    foreground="#1a6b1a")
+        self.mig_status.pack(anchor="w", pady=(6, 0))
+
+    def _mig_node(self) -> str:
+        node = find_node()
+        if not node:
+            raise RuntimeError("未找到 Node.js（≥22.19/24）。请先在「安装与启动」页完成安装。")
+        return node
+
+    def _mig_script(self) -> Path:
+        return HERE / "migrate.mjs"
+
+    def _mig_selected_id(self) -> str | None:
+        sel = self.mig_tree.selection()
+        return sel[0] if sel else None
+
+    def _mig_set_busy(self, busy: bool) -> None:
+        self.mig_busy = busy
+        state = "disabled" if busy else "normal"
+        for btn in (self.btn_mig_scan, self.btn_mig_inject,
+                    self.btn_mig_verify, self.btn_mig_restore):
+            btn.configure(state=state)
+        if busy:
+            self.mig_status.configure(text="工作中…", foreground="#a05a00")
+
+    def _mig_fail(self, exc: BaseException) -> None:
+        self._append(f"[会话迁移] 失败：{exc}")
+        self.after(0, lambda: self._mig_set_busy(False))
+        self.after(0, lambda: self.mig_status.configure(text=f"失败：{exc}", foreground="#a11"))
+
+    # ---- 扫描
+    def _mig_scan(self) -> None:
+        if self.mig_busy:
+            return
+        self._mig_set_busy(True)
+        threading.Thread(target=self._mig_scan_worker, daemon=True).start()
+
+    def _mig_scan_worker(self) -> None:
+        try:
+            self.after(0, lambda: self._mig_set_busy(True))
+            node = self._mig_node()
+            script = self._mig_script()
+            if not script.exists():
+                raise RuntimeError(f"缺少随包文件 {script}")
+            import json as _json
+            raw = run_text([node, str(script), "list-json"])
+            data = _json.loads(raw)
+            rows: list[dict[str, str]] = []
+            for item in data:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                rows.append({
+                    "id": item["id"],
+                    "title": item.get("title") or "(无标题)",
+                    "preset": item.get("preset") or "(none)",
+                    "cache": item.get("cache") or "(none)",
+                    "bytes": f"{item.get('bytes') or 0}",
+                    "ws": item.get("workspace") or "",
+                    "sub": bool(item.get("subagent")),
+                    "error": item.get("error") or "",
+                })
+            self.after(0, lambda: self._mig_apply_rows(rows))
+        except Exception as exc:  # noqa: BLE001
+            self.after(0, lambda: self._mig_fail(exc))
+
+    def _mig_apply_rows(self, rows: list[dict[str, str]]) -> None:
+        rows.sort(key=lambda r: -(int(r.get("bytes") or 0)))
+        self.mig_rows = rows
+        self._mig_render()
+        self._mig_set_busy(False)
+
+    def _mig_render(self, _event=None) -> None:
+        q = self.mig_filter_var.get().strip().lower()
+        show_sub = self.mig_show_sub.get()
+        hidden = 0
+        for child in self.mig_tree.get_children():
+            self.mig_tree.delete(child)
+        shown = 0
+        for row in self.mig_rows:
+            if row.get("sub") and not show_sub:
+                hidden += 1
+                continue
+            hay = f"{row.get('title')} {row['id']} {row.get('workspace')}".lower()
+            if q and q not in hay:
+                continue
+            shown += 1
+            title = row.get("title") or "(无标题)"
+            if row.get("error"):
+                title = f"⚠ {title}（读取失败：{row['error']}）"
+            self.mig_tree.insert("", "end", iid=row["id"],
+                                 values=(title, row["preset"], row["cache"],
+                                         row["bytes"], row["id"], row["ws"]))
+        sub_note = f"，已隐藏 {hidden} 个子代理" if hidden else ""
+        self.mig_status.configure(
+            text=f"显示 {shown}/{len(self.mig_rows)} 个会话{sub_note}（输入关键词过滤）。"
+                 "选中行 → 选目标 preset → 「写入（迁移）所选」。",
+            foreground="#1a6b1a")
+
+    # ---- 写入 / 校验 / 恢复
+    def _mig_inject_click(self) -> None:
+        if self.mig_busy:
+            return
+        sid = self._mig_selected_id()
+        if not sid:
+            messagebox.showinfo("会话迁移", "请先在列表里选择一个会话。", parent=self)
+            return
+        preset = self.mig_preset_var.get().strip()
+        if not preset:
+            messagebox.showinfo("会话迁移", "请填写目标 preset。", parent=self)
+            return
+        title = next((r.get("title") for r in self.mig_rows if r.get("id") == sid), sid)
+        if not messagebox.askyesno(
+                "会话迁移 · 确认",
+                f"把会话「{title}」迁移到 preset：{preset}\n\n"
+                "⚠️ 请先确保 dsh web 已停止（「安装与启动」页点 ⏹ 停止服务）。\n"
+                "工具会先备份被改的两个文件本身；随时可在本页「从备份恢复…」。\n\n继续？",
+                parent=self):
+            return
+        self._mig_set_busy(True)
+        threading.Thread(target=self._mig_run_worker,
+                         args=("inject", [sid, preset]),
+                         daemon=True).start()
+
+    def _mig_verify(self) -> None:
+        if self.mig_busy:
+            return
+        sid = self._mig_selected_id()
+        if not sid:
+            messagebox.showinfo("会话迁移", "请先在列表里选择一个会话。", parent=self)
+            return
+        self._mig_set_busy(True)
+        threading.Thread(target=self._mig_run_worker,
+                         args=("verify", [sid]), daemon=True).start()
+
+    def _mig_restore_click(self) -> None:
+        if self.mig_busy:
+            return
+        backup_root = plugin_home() / "_session-preset-backup"
+        chosen = filedialog.askdirectory(
+            title="选择备份目录（含 manifest.json）", parent=self,
+            initialdir=str(backup_root) if backup_root.exists() else None)
+        if not chosen:
+            return
+        if not messagebox.askyesno(
+                "会话迁移 · 恢复确认",
+                "⚠️ 恢复 = 把「会话日志 + 投影缓存」这两个文件整体还原到备份时刻（非合并）。\n\n"
+                "请先确保 dsh web 已停止（「安装与启动」页点 ⏹ 停止服务）；\n"
+                "若该会话在备份之后又有新运行，恢复会丢掉其后追加的内容。\n\n继续？",
+                parent=self):
+            return
+        self._mig_set_busy(True)
+        threading.Thread(target=self._mig_run_worker,
+                         args=("restore", [chosen]), daemon=True).start()
+
+    def _mig_run_worker(self, op: str, args: list[str]) -> None:
+        try:
+            self.after(0, lambda: self._mig_set_busy(True))
+            node = self._mig_node()
+            proc = run([node, str(self._mig_script()), op, *args])
+            out = decode_proc(proc)
+            for line in out.splitlines():
+                if line.strip():
+                    self._append(f"[会话迁移·{op}] {line.strip()}")
+            if proc.returncode != 0:
+                raise RuntimeError(f"migrate {op} 退出码 {proc.returncode}（见上方日志）")
+            tail = {
+                "inject": "注入完成，重启 dsh web 后生效。",
+                "verify": "校验完成（结果见上方日志）。",
+                "restore": "恢复完成。",
+            }[op]
+            self.after(0, lambda: self.mig_status.configure(text=tail, foreground="#1a6b1a"))
+        except Exception as exc:  # noqa: BLE001
+            self.after(0, lambda: self._mig_fail(exc))
+        finally:
+            self.after(0, lambda: self._mig_set_busy(False))
+
+    def _mig_open_backups(self) -> None:
+        backup_root = plugin_home() / "_session-preset-backup"
+        try:
+            backup_root.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(backup_root))  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            self._mig_fail(exc)
+
     def _on_close(self) -> None:
         """关窗口前先停 dsh web，再销毁窗口。"""
         self._stop_web_internal(quiet=False)
@@ -1504,7 +1714,7 @@ class App(tk.Tk):
 
 
 def selfcheck() -> int:
-    log_line("=== 环境自检（DeepSeek Harness 安装助手） ===")
+    log_line("=== 环境自检（DSH-孤辰小助手） ===")
     log_line(f"Python     : {sys.executable}")
     log_line(f"工作目录   : {HERE}")
     log_line(f"Windows    : {os.environ.get('OS', '?')} / "

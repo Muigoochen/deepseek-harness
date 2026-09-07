@@ -301,6 +301,18 @@ class OperationTest(unittest.TestCase):
         cards = ps.status_view(home, sources, ps.parse_dump(""))
         self.assertEqual(cards[0].state, "downloaded")
 
+    def test_declared_source_empty_dump_is_external_not_downloaded(self) -> None:
+        # 结构门因 bundle 失败 → dump 为空；但补丁已声明的来源插件不应标「已下载」
+        home = make_home()
+        ps.commit_patch(home, "- insert:\n    - id: lsp-echo\n      name: '@dsh-user/lsp-echo'\n")
+        root = Path(tempfile.mkdtemp())
+        make_plugin(root / "plugins", "lsp-echo")
+        sources = ps.discover_sources(root)
+        cards = ps.status_view(home, sources, ps.parse_dump(""))
+        states = {c.name: c.state for c in cards}
+        self.assertEqual(states["@dsh-user/lsp-echo"], "external")
+        self.assertNotIn("downloaded", states.values())
+
 
 class ReferenceScanTest(unittest.TestCase):
     def test_own_segment_not_self_reference(self) -> None:

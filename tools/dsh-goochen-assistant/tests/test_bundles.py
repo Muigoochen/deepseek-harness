@@ -303,5 +303,27 @@ class MarketTest(unittest.TestCase):
         self.assertEqual(ps.bundle_installed_version(home, "nope"), "")
 
 
+class BundleStageTest(unittest.TestCase):
+    def test_bundle_real_dirs_skips_builtin_and_missing(self) -> None:
+        home = make_home()
+        ps.profile_manifest_write(home, {"dsh": {"profile": {
+            "bundles": ["dshmarket", "@deepseek-ai/dsh-base", "not-installed"]}}})
+        nm = home / "profiles" / "web" / "node_modules"
+        mb = make_bundle(nm, "dshmarket", patch=True, name="dshmarket")
+        dirs = ps._bundle_real_dirs(home)
+        self.assertEqual(dirs, [("dshmarket", mb)])   # 内置与未安装皆跳过
+
+    def test_stage_profile_bundles_copies_content(self) -> None:
+        home = make_home()
+        ps.profile_manifest_write(home, {"dsh": {"profile": {"bundles": ["dshmarket"]}}})
+        nm = home / "profiles" / "web" / "node_modules"
+        make_bundle(nm, "dshmarket", patch=True, name="dshmarket")
+        clone = Path(tempfile.mkdtemp(prefix="dsh-clone-"))
+        ps._stage_profile_bundles(home, clone)
+        dst = clone / "profiles" / "web" / "node_modules" / "dshmarket"
+        self.assertTrue((dst / "package.json").is_file())
+        self.assertTrue((dst / "cordis.patch.yml").is_file())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
