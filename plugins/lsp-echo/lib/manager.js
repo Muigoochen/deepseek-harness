@@ -221,23 +221,23 @@ function ensureClientd(bridge, project, role = 'main', editorPort) {
   const byProject = liveClients.get(bridge) || new Map()
   liveClients.set(bridge, byProject)
   const projLower = path.resolve(project).toLowerCase()
-  const rolePrefix = `${projLower}::${role}`
-  // The attach port is part of the identity: a clientd started with one port
-  // must not be reused after the user changes the override (its host decision
-  // already ran inside the bridge process).
+  // One bridge process per project+attach-port, regardless of role. The Godot
+  // editor LSP is a single-session server (a second client logs "Connection
+  // Taken" and kicks the first), so baseline and main checks MUST share one
+  // clientd; `role` only selects the sweep request inside clientdRequest.
   const portKey = editorPort ? `:p${editorPort}` : ':auto'
-  const key = `${rolePrefix}${portKey}`
+  const key = `${projLower}::${portKey}`
   const existing = byProject.get(key)
   if (existing && existing.child.exitCode === null && existing.child.stdin && existing.child.stdin.writable) return existing
   if (existing) {
     try { existing.child.kill() } catch { /* gone */ }
     byProject.delete(key)
   }
-  // A port/override change for the same role supersedes every older clientd:
+  // A port/override change supersedes every older clientd for this project:
   // retire stale ones so only one engine session (and at most one editor
-  // attach) lives per role.
+  // attach) lives per project.
   for (const [oldKey, old] of [...byProject]) {
-    if (oldKey !== key && oldKey.startsWith(rolePrefix)) {
+    if (oldKey !== key && oldKey.startsWith(`${projLower}::`)) {
       byProject.delete(oldKey)
       for (const [, entry] of old.pending) {
         clearTimeout(entry.timer)
@@ -338,6 +338,22 @@ export function status(bridge, project) {
 }
 
 /**
+ * Ask the editor-bridge addon (dsh_echo_bridge) inside the running engine to
+ * rescan the project filesystem, which is what registers newly created
+ * `class_name` scripts. A running engine never rescans by itself, so without
+ * this a file referencing a brand-new class is reported as an unknown type.
+ * @param {string} bridge absolute bridge script path
+ * @param {string} project project root
+ * @param {number} [port] addon control port; the bridge defaults to 6089
+ * @returns {Promise<{ ok: boolean, fatal: boolean, stdout: string, stderr: string }>}
+ */
+export function rescanEngine(bridge, project, port) {
+  const args = ['rescan', '--project', project]
+  if (port) args.push('--bridge-port', String(port))
+  return runBridge(bridge, args, 20_000)
+}
+
+/**
  * Check files and return the parsed diagnostics payload.
  * Preferred path: one persistent LSP client (`clientd`) — no per-call
  * handshake and batched-parallel file pushes. Falls back to the legacy
@@ -358,6 +374,14 @@ export async function checkFiles(bridge, project, files, timeoutMs = 120_000, ro
     }
     throw new Error((reply && reply.error) || 'clientd returned a failed reply')
   } catch (clientError) {
+    // The engine host is a single-session LSP server. When the clientd call
+    // itself failed (timeout / exit / superseded), retire any still-alive
+    // clientd BEFORE the legacy one-shot `check` opens its own session —
+    // leaving it alive would let the two sessions kick each other
+    // ("Connection Taken") and fail every in-flight request. Ordinary
+    // engine-reported errors keep the healthy session.
+    const failMsg = String((clientError && clientError.message) || clientError)
+    if (/timed out|exited|superseded/i.test(failMsg)) stopClientd(bridge, project)
     // Legacy one-shot path: bridge writes the payload to a temp file (atomic
     // inside the bridge), we read it back and persist through the same writer.
     const tmpOut = path.join(runtimeRoot(), `.tmp-check-${safeName(project)}-${role}-${process.pid}-${Date.now()}.json`)
