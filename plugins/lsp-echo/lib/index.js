@@ -19,7 +19,8 @@ import fs from 'node:fs'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { engines, markers, matchExtension } from './checkers.js'
-import { ensureHost, stopHost, status, checkFiles, runtimeRoot, stopClientd, diagnosticsPath, pruneSnapshot } from './manager.js'
+import { ensureHost, stopHost, status, checkFiles, runtimeRoot, stopClientd, diagnosticsPath, pruneSnapshot, rescanEngine } from './manager.js'
+import { ADDON_ID, discoverBridgePort, installAddonInto, probeEngineBridge, rescanPortOf } from './addon.js'
 import { ProjectWatcher, scanFiles } from './watcher.js'
 import { registerTool } from './tool.js'
 import { scanProjectRoots } from './registry.js'
@@ -70,7 +71,7 @@ const REGISTRY_SCHEMA = z.object({
   })).default([]),
 })
 
-const DEFAULT_SKIP = ['.godot', 'addons']
+const DEFAULT_SKIP = ['node_modules', '.git', '.godot', 'addons']
 
 export const Config = z.object({
   projects: z.array(PROJECT_ENTRY).default([]),
@@ -280,6 +281,38 @@ export function apply(ctx, config) {
     try { if (ctx.toast && typeof ctx.toast.dismiss === 'function' && id) ctx.toast.dismiss(id) } catch { /* ignore */ }
   }
 
+  // ---- engine host-state warnings → GUI toast ---------------------------
+  // The godot bridge writes { warn: { ports, at } } into its runtime
+  // host-<project>.json when an editor LSP port accepts TCP but never answers
+  // LSP initialize (dead/fake LSP peer). Surface that once per occurrence so
+  // the user learns why their editor attach silently fell back to headless.
+  const engineWarnShown = new Set() // `${engineId}:${ports}:${at}` seen keys
+  const engineHostWarn = (eng, project) => {
+    try {
+      const safe = (path.basename(path.resolve(project)) || 'project').replace(/[^A-Za-z0-9._-]/g, '_')
+      const file = path.join(path.dirname(eng.bridge), '.runtime', `host-${safe}.json`)
+      const s = JSON.parse(fs.readFileSync(file, 'utf8'))
+      if (s && s.warn && Array.isArray(s.warn.ports) && s.warn.ports.length && typeof s.warn.at === 'number') return s.warn
+    } catch { /* no host state yet */ }
+    return undefined
+  }
+  const maybeToastEngineWarn = (eng, project) => {
+    if (!eng) return
+    const warn = engineHostWarn(eng, project)
+    if (!warn) return
+    const key = `${eng.id}:${warn.ports.join(',')}:${warn.at}`
+    if (engineWarnShown.has(key)) return
+    engineWarnShown.add(key)
+    if (engineWarnShown.size > 64) engineWarnShown.clear() // bounded: never grows unbounded across sessions
+    showToast(
+      'warning',
+      `${eng.name} 编辑器 LSP 端口异常`,
+      `端口 ${warn.ports.join(', ')} 可连接但不响应 LSP 请求(占用它的进程不是该语言的编辑器 LSP,或编辑器 LSP 已卡死)。已自动改用独立引擎,请检查该端口。`,
+      `lsp-echo-engwarn:${key}`,
+      8000,
+    )
+  }
+
   // ---- settings namespace = durable store for discovered/manual -----------
   const settings = ctx.get('settings')
   let scope
@@ -330,6 +363,185 @@ export function apply(ctx, config) {
   }
   /** Global auto-inject: settings toggle when set, else the Config seed (default true). */
   const globalAutoInject = () => (typeof store.autoInjectGlobal === 'boolean' ? store.autoInjectGlobal : config.autoInject !== false)
+
+  // ---- running-engine rescan (new class_name scripts) ---------------------
+  // Godot registers global class names only while scanning the project
+  // filesystem, and a running engine never rescans on its own (the editor does
+  // it when its window regains focus; a headless engine never does). A
+  // class_name script created after the engine started is therefore reported as
+  // an unknown type until the engine rescans. Engines declaring `rescan` ship an
+  // in-project addon (engine.json `addon`) listening on `rescanPort`; asking it
+  // to rescan is the only way to refresh a running engine without restarting it.
+  const RESCAN_FAIL_COOLDOWN_MS = 120_000
+  const RESCAN_WARN_INTERVAL_MS = 600_000
+  const RESCAN_OK_INTERVAL_MS = 3_000
+  const RESCAN_STATE_CAP = 64
+  /** Writing this header is the user's browser asking, not a cross-site page. */
+  const TRUST_HEADER = 'x-dsh-lsp-echo'
+  const rescanFailedAt = new Map() // `${engineId}:${projectLower}` -> last failure
+  const rescanOkAt = new Map()
+  const rescanWarnedAt = new Map()
+  const capState = (map, cap) => { if (map.size > cap) map.clear() }
+  /**
+   * Ask rescan-capable engines of a project to rescan its filesystem.
+   * @param {{ id: string, name: string, bridge: string, rescan?: boolean, rescanPort?: number }} eng
+   * @param {string} project project root
+   * @param {string} why short reason, for the trace log only
+   * @returns {Promise<boolean>} true when the engine acknowledged the rescan
+   */
+  const tryEngineRescan = async (eng, project, why) => {
+    if (!eng || !eng.rescan) return false
+    const key = `${eng.id}:${project.toLowerCase()}`
+    if (Date.now() - (rescanFailedAt.get(key) || 0) < RESCAN_FAIL_COOLDOWN_MS) return false
+    if (Date.now() - (rescanOkAt.get(key) || 0) < RESCAN_OK_INTERVAL_MS) return false
+    // A running engine publishes the port it actually bound; the declared
+    // engine default is only the fallback when nothing published one.
+    const port = discoverBridgePort(project) ?? rescanPortOf(eng)
+    try {
+      // runBridge resolves for every exit code, so the receipt must be checked:
+      // otherwise a failed rescan looks successful and the warning path below
+      // is dead code.
+      const r = await rescanEngine(eng.bridge, project, port)
+      if (!r || !r.ok) {
+        const detail = String((r && (r.stderr || r.stdout)) || '').trim() || `rescan exited ${r && r.status}`
+        throw new Error(detail)
+      }
+      rescanFailedAt.delete(key)
+      rescanOkAt.set(key, Date.now())
+      capState(rescanOkAt, RESCAN_STATE_CAP)
+      trace('rescan', eng.id, `ok on port ${port} (${why})`)
+      return true
+    } catch (error) {
+      rescanFailedAt.set(key, Date.now())
+      capState(rescanFailedAt, RESCAN_STATE_CAP)
+      if (Date.now() - (rescanWarnedAt.get(key) || 0) > RESCAN_WARN_INTERVAL_MS) {
+        rescanWarnedAt.set(key, Date.now())
+        capState(rescanWarnedAt, RESCAN_STATE_CAP)
+        showToast(
+          'warning',
+          `${eng.name} 引擎未刷新`,
+          `${path.basename(project)}:运行中的引擎不会发现新建脚本的 class_name。在设置页点「安装引擎桥」并在 Godot 里启用后,插件即可自动让引擎重扫。`,
+          `lsp-echo-rescan:${key}`,
+          9000,
+        )
+      }
+      trace('rescan', eng.id, `failed: ${(error && error.message) || error}`)
+      return false
+    }
+  }
+  const MISSING_TYPE_RE = /Could not find type "([^"]+)"/i
+  /**
+   * Unknown-type names reported for the files of THIS check (deduped). The
+   * payload is a merged project snapshot carrying files this check never
+   * touched; only checked files may drive a rescan, or one stale snapshot entry
+   * would re-trigger a rescan on every single check.
+   * @param {object} payload merged diagnostics payload of one engine
+   * @param {string} project project root
+   * @param {string[]} files absolute paths checked in this call
+   * @returns {string[]} unknown type names worth a rescan
+   */
+  const missingTypeNames = (payload, project, files) => {
+    const names = []
+    const rels = new Set((files || []).map((f) => path.relative(project, f).split(path.sep).join('/').toLowerCase()))
+    for (const rel of Object.keys((payload && payload.files) || {})) {
+      if (!rels.has(rel.toLowerCase())) continue
+      for (const d of payload.files[rel].diagnostics || []) {
+        const m = MISSING_TYPE_RE.exec(String(d.message || ''))
+        if (m && !names.includes(m[1])) names.push(m[1])
+      }
+    }
+    return names
+  }
+  const CLASS_NAME_RE = /^[ \t]*class_name[ \t]+([A-Za-z_][A-Za-z0-9_]*)/
+  const CLASS_INDEX_CAP = 32
+  const classIndex = new Map() // projectLower -> { mtimes: Map<abs, mtime>, names: Map<name, abs> }
+  const readHead = (file, bytes = 8192) => {
+    const fd = fs.openSync(file, 'r')
+    try {
+      const buf = Buffer.alloc(bytes)
+      const n = fs.readSync(fd, buf, 0, buf.length, 0)
+      return buf.subarray(0, n).toString('utf8')
+    } finally { fs.closeSync(fd) }
+  }
+  /**
+   * `class_name` declarations present in the project. The index is re-diffed
+   * against file mtimes on every call, so a class created moments ago is
+   * visible at once — a TTL cache would hide exactly the new scripts this heal
+   * exists for.
+   * @param {string} project project root
+   * @returns {Set<string>} declared class names
+   */
+  const projectClassNames = (project) => {
+    const key = project.toLowerCase()
+    let entry = classIndex.get(key)
+    if (!entry) {
+      if (classIndex.size >= CLASS_INDEX_CAP) classIndex.clear()
+      entry = { mtimes: new Map(), names: new Map() }
+      classIndex.set(key, entry)
+    }
+    let current = new Map()
+    // Godot registers global class names for the whole res:// tree, addons/
+    // included, so the index must not inherit the watcher's skip list.
+    const indexSkip = (config.watchSkip || DEFAULT_SKIP).filter((dir) => dir !== 'addons')
+    try { current = scanFiles(project, indexSkip, ['.gd']) } catch { /* unreadable: keep the last index */ }
+    for (const [name, file] of [...entry.names]) if (!current.has(file)) entry.names.delete(name)
+    for (const [file, mtime] of current) {
+      if (entry.mtimes.get(file) === mtime) continue
+      let head = ''
+      try { head = readHead(file) } catch { continue /* locked or vanished: retry on the next call */ }
+      // Record the mtime only after a successful read: recording it first would
+      // freeze this file as "already indexed" and drop its class names until the
+      // file changes again.
+      entry.mtimes.set(file, mtime)
+      for (const [name, owner] of [...entry.names]) if (owner === file) entry.names.delete(name)
+      for (const line of head.split(/\r?\n/)) {
+        const m = CLASS_NAME_RE.exec(line)
+        if (m) entry.names.set(m[1], file)
+      }
+    }
+    for (const file of [...entry.mtimes.keys()]) if (!current.has(file)) entry.mtimes.delete(file)
+    return new Set(entry.names.keys())
+  }
+  /**
+   * Check files through one engine, healing the new-script false positive: when
+   * the engine reports an unknown type that the project really declares, rescan
+   * the engine and check the same files once more.
+   * @param {object} eng engine record from checkers.engines()
+   * @param {string} project project root
+   * @param {string[]} files absolute file paths
+   * @param {number} timeoutMs bridge timeout
+   * @param {string} role check role ('main' | 'baseline')
+   * @param {string[]|undefined} ownExts extensions this engine owns in the snapshot
+   * @param {string[]|undefined} keepExts extensions the snapshot must keep
+   * @returns {Promise<object>} diagnostics payload
+   */
+  const checkWithHeal = async (eng, project, files, timeoutMs, role, ownExts, keepExts) => {
+    const port = enginePortOf(eng.id)
+    const payload = await checkFiles(eng.bridge, project, files, timeoutMs, role, ownExts, keepExts, port)
+    if (!eng.rescan) return payload
+    const missing = missingTypeNames(payload, project, files)
+    if (!missing.length) return payload
+    const declared = projectClassNames(project)
+    const stale = missing.filter((n) => declared.has(n))
+    if (!stale.length) return payload
+    if (!(await tryEngineRescan(eng, project, `unknown types: ${stale.join(', ')}`))) return payload
+    trace('rescan', eng.id, `re-checking ${files.length} file(s) after rescan`)
+    try {
+      // The post-rescan answer is the better one, but a failing re-check must
+      // leave the first result in place instead of reporting "no diagnostics".
+      // The smaller budget keeps the doubled cost off the pre-step path.
+      const retryBudgetMs = Math.min(timeoutMs, 45_000)
+      const healed = await checkFiles(eng.bridge, project, files, retryBudgetMs, role, ownExts, keepExts, port)
+      if (missingTypeNames(healed, project, files).length) {
+        trace('rescan', eng.id, 're-check still reports unknown types; the engine may not have re-published diagnostics yet')
+      }
+      return healed
+    } catch (error) {
+      trace('rescan', eng.id, `re-check failed, keeping the pre-rescan result: ${(error && error.message) || error}`)
+      return payload
+    }
+  }
+  /** Ping status of the in-project bridge addon (shared by the GUI action). */
 
   // ---- effective project map (discovered/config seed, manual overrides) ----
   // known value: { path, source, lsp: [{engine}], autoInject } (autoInject =
@@ -504,7 +716,7 @@ export function apply(ctx, config) {
       try { files = [...scanFiles(rec.path, config.watchSkip || DEFAULT_SKIP, eng.extensions).keys()] } catch { /* keep [] */ }
       if (!files.length) { rows.push({ eng: eng.id, empty: true }); return }
       try {
-        const payload = await checkFiles(eng.bridge, rec.path, files, timeoutMs, 'baseline', eng.extensions, keepExts, enginePortOf(eng.id))
+        const payload = await checkWithHeal(eng, rec.path, files, timeoutMs, 'baseline', eng.extensions, keepExts)
         // merged snapshot holds every engine's keyspace; per-engine view only
         const scope = engineScope(payload, eng.extensions)
         rows.push({ eng: eng.id, payload, scope: scope.summary, files: scope.files })
@@ -565,6 +777,8 @@ export function apply(ctx, config) {
       if (!rec) return checkFiles(bridge, project, files, timeoutMs, 'main', undefined, undefined, portForBridge(bridge))
       const keepExts = boundExtensions(rec)
       const ownExts = engineByBridge(bridge) ? engineByBridge(bridge).extensions : boundExtensions(rec)
+      const eng = engineByBridge(bridge)
+      if (eng) return checkWithHeal(eng, project, files, timeoutMs || 120_000, 'main', ownExts, keepExts)
       return checkFiles(bridge, project, files, timeoutMs || 120_000, 'main', ownExts, keepExts, portForBridge(bridge))
     },
     projectsList: () => [...known.values()].map((r) => `${r.source}\t${primaryEngine(r) || '?'}\t${r.path}`),
@@ -626,12 +840,26 @@ export function apply(ctx, config) {
       res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify(body))
     }
+    /** Guard for actions that mutate state or our engine processes. */
+    const requireTrust = (req, res) => {
+      if (req.headers[TRUST_HEADER] === '1') return true
+      json(res, 403, { ok: false, error: `${TRUST_HEADER}: 1 header required` })
+      return false
+    }
+    // A cross-site page can reach a plain GET, so every action with a side
+    // effect asks for the header only our own bundle sends. Read-only actions
+    // (projects/engines/diagnostics/status/addCandidates/bridgeStatus) stay open.
+    const MUTATING_ACTIONS = new Set(['installAddon', 'smart', 'setProject', 'addLsp', 'delLsp', 'resetProject', 'delProject', 'baseline', 'host', 'stop'])
     const apiHandler = async (req, res) => {
       try {
         if ((req.method || 'GET').toUpperCase() !== 'GET') return json(res, 405, { ok: false, error: 'method not allowed' })
         const url = new URL(req.url || '/', 'http://lsp-echo.local')
         const action = url.searchParams.get('action')
         const project = url.searchParams.get('project')
+        // config/enginePort are read-only without their parameter and writes with it.
+        const mutatingQuery = (action === 'config' && url.searchParams.has('autoInject'))
+          || (action === 'enginePort' && url.searchParams.has('port'))
+        if ((MUTATING_ACTIONS.has(action) || mutatingQuery) && !requireTrust(req, res)) return
         if (action === 'projects') {
           return json(res, 200, {
             ok: true,
@@ -647,8 +875,49 @@ export function apply(ctx, config) {
         }
         // ---- settings-page management actions (no engine host required) ----
         if (action === 'engines') {
-          const detail = Object.values(engineTable).map((e) => ({ id: e.id, name: e.name, marker: e.marker, extensions: e.extensions }))
+          const detail = Object.values(engineTable).map((e) => ({ id: e.id, name: e.name, marker: e.marker, extensions: e.extensions, rescan: !!e.rescan, addon: e.addon || null }))
           return json(res, 200, { ok: true, engines: detail })
+        }
+        // In-project engine bridge addon: copy it into the project and register
+        // it in project.godot, so a running engine can be asked to rescan.
+        if (action === 'installAddon') {
+          const abs = project ? path.resolve(project) : undefined
+          if (!abs) return json(res, 400, { ok: false, error: 'installAddon requires project=<abs>' })
+          const rec = known.get(abs.toLowerCase())
+          const eng = rec ? (rec.lsp || []).map((x) => engine(x.engine)).find((e) => e && e.rescan && e.addon) : undefined
+          if (!eng) return json(res, 400, { ok: false, error: '该项目的引擎不支持引擎桥(engine.json 未声明 rescan/addon)' })
+          const r = installAddonInto(abs, eng)
+          // Our own headless engine loads editor plugins only at startup, so stop
+          // it: the next check starts a fresh engine that loads the addon. A
+          // user's editor is never touched (its addon loads when it restarts).
+          let stoppedForRestart = false
+          if (r.ok && r.enabled) {
+            try {
+              const st = await status(eng.bridge, abs)
+              // Anchor on the bridge's own status line: the report also carries
+              // the project path, which may itself contain "headless".
+              if (/^running \(headless\)/m.test(String((st && st.stdout) || ''))) {
+                stopClientd(eng.bridge, abs)
+                await stopHost(eng.bridge, abs)
+                stoppedForRestart = true
+              }
+            } catch (error) {
+              trace('addon', `stopping the headless engine after install failed: ${(error && error.message) || error}`)
+            }
+          }
+          return json(res, r.ok ? 200 : 500, { ...r, stoppedForRestart })
+        }
+        if (action === 'bridgeStatus') {
+          const abs = project ? path.resolve(project) : undefined
+          const rec = abs ? known.get(abs.toLowerCase()) : undefined
+          const eng = rec ? (rec.lsp || []).map((x) => engine(x.engine)).find((e) => e && e.rescan) : undefined
+          // A running addon publishes the port it actually bound; fall back to
+          // the engine default only when nothing is running yet.
+          const published = abs ? discoverBridgePort(abs) : undefined
+          const port = published ?? (eng ? rescanPortOf(eng) : undefined)
+          const installed = abs ? fs.existsSync(path.join(abs, 'addons', ADDON_ID, 'plugin.gd')) : false
+          const probe = eng ? await probeEngineBridge(port) : { online: false, error: '该项目没有声明 rescan 能力的引擎' }
+          return json(res, 200, { ok: true, project: abs || null, port: port ?? 0, declared: !!eng, installed, online: !!probe.online, error: probe.error })
         }
         // Global auto-inject switch (RFC §7): GET returns effective value,
         // GET with autoInject=0|1 persists the toggle to the settings store.
@@ -909,11 +1178,13 @@ export function apply(ctx, config) {
         else if (action === 'status') {
           r = await status(bridge, proj)
           // Structured mode for the GUI: parse the bridge's one-line report.
+          // Anchored on the report itself — the same line carries the project
+          // path, which may contain words like "headless" or "editor".
           const out = r.stdout || ''
           let mode = 'off'
-          if (/\bheadless\b/i.test(out)) mode = 'headless'
-          else if (/editor-attach/i.test(out)) mode = 'editor'
-          else if (/running/i.test(out)) mode = 'running'
+          if (/^running \(headless\)/m.test(out)) mode = 'headless'
+          else if (/^running \(editor-attach\)/m.test(out)) mode = 'editor'
+          else if (/^running\b/m.test(out)) mode = 'running'
           return json(res, 200, { ok: !r.fatal, project: proj, mode, stdout: out, stderr: r.stderr })
         } else if (action === 'baseline') {
           const rec = known.get(path.resolve(proj).toLowerCase())
@@ -970,10 +1241,19 @@ export function apply(ctx, config) {
     const cwd = agent && agent.session && agent.session.header ? agent.session.header.cwd : undefined
     if (!cwd) { trace('pre-step', agentId, 'skip: no session cwd'); return decision }
     const lowerCwd = path.resolve(cwd).toLowerCase()
-    const rec = [...known.values()].find((r) => {
+    // Nested projects (e.g. a workspace root whose repo also registers a
+    // sub-project like plugins/dsh-lsp-actions) both prefix-match the cwd;
+    // pick the DEEPEST root so a parent record with no engines cannot shadow
+    // the child project's bound engine.
+    let rec
+    let bestLen = -1
+    for (const r of known.values()) {
       const root = r.path.toLowerCase()
-      return lowerCwd === root || lowerCwd.startsWith(root + path.sep)
-    })
+      if ((lowerCwd === root || lowerCwd.startsWith(root + path.sep)) && root.length > bestLen) {
+        rec = r
+        bestLen = root.length
+      }
+    }
     if (!rec) { trace('pre-step', agentId, `skip: no known project under cwd ${cwd}`); return decision }
     if (!globalAutoInject()) { trace('pre-step', agentId, `skip: global auto-inject off for ${rec.path}`); return decision }
     if (rec.autoInject === false) { trace('pre-step', agentId, `skip: autoInject=false for ${rec.path}`); return decision }
@@ -991,7 +1271,20 @@ export function apply(ctx, config) {
     if (typeof baselineStarter === 'function') baselineStarter(agent)
     const watcher = ensureWatcher(rec)
     watcher.tick() // full-tree diff at the step boundary (mode B)
+    const structural = watcher.drainStructural()
     const dirty = watcher.drain().filter((f) => fs.existsSync(f)) // drop deleted files (routing would throw)
+    // A script created or deleted since the last step may declare a class_name
+    // the running engine has not registered yet: refresh rescan-capable engines
+    // BEFORE checking, or the first check of a file referencing it reports a
+    // false unknown-type error.
+    if (structural.created.length || structural.deleted.length) {
+      const touched = [...structural.created, ...structural.deleted]
+      const stale = boundEngines.filter((e) => e.rescan && touched.some((f) => matchExtension(e, f)))
+      if (stale.length) {
+        trace('pre-step', agentId, `structural change (${structural.created.length} created / ${structural.deleted.length} deleted) → engine rescan`)
+        await Promise.all(stale.map((e) => tryEngineRescan(e, rec.path, 'structural change')))
+      }
+    }
     if (!dirty.length) { trace('pre-step', agentId, `${rec.path}: ok, no changed files since last step`); return decision }
     // Route dirty files to their owning engine by extension.
     const byEngine = new Map() // engineId -> [abs files]
@@ -1006,7 +1299,7 @@ export function apply(ctx, config) {
       const files = byEngine.get(eng.id) || []
       if (!files.length) continue
       tasks.push(
-        checkFiles(eng.bridge, rec.path, files, 120_000, 'main', eng.extensions, keepExts, enginePortOf(eng.id))
+        checkWithHeal(eng, rec.path, files, 120_000, 'main', eng.extensions, keepExts)
           .then((payload) => ({ engineId: eng.id, eng, payload }))
           .catch((error) => {
             console.error(`[lsp-echo] check failed (${eng.id}): ${(error && error.message) || error}`)
@@ -1019,7 +1312,11 @@ export function apply(ctx, config) {
     const parts = []
     let totalErrors = 0
     let checked = 0
+    const checkedNames = [] // rel basenames actually verified this round (0-error echo)
     for (const { engineId, eng, payload } of results) {
+      // An engine that silently fell back to headless (dead editor LSP port)
+      // still "succeeds"; surface its host-state warning once per occurrence.
+      if (eng) maybeToastEngineWarn(eng, rec.path)
       if (!payload) continue
       // The merged snapshot on disk holds every engine's keyspace; count only
       // this engine's files so totals and echoes never double-count.
@@ -1027,6 +1324,10 @@ export function apply(ctx, config) {
       const scoped = { files: scope.files, summary: scope.summary }
       checked += scoped.summary.files_checked || 0
       totalErrors += scoped.summary.errors || 0
+      for (const rel of Object.keys(scoped.files)) {
+        const base = path.basename(rel)
+        if (!checkedNames.includes(base)) checkedNames.push(base)
+      }
       const text = buildEchoText(engineId, scoped)
       if (text) parts.push(text)
     }
@@ -1037,7 +1338,9 @@ export function apply(ctx, config) {
       // 本轮确有改动文件被引擎检查且全部通过 → 仍注入一句确认,AI 知道
       // 改动是干净的,不必自己再调工具去查。
       if (checked > 0) {
-        const okText = `[lsp-echo] 已检查本轮改动的 ${checked} 个文件：编译通过，0 错误。`
+        const shown = checkedNames.slice(0, 3).join('、')
+        const list = checkedNames.length > 3 ? `${shown} 等 ${checkedNames.length} 个` : shown
+        const okText = `[lsp-echo] 已自动完成本轮编译诊断：\n- 检查文件（${checked} 个）：${list}\n- 结果：编译通过，0 错误\n- 本结论来自引擎实时检查，无需为这些文件再次运行 LSP/编译检查。`
         const okMsg = createUserMessage({
           content: [{ type: 'text', text: okText }],
           source: { kind: 'plugin', plugin: name, form: 'snapshot', sections: [{ name, text: okText }] },
@@ -1059,9 +1362,9 @@ export function apply(ctx, config) {
   // ---- one-time per-process full-project baseline scan (user-facing) ------
   // Triggered by the first top-level session that enters a workspace
   // (agent/session-start, source startup|resume — i.e. the user opens that
-  // workspace's conversation). Runs once per process run on a DEDICATED
-  // clientd role so the ~1min sweep never queues behind or blocks regular
-  // diff checks. Progress + completion are announced through the pre-step
+  // workspace's conversation). Runs once per process run as a sweep request
+  // on the project's single shared clientd (requests are serialized inside
+  // the bridge). Progress + completion are announced through the pre-step
   // channel (both shown, also when the project is clean).
   const baseline = new Map() // projectLower -> state
   const baselineKey = (rec) => rec.path.toLowerCase()
@@ -1083,10 +1386,21 @@ export function apply(ctx, config) {
     if (lines.length > 10) lines.splice(10, lines.length - 10, `… 还有 ${lines.length - 10} 条`)
     return [head, ...lines].join('\n')
   }
-  const baselineRecFor = (cwdPath) => [...known.values()].find((r) => {
-    const root = r.path.toLowerCase()
-    return cwdPath === root || cwdPath.startsWith(root + path.sep)
-  })
+  const baselineRecFor = (cwdPath) => {
+    // Deepest-prefix match: a nested child project must win over its parent
+    // root (same shadowing concern as the pre-step resolution above).
+    const lower = path.resolve(cwdPath).toLowerCase()
+    let rec
+    let bestLen = -1
+    for (const r of known.values()) {
+      const root = r.path.toLowerCase()
+      if ((lower === root || lower.startsWith(root + path.sep)) && root.length > bestLen) {
+        rec = r
+        bestLen = root.length
+      }
+    }
+    return rec
+  }
   const baselineAttempts = new Map() // cwdLower -> attempt count (discovery may lag)
   const startBaselineFor = (agent) => {
     const hdr = agent && agent.session && agent.session.header
@@ -1144,7 +1458,7 @@ export function apply(ctx, config) {
       const eng = boundEngines[0]
       const all = scanAll(eng)
       if (!all.length) return noFilesDone()
-      checkFiles(eng.bridge, rec.path, all, 200_000, 'baseline', eng.extensions, boundExtensions(rec), enginePortOf(eng.id))
+      checkWithHeal(eng, rec.path, all, 200_000, 'baseline', eng.extensions, boundExtensions(rec))
         .then((payload) => {
           state.status = 'done'
           state.scanned = payload && payload.summary ? payload.summary.files_checked : all.length
@@ -1174,7 +1488,7 @@ export function apply(ctx, config) {
     Promise.all(all.map(async ({ eng, files }) => {
       if (!files.length) return { eng: eng.id, empty: true }
       try {
-        const payload = await checkFiles(eng.bridge, rec.path, files, 200_000, 'baseline', eng.extensions, keepExtsM, enginePortOf(eng.id))
+        const payload = await checkWithHeal(eng, rec.path, files, 200_000, 'baseline', eng.extensions, keepExtsM)
         return { eng: eng.id, payload }
       } catch (e) {
         return { eng: eng.id, error: (e && e.message) || String(e) }

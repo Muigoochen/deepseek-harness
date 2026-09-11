@@ -51,6 +51,8 @@ export class ProjectWatcher {
     this.extensions = extensions || DEFAULT_EXTENSIONS
     this.map = scanFiles(project, skipDirs, this.extensions)
     this.dirty = new Set()
+    this.created = new Set()
+    this.deleted = new Set()
   }
 
   /** Diff current mtimes against the last scan; record changes as dirty. */
@@ -58,14 +60,33 @@ export class ProjectWatcher {
     const next = scanFiles(this.project, this.skipDirs, this.extensions)
     const changed = []
     for (const [f, mt] of next) {
-      if (this.map.get(f) !== mt) changed.push(f)
+      if (!this.map.has(f)) this.created.add(f)
+      else if (this.map.get(f) !== mt) changed.push(f)
     }
     for (const f of this.map.keys()) {
-      if (!next.has(f)) changed.push(f) // deleted
+      if (!next.has(f)) {
+        changed.push(f) // deleted
+        this.created.delete(f)
+        this.deleted.add(f)
+      }
     }
     this.map = next
     for (const f of changed) this.dirty.add(f)
     return changed
+  }
+
+  /**
+   * Remove and return files that appeared or disappeared since the last call.
+   * Engines that only register global class names while scanning the project
+   * filesystem (Godot) need this signal: a class_name script created after the
+   * engine started is invisible to diagnostics until the engine rescans.
+   * @returns {{ created: string[]; deleted: string[] }}
+   */
+  drainStructural() {
+    const out = { created: [...this.created], deleted: [...this.deleted] }
+    this.created.clear()
+    this.deleted.clear()
+    return out
   }
 
   /** Remove and return all pending dirty files. */
@@ -77,6 +98,11 @@ export class ProjectWatcher {
 
   /** Adopt the pending changes of another watcher (rebuild without loss). */
   adopt(other) {
-    for (const f of other ? other.dirty : []) this.dirty.add(f)
+    if (!other) return
+    for (const f of other.dirty) this.dirty.add(f)
+    // Structural changes matter as much as dirty files: the rebuilt watcher
+    // must still report the new/deleted scripts the engine has to rescan for.
+    for (const f of other.created) this.created.add(f)
+    for (const f of other.deleted) this.deleted.add(f)
   }
 }

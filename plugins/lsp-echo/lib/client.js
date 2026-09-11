@@ -155,9 +155,14 @@ window.__ModuleLoader__.load({
     }
 
     // ---------- transport ----------
+    // TRUST_HEADER: the host refuses project-writing actions without it, so a
+    // cross-site page cannot make DSH write into a user's project.
+    var TRUST_HEADER = 'x-dsh-lsp-echo'
     function httpGet(url) {
       if (typeof fetch === 'function') {
-        return fetch(url, { cache: 'no-store' }).then(function (res) {
+        var headers = {}
+        headers[TRUST_HEADER] = '1'
+        return fetch(url, { cache: 'no-store', headers: headers }).then(function (res) {
           return res.json()
         }).catch(function () { return null })
       }
@@ -165,6 +170,7 @@ window.__ModuleLoader__.load({
         try {
           var xhr = new XMLHttpRequest()
           xhr.open('GET', url)
+          xhr.setRequestHeader(TRUST_HEADER, '1')
           xhr.onload = function () {
             try { resolve(xhr.status >= 200 && xhr.status < 300 ? JSON.parse(xhr.responseText) : null) }
             catch (e) { resolve(null) }
@@ -694,6 +700,38 @@ window.__ModuleLoader__.load({
         })
       }
 
+      // 引擎桥:把 addons/dsh_echo_bridge 装进项目,让运行中的 Godot 引擎
+      // (编辑器或 headless)可以被要求重扫文件系统 —— 新建脚本的 class_name
+      // 因此立即可见,不必重启引擎。
+      function doInstallAddon(path) {
+        if (s.busy) return
+        set({ busy: 'addon:' + path })
+        apiGet('installAddon', path).then(function (d) {
+          set({ busy: '' })
+          if (d && d.ok) {
+            set({ note: '引擎桥已安装到 ' + path
+              + (d.enableChanged ? ',并已在 project.godot 启用' : ',project.godot 已是启用状态')
+              + (d.enabled
+                ? (d.stoppedForRestart ? ' —— 已停止本项目正在运行的引擎,下次检查会自动重启并加载引擎桥' : ' —— 重启 Godot 编辑器后生效(或在「项目设置 → 插件」里确认已启用)')
+                : ' —— 但未能自动启用:' + (d.error || '')) })
+          } else set({ note: (d && d.error) || '安装引擎桥失败' })
+        })
+      }
+      function doCheckBridge(path) {
+        if (s.busy) return
+        set({ busy: 'bridge:' + path })
+        apiGet('bridgeStatus', path).then(function (d) {
+          set({ busy: '' })
+          if (d && d.ok) {
+            set({ note: d.online
+              ? '引擎桥在线(端口 ' + d.port + '):运行中的引擎可被要求重扫'
+              : (d.declared === false
+                ? '该项目绑定的引擎不支持引擎桥:' + (d.error || '')
+                : '引擎桥未响应(' + (d.port ? '端口 ' + d.port + ',' : '') + 'addon ' + (d.installed ? '已安装' : '未安装') + '):' + (d.error || '')) })
+          } else set({ note: '检测引擎桥失败' })
+        })
+      }
+
       // ---- render helpers ----
       function chipFor(rec, engineId) {
         var info = engineById[engineId]
@@ -796,6 +834,14 @@ window.__ModuleLoader__.load({
         var projName = normPath.slice(normPath.lastIndexOf('/') + 1) || p.path
         var injText = p.autoInject === false ? '已静音' : (s.autoInject ? '自动注入' : '注入关闭')
         var addPicker = addPickerFor(p)
+        // 引擎桥按钮只对该项目绑定的、声明了 rescan 能力的引擎出现(否则点了只会报错)
+        var canBridge = false
+        for (var bi = 0; bi < lspList.length; bi++) {
+          var bound = engineById[lspList[bi]]
+          // Mirrors the host check (rescan + shipped addon), so the button never
+          // appears for a project whose engine cannot serve it.
+          if (bound && bound.rescan && bound.addon) { canBridge = true; break }
+        }
         return React.createElement('div', { key: p.path, className: 'lspi-card' }, [
           React.createElement('div', { key: 'head', className: 'lspi-card-head' }, [
             React.createElement('span', { key: 't', className: 'lspi-card-title', title: p.path + '\n来源:' + srcText }, projName),
@@ -810,6 +856,16 @@ window.__ModuleLoader__.load({
               addPicker[0],
               addPicker[1],
             ]) : null,
+            canBridge ? React.createElement('button', {
+              type: 'button', className: 'lspi-set-btn', disabled: !!s.busy,
+              title: '在项目里安装 addons/dsh_echo_bridge(编辑器插件):运行中的 Godot 引擎(编辑器或 headless)可被要求重扫文件系统,新建脚本的 class_name 立即可见,不必重启引擎',
+              onClick: function () { doInstallAddon(p.path) },
+            }, s.busy === 'addon:' + p.path ? '…' : '安装引擎桥') : null,
+            canBridge ? React.createElement('button', {
+              type: 'button', className: 'lspi-set-btn', disabled: !!s.busy,
+              title: '检测运行中的引擎是否已加载引擎桥(能否响应重扫请求)',
+              onClick: function () { doCheckBridge(p.path) },
+            }, s.busy === 'bridge:' + p.path ? '…' : '检测引擎桥') : null,
             React.createElement('button', {
               type: 'button', className: 'lspi-set-btn', disabled: !!s.busy,
               title: '智能配置:探测项目语言,自动补上缺失的 LSP —— 只追加,绝不覆盖你手动删的',

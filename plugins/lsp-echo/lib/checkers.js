@@ -30,6 +30,15 @@ function descriptor(dir) {
     marker,
     extensions,
     bridgeName: typeof raw.bridge === 'string' && raw.bridge ? raw.bridge : DEFAULT_BRIDGE_NAME,
+    // Optional engine capabilities. `rescan` marks engines whose bridge can ask
+    // a running engine to rescan the project filesystem; `rescanPort` is that
+    // control socket's default port; `addon` names the in-project addon
+    // directory shipped next to the bridge that serves the request.
+    rescan: raw.rescan === true,
+    rescanPort: typeof raw.rescanPort === 'number' && Number.isInteger(raw.rescanPort) && raw.rescanPort > 0 && raw.rescanPort <= 65535
+      ? raw.rescanPort
+      : undefined,
+    addon: typeof raw.addon === 'string' && raw.addon ? raw.addon : undefined,
   }
 }
 
@@ -63,6 +72,9 @@ export function engines(pluginRoot) {
       bridge,
       marker: desc.marker,
       extensions: desc.extensions,
+      rescan: desc.rescan,
+      rescanPort: desc.rescanPort,
+      addon: desc.addon,
     }
   }
   return list

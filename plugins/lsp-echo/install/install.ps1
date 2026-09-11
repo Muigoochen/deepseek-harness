@@ -33,6 +33,12 @@ Write-Host "source : $PluginSource"
 Write-Host "target : $dest"
 
 # ---------- 1. copy the package (skip machine/runtime artifacts) ----------
+# The machine config lives inside $dest, so keep its content across the wipe:
+# reinstalling must not silently drop a hand-edited editorPort/attachEditor or
+# the godotBin this machine was set up with.
+$machineConfig = Join-Path $dest 'checkers\godot-lsp\godot-lsp.config.json'
+$previousConfig = ''
+if (Test-Path $machineConfig) { $previousConfig = Get-Content $machineConfig -Raw }
 if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dest 'lib') | Out-Null
@@ -47,10 +53,19 @@ Copy-Item (Join-Path $PluginSource 'checkers\godot-lsp\README.md') (Join-Path $e
 if (Test-Path (Join-Path $PluginSource 'checkers\godot-lsp\reference')) {
   Copy-Item (Join-Path $PluginSource 'checkers\godot-lsp\reference') (Join-Path $engineDir 'reference') -Recurse -Force
 }
+# The engine-bridge addon ships with the engine: without it the settings-page
+# "install engine bridge" action has no source directory to copy from.
+if (Test-Path (Join-Path $PluginSource 'checkers\godot-lsp\addon')) {
+  Copy-Item (Join-Path $PluginSource 'checkers\godot-lsp\addon') (Join-Path $engineDir 'addon') -Recurse -Force
+} else {
+  Write-Warning "engine bridge addon missing from source: $(Join-Path $PluginSource 'checkers\godot-lsp\addon')"
+}
 
 # ---------- 2. machine-local bridge config (only when missing) ----------
-$machineConfig = Join-Path $engineDir 'godot-lsp.config.json'
-if (-not (Test-Path $machineConfig)) {
+if ($previousConfig) {
+  Write-TextNoBom -Path $machineConfig -Text $previousConfig
+  Write-Host "restored existing machine config: $machineConfig"
+} elseif (-not (Test-Path $machineConfig)) {
   if (-not $GodotBin) {
     try { $GodotBin = (Get-Command godot -ErrorAction Stop).Source } catch { $GodotBin = '' }
   }

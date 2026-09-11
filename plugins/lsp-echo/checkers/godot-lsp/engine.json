@@ -2,5 +2,8 @@
   "name": "godot-lsp",
   "marker": "project.godot",
   "extensions": [".gd", ".gdshader"],
-  "bridge": "godot-lsp.mjs"
+  "bridge": "godot-lsp.mjs",
+  "rescan": true,
+  "rescanPort": 6089,
+  "addon": "addon"
 }
