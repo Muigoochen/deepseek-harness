@@ -1,0 +1,6 @@
+{
+  "name": "typescript",
+  "marker": "tsconfig.json",
+  "extensions": [".ts", ".tsx", ".mjs", ".cjs", ".js", ".jsx"],
+  "bridge": "typescript-lsp.mjs"
+}
