@@ -1,0 +1,10 @@
+# 追加到 C:\Users\<you>\.dsh\profiles\web\cordis.patch.yml
+# （install.ps1 会自动且幂等地追加这一行；本文件只是行示例。）
+# 本插件只有 Host 半，config 全部可省（省略即用默认阈值）。
+- insert:
+    - id: repeat-stream-guard
+      name: '@dsh-user/repeat-stream-guard'
+      config:
+        minPeriodicChars: 120
+        minCopies: 5
+        maxPeriod: 64
