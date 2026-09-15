@@ -149,8 +149,13 @@ def is_admin() -> bool:
 
 
 # ------------------------------------------------- 安装位置（可配置 + 持久化）
-# 一个目录同时有这两样 = DSH 检出 = 已装好可直接用。
+# 结构必要条件：一个目录同时有这两样，才有可能是 DSH 检出。
 CHECKOUT_MARKERS = ("package.json", "pnpm-workspace.yaml")
+# 身份条件（任意一条成立才算 DSH）：官方根包名 / 官方包名前缀 / 官方分组目录。
+# 只看结构会把**任意 pnpm 单仓**误判成 DSH，所以必须再认身份。
+DSH_ROOT_PACKAGE = "@deepseek-ai/dsh-root"
+DSH_PACKAGE_PREFIX = "@deepseek-ai/dsh"
+DSH_GROUP_DIRS = ("core", "api")
 # 常见安装目录名（含下划线写法，用户的安装常叫 deepseek_harness）。
 INSTALL_DIR_NAMES = ("deepseek-harness", "deepseek_harness", "dsh-harness",
                      "dsh_harness", "DeepseekHarness")
@@ -215,12 +220,42 @@ def default_project_dir() -> Path:
     return others[0] if others else DEFAULT_PROJECT_DIR
 
 
+def _pkg_name(pkg_json: Path) -> str:
+    """读 package.json 的 name；缺失/损坏/非对象一律返回空串。"""
+    try:
+        data = json.loads(pkg_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    return str(data.get("name", "")) if isinstance(data, dict) else ""
+
+
+def checkout_identity(path: Path) -> str:
+    """这个目录凭什么被认成 DSH 检出；返回判定依据，'' 表示不是。
+
+    结构（`package.json` + `pnpm-workspace.yaml`）只是必要条件——任意 pnpm 单仓都满足，
+    所以还要认身份，任意一条成立即可：
+      ① 根包名 = `@deepseek-ai/dsh-root`（官方根包名，最硬）
+      ② 根包名以 `@deepseek-ai/dsh` 开头（rescore/改名后仍认）
+      ③ 同时存在 `packages/core` 与 `packages/api`（官方分组布局，不依赖包名）
+    """
+    try:
+        if not all((path / m).is_file() for m in CHECKOUT_MARKERS):
+            return ""
+    except OSError:
+        return ""
+    name = _pkg_name(path / "package.json")
+    if name == DSH_ROOT_PACKAGE:
+        return f"根包名 {name}"
+    if name.startswith(DSH_PACKAGE_PREFIX):
+        return f"根包名 {name}"
+    if all((path / "packages" / g).is_dir() for g in DSH_GROUP_DIRS):
+        return "目录布局 packages/" + "+".join(DSH_GROUP_DIRS)
+    return ""
+
+
 def is_checkout(path: Path) -> bool:
     """该目录是否是一个 DSH 检出（= 已装好，可直接运行、无需重装）。"""
-    try:
-        return all((path / m).is_file() for m in CHECKOUT_MARKERS)
-    except OSError:
-        return False
+    return bool(checkout_identity(path))
 
 
 def _drive_roots() -> list[Path]:
@@ -954,10 +989,11 @@ class App(tk.Tk):
         """即时反馈：红=不能装，橙=可装有风险，绿=已装好/可用（最多 2 条提示）。"""
         target = self._current_dir()
         errors, warns = check_install_dir(target)
+        why = checkout_identity(target)
         if errors:
             text, color = "✗ " + errors[0], "#b00000"
-        elif is_checkout(target):
-            text, color = "✓ 已检测到已安装的 DSH，将直接使用（不会重复下载）", "#1a6b1a"
+        elif why:
+            text, color = f"✓ 已检测到已安装的 DSH（{why}），将直接使用", "#1a6b1a"
         elif warns:
             shown = "；".join(warns[:2]) + ("…" if len(warns) > 2 else "")
             text, color = "⚠ " + shown, "#a05a00"
@@ -2124,8 +2160,9 @@ def selfcheck() -> int:
         log_line(f"  {'✓' if ok else '—'} {name:<12} {path}")
 
     target = project_dir()
-    if is_checkout(target):
-        state = "★ 已检测到已安装的 DSH，将直接使用"
+    why = checkout_identity(target)
+    if why:
+        state = f"★ 已检测到已安装的 DSH（{why}），将直接使用"
     elif target.exists():
         state = "目录已存在，但不是 DSH 检出（安装时会克隆/解压到这里）"
     else:

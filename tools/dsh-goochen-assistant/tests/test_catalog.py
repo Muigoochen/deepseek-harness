@@ -206,11 +206,59 @@ class InstallDirTest(unittest.TestCase):
             self.assertEqual(installer.default_project_dir(),
                              installer.DEFAULT_PROJECT_DIR)
 
-    def _make_checkout(self, root: Path) -> Path:
+    def _make_checkout(self, root: Path, name: str = "@deepseek-ai/dsh-root") -> Path:
+        """造一个「假检出」：有结构标记，且带官方根包名（否则不算 DSH）。"""
         root.mkdir(parents=True, exist_ok=True)
-        (root / "package.json").write_text("{}", encoding="utf-8")
+        (root / "package.json").write_text(json.dumps({"name": name}),
+                                           encoding="utf-8")
         (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
         return root
+
+    def test_identity_rejects_a_plain_pnpm_repo(self):
+        """结构像（有 package.json + pnpm-workspace.yaml）但不是 DSH → 不认。"""
+        other = self.tmp / "some-monorepo"
+        other.mkdir()
+        (other / "package.json").write_text('{"name": "my-app"}', encoding="utf-8")
+        (other / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        self.assertEqual(installer.checkout_identity(other), "")
+        self.assertFalse(installer.is_checkout(other))
+
+    def test_identity_requires_both_markers(self):
+        """只有 package.json、没有 pnpm-workspace.yaml → 不认。"""
+        root = self.tmp / "half"
+        root.mkdir()
+        (root / "package.json").write_text('{"name": "@deepseek-ai/dsh-root"}',
+                                           encoding="utf-8")
+        self.assertEqual(installer.checkout_identity(root), "")
+
+    def test_identity_accepts_official_root_name(self):
+        root = self._make_checkout(self.tmp / "anywhere")
+        self.assertIn("@deepseek-ai/dsh-root", installer.checkout_identity(root))
+        self.assertTrue(installer.is_checkout(root))
+
+    def test_identity_accepts_dsh_package_prefix(self):
+        """根包名换了但仍是 @deepseek-ai/dsh* → 认。"""
+        root = self._make_checkout(self.tmp / "renamed", name="@deepseek-ai/dsh-app")
+        self.assertTrue(installer.is_checkout(root))
+
+    def test_identity_accepts_official_group_layout_without_name(self):
+        """包名认不出时，靠 packages/core + packages/api 布局也能认。"""
+        root = self.tmp / "layout-only"
+        for group in ("core", "api"):
+            (root / "packages" / group).mkdir(parents=True)
+        (root / "package.json").write_text('{"name": "whatever"}', encoding="utf-8")
+        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        self.assertIn("packages/", installer.checkout_identity(root))
+        self.assertTrue(installer.is_checkout(root))
+
+    def test_identity_survives_broken_package_json(self):
+        """package.json 坏了不能崩，只按布局判定。"""
+        root = self.tmp / "broken"
+        (root / "packages" / "core").mkdir(parents=True)
+        (root / "packages" / "api").mkdir(parents=True)
+        (root / "package.json").write_text("{ not json", encoding="utf-8")
+        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        self.assertTrue(installer.is_checkout(root))
 
     def test_plan_a_default_when_nothing_saved_or_installed(self):
         with mock.patch.object(installer, "detect_installed_dir", return_value=None):
@@ -242,11 +290,9 @@ class InstallDirTest(unittest.TestCase):
 
     def test_detects_install_that_contains_the_tool(self):
         """小助手就在安装目录里 → 直接认出那份安装（正是实测遇到的情况）。"""
-        root = self.tmp / "deepseek_harness"
+        root = self._make_checkout(self.tmp / "deepseek_harness")
         tool = root / "tools" / "dsh-goochen-assistant"
         tool.mkdir(parents=True)
-        (root / "package.json").write_text("{}", encoding="utf-8")
-        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
         with mock.patch.object(installer, "HERE", tool):
             self.assertEqual(installer.detect_installed_dir(refresh=True),
                              root.resolve())
@@ -269,10 +315,7 @@ class InstallDirTest(unittest.TestCase):
 
     def test_normalize_picked_never_renames_an_installed_dir(self):
         """选到已装好的目录（含下划线命名）→ 原样采用；选到父目录才下钻。"""
-        root = self.tmp / "deepseek_harness"
-        (root / "tools").mkdir(parents=True)
-        (root / "package.json").write_text("{}", encoding="utf-8")
-        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        root = self._make_checkout(self.tmp / "deepseek_harness")
         self.assertEqual(installer.App._normalize_picked(root), root)
         self.assertEqual(installer.App._normalize_picked(self.tmp), root)
         plain = self.tmp / "plain"
