@@ -17,6 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -187,8 +188,12 @@ class InstallDirTest(unittest.TestCase):
         self._old_dir, self._old_path = installer.CONFIG_DIR, installer.CONFIG_PATH
         installer.CONFIG_DIR = self.tmp
         installer.CONFIG_PATH = self.tmp / "config.json"
+        installer.set_active_dir(None)      # 清掉上一个用例留下的界面选择
+        installer._DETECT_CACHE.clear()     # 清掉自动检测缓存
 
     def tearDown(self):
+        installer.set_active_dir(None)
+        installer._DETECT_CACHE.clear()
         installer.CONFIG_DIR, installer.CONFIG_PATH = self._old_dir, self._old_path
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -201,13 +206,80 @@ class InstallDirTest(unittest.TestCase):
             self.assertEqual(installer.default_project_dir(),
                              installer.DEFAULT_PROJECT_DIR)
 
-    def test_project_dir_defaults_then_honors_config(self):
-        self.assertEqual(installer.project_dir(), installer.default_project_dir())
-        custom = self.tmp / "my" / "deepseek-harness"
+    def _make_checkout(self, root: Path) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "package.json").write_text("{}", encoding="utf-8")
+        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        return root
+
+    def test_plan_a_default_when_nothing_saved_or_installed(self):
+        with mock.patch.object(installer, "detect_installed_dir", return_value=None):
+            self.assertEqual(installer.project_dir(), installer.default_project_dir())
+
+    def test_saved_config_is_honored_when_it_holds_a_real_install(self):
+        custom = self._make_checkout(self.tmp / "my" / "deepseek_harness")
         installer.set_project_dir(custom)
-        self.assertEqual(installer.project_dir(), custom)
+        installer._DETECT_CACHE.clear()
+        with mock.patch.object(installer, "detect_installed_dir", return_value=None):
+            self.assertEqual(installer.project_dir(), custom)
         saved = json.loads(installer.CONFIG_PATH.read_text(encoding="utf-8"))
         self.assertEqual(saved["installDir"], str(custom))
+
+    def test_saved_empty_dir_does_not_hide_a_real_install(self):
+        """配置指向空目录时，不能让机器上已装好的那份被「尚未安装」掩盖。"""
+        installer.set_project_dir(self.tmp / "empty" / "deepseek-harness")
+        installed = self._make_checkout(self.tmp / "deepseek_harness")
+        with mock.patch.object(installer, "detect_installed_dir",
+                               return_value=installed):
+            self.assertEqual(installer.project_dir(), installed)
+
+    def test_saved_empty_dir_is_used_when_nothing_is_installed(self):
+        """哪儿都没装 → 用户存的位置就是「将要安装到哪」。"""
+        target = self.tmp / "fresh" / "deepseek-harness"
+        installer.set_project_dir(target)
+        with mock.patch.object(installer, "detect_installed_dir", return_value=None):
+            self.assertEqual(installer.project_dir(), target)
+
+    def test_detects_install_that_contains_the_tool(self):
+        """小助手就在安装目录里 → 直接认出那份安装（正是实测遇到的情况）。"""
+        root = self.tmp / "deepseek_harness"
+        tool = root / "tools" / "dsh-goochen-assistant"
+        tool.mkdir(parents=True)
+        (root / "package.json").write_text("{}", encoding="utf-8")
+        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        with mock.patch.object(installer, "HERE", tool):
+            self.assertEqual(installer.detect_installed_dir(refresh=True),
+                             root.resolve())
+            self.assertEqual(installer.project_dir(), root.resolve())
+
+    def test_detected_install_beats_plan_a_default(self):
+        """已装好的位置优先于方案 A 默认——否则会指着不存在的 C 盘目录说「尚未安装」。"""
+        other = self.tmp / "elsewhere"
+        with mock.patch.object(installer, "detect_installed_dir", return_value=other):
+            self.assertEqual(installer.project_dir(), other)
+
+    def test_active_dir_wins_over_config_and_detection(self):
+        """界面里选的目录立即生效（不必先点安装），压过配置与自动检测。"""
+        installer.set_project_dir(self._make_checkout(self.tmp / "saved"))
+        picked = self.tmp / "picked"
+        installer.set_active_dir(picked)
+        self.assertEqual(installer.project_dir(), picked)
+        installer.set_active_dir(None)
+        self.assertEqual(installer.project_dir(), self.tmp / "saved")
+
+    def test_normalize_picked_never_renames_an_installed_dir(self):
+        """选到已装好的目录（含下划线命名）→ 原样采用；选到父目录才下钻。"""
+        root = self.tmp / "deepseek_harness"
+        (root / "tools").mkdir(parents=True)
+        (root / "package.json").write_text("{}", encoding="utf-8")
+        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        self.assertEqual(installer.App._normalize_picked(root), root)
+        self.assertEqual(installer.App._normalize_picked(self.tmp), root)
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        self.assertEqual(installer.App._normalize_picked(plain), plain)
+        self.assertEqual(installer.App._normalize_picked(Path("E:\\")),
+                         Path("E:\\") / installer.SOURCE_DIR_NAME)
 
     def test_check_install_dir_errors(self):
         errs, _ = installer.check_install_dir(Path("deepseek-harness"))

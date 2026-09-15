@@ -149,6 +149,17 @@ def is_admin() -> bool:
 
 
 # ------------------------------------------------- 安装位置（可配置 + 持久化）
+# 一个目录同时有这两样 = DSH 检出 = 已装好可直接用。
+CHECKOUT_MARKERS = ("package.json", "pnpm-workspace.yaml")
+# 常见安装目录名（含下划线写法，用户的安装常叫 deepseek_harness）。
+INSTALL_DIR_NAMES = ("deepseek-harness", "deepseek_harness", "dsh-harness",
+                     "dsh_harness", "DeepseekHarness")
+# 界面当前选定的安装位：置顶于配置与自动检测之上（见 project_dir）。
+_ACTIVE_DIR: Path | None = None
+# 自动检测结果缓存（单元素）：探测只做一次，避免每次按键都扫盘。
+_DETECT_CACHE: list[Path | None] = []
+
+
 def load_config() -> dict:
     """读取小助手配置；文件缺失或损坏时返回空配置。"""
     try:
@@ -204,12 +215,111 @@ def default_project_dir() -> Path:
     return others[0] if others else DEFAULT_PROJECT_DIR
 
 
+def is_checkout(path: Path) -> bool:
+    """该目录是否是一个 DSH 检出（= 已装好，可直接运行、无需重装）。"""
+    try:
+        return all((path / m).is_file() for m in CHECKOUT_MARKERS)
+    except OSError:
+        return False
+
+
+def _drive_roots() -> list[Path]:
+    out: list[Path] = []
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        root = Path(f"{letter}:\\")
+        try:
+            if root.exists():
+                out.append(root)
+        except OSError:
+            continue
+    return out
+
+
+def _shallow_dirs(root: Path, limit: int = 60) -> list[Path]:
+    """一层子目录（跳系统目录、限量）——只用于有限探测，不遍历整盘。"""
+    skip = {"$recycle.bin", "system volume information", "windows", "program files",
+            "program files (x86)", "programdata", "recovery", "node_modules", ".git"}
+    out: list[Path] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if len(out) >= limit:
+                    break
+                try:
+                    if entry.is_dir() and entry.name.lower() not in skip:
+                        out.append(Path(entry.path))
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    return out
+
+
+def detect_installed_dir(*, refresh: bool = False) -> Path | None:
+    """自动找出机器上**已经装好**的 DSH 检出。
+
+    顺序：小助手自身所在检出（小助手常被直接放进那份安装里）→ 用户目录下常见命名 →
+    各盘根下的常见命名及其**再一层**（覆盖 E:\\Deepseek\\deepseek_harness 这类）。
+    结果按进程缓存：探测只需做一次，之后每次调用都是读缓存。
+    """
+    if _DETECT_CACHE and not refresh:
+        return _DETECT_CACHE[0]
+    found = _detect_uncached()
+    _DETECT_CACHE[:] = [found]
+    return found
+
+
+def _detect_uncached() -> Path | None:
+    here = HERE.resolve()
+    for up in (here.parent, here.parent.parent, here.parent.parent.parent):
+        if is_checkout(up):
+            return up
+    for name in INSTALL_DIR_NAMES:
+        if is_checkout(INSTALL_BASE / name):
+            return INSTALL_BASE / name
+    for drive in _drive_roots():
+        for name in INSTALL_DIR_NAMES:
+            if is_checkout(drive / name):
+                return drive / name
+        if is_checkout(drive / "DSH" / SOURCE_DIR_NAME):
+            return drive / "DSH" / SOURCE_DIR_NAME
+        for sub in _shallow_dirs(drive):
+            for name in INSTALL_DIR_NAMES:
+                if is_checkout(sub / name):
+                    return sub / name
+    return None
+
+
 def project_dir() -> Path:
-    """实际安装位：用户配置优先，其次方案 A 默认（含空间回退）。"""
+    """实际安装位，优先级：
+
+    界面当前选择 → 配置里的**真实**安装（是 DSH 检出）→ 机器上自动检测到的已安装
+    → 配置里的空位（将要安装到哪）→ 方案 A 默认。
+
+    配置若指向一个空目录，不让它掩盖机器上已经装好的那份——否则用户会看到
+    「尚未安装」而以为自己得重装。
+    """
+    if _ACTIVE_DIR is not None:
+        return _ACTIVE_DIR
     raw = str(load_config().get("installDir", "")).strip()
-    if raw:
-        return Path(os.path.expandvars(raw)).expanduser()
+    saved = Path(os.path.expandvars(raw)).expanduser() if raw else None
+    if saved is not None and is_checkout(saved):
+        return saved
+    found = detect_installed_dir()
+    if found is not None:
+        return found
+    if saved is not None:
+        return saved
     return default_project_dir()
+
+
+def set_active_dir(path: Path | None) -> None:
+    """记录界面**当前**选定的安装位；立即对自检/运行/插件生效，不必先点安装。"""
+    global _ACTIVE_DIR
+    if path is None:
+        _ACTIVE_DIR = None
+        return
+    _ACTIVE_DIR = Path(os.path.expandvars(str(path))).expanduser()
 
 
 def set_project_dir(path: Path) -> None:
@@ -612,13 +722,14 @@ class App(tk.Tk):
         self.dir_var = tk.StringVar(value=str(project_dir()))
         dir_ent = ttk.Entry(lrow, textvariable=self.dir_var)
         dir_ent.pack(side="left", fill="x", expand=True)
-        dir_ent.bind("<FocusOut>", self._dir_hint)
-        dir_ent.bind("<Return>", self._dir_hint)
+        dir_ent.bind("<FocusOut>", self._on_dir_committed)
+        dir_ent.bind("<Return>", self._on_dir_committed)
         ttk.Button(lrow, text="浏览…", command=self._on_pick_dir).pack(side="left", padx=(6, 0))
         ttk.Button(lrow, text="恢复默认", command=self._on_reset_dir).pack(side="left", padx=(6, 0))
         self.dir_hint = ttk.Label(loc, text="", foreground="#666")
         self.dir_hint.pack(anchor="w", pady=(4, 0))
-        self._dir_hint()
+        self.dir_var.trace_add("write", self._on_dir_changed)
+        self._on_dir_changed()
 
         # 按钮
         btns = ttk.Frame(tab_run)
@@ -801,30 +912,52 @@ class App(tk.Tk):
         raw = self.dir_var.get().strip()
         return Path(os.path.expandvars(raw)).expanduser() if raw else default_project_dir()
 
+    def _on_dir_changed(self, *_args) -> None:
+        """输入框一动就立即生效：之后的「运行/自检/插件」都用这个目录。"""
+        set_active_dir(self._current_dir())
+        self._dir_hint()
+
+    def _on_dir_committed(self, _event=None) -> None:
+        """失焦/回车 = 用户确认了这个位置，顺手记进配置。"""
+        self._on_dir_changed()
+        set_project_dir(self._current_dir())
+
+    @staticmethod
+    def _normalize_picked(chosen: Path) -> Path:
+        """选中的目录**直接采用**；只有选到盘根时才补默认名，绝不擅自改名。"""
+        if is_checkout(chosen):
+            return chosen
+        for name in INSTALL_DIR_NAMES:
+            if is_checkout(chosen / name):
+                return chosen / name
+        if chosen.parent == chosen:                 # 盘根，如 E:\
+            return chosen / SOURCE_DIR_NAME
+        return chosen
+
     def _on_pick_dir(self) -> None:
         base = self._current_dir()
         picked = filedialog.askdirectory(
-            title="选择安装位置（产品将装在其下的 deepseek-harness 里）", parent=self,
-            initialdir=str(base.parent) if base.parent.exists() else None)
+            title="选择 DSH 安装位置（已装好的目录会被自动识别）", parent=self,
+            initialdir=str(base if base.exists() else base.parent))
         if not picked:
             return
-        chosen = Path(picked)
-        # 选中的若是父目录，自动补产品目录名，避免源码摊在盘根/桌面
-        if chosen.name.lower() != SOURCE_DIR_NAME:
-            chosen = chosen / SOURCE_DIR_NAME
-        self.dir_var.set(str(chosen))
-        self._dir_hint()
+        chosen = self._normalize_picked(Path(picked))
+        self.dir_var.set(str(chosen))               # 触发 _on_dir_changed → 立即生效
+        set_project_dir(chosen)
 
     def _on_reset_dir(self) -> None:
-        self.dir_var.set(str(default_project_dir()))
-        self._dir_hint()
+        default = default_project_dir()
+        self.dir_var.set(str(default))
+        set_project_dir(default)
 
     def _dir_hint(self, _event=None) -> None:
-        """即时反馈安装位置可用性：错误红、警告橙、正常绿（最多显示 2 条提示）。"""
+        """即时反馈：红=不能装，橙=可装有风险，绿=已装好/可用（最多 2 条提示）。"""
         target = self._current_dir()
         errors, warns = check_install_dir(target)
         if errors:
             text, color = "✗ " + errors[0], "#b00000"
+        elif is_checkout(target):
+            text, color = "✓ 已检测到已安装的 DSH，将直接使用（不会重复下载）", "#1a6b1a"
         elif warns:
             shown = "；".join(warns[:2]) + ("…" if len(warns) > 2 else "")
             text, color = "⚠ " + shown, "#a05a00"
@@ -832,7 +965,8 @@ class App(tk.Tk):
             probe = target if target.exists() else (
                 target.parent if target.parent.exists() else INSTALL_BASE)
             free = free_gb(probe)
-            text = (f"✓ 可用（所在磁盘剩余 {free:.0f} GB）" if free >= 0 else "✓ 可用")
+            text = (f"✓ 可用（所在磁盘剩余 {free:.0f} GB）→ 将安装到这里"
+                    if free >= 0 else "✓ 可用 → 将安装到这里")
             color = "#1a6b1a"
         self.dir_hint.configure(text=text, foreground=color)
 
@@ -855,20 +989,19 @@ class App(tk.Tk):
             self._set_busy(False)
 
     def _resolve_web_project(self) -> Path | None:
-        """可用项目目录：用户配置/默认安装位优先；仓库根仅在显式开发态兜底。
+        """可运行的项目目录：界面当前选择/配置/自动检测到的已安装位。
 
-        小助手默认与所在仓库解耦（产品由官方链接独立克隆），因此仓库根不再
-        作为常规候选；本机开发时设 DSH_ASSISTANT_DEV=1 可恢复该兜底。
+        只认「DSH 检出」；仓库根兜底仅在显式开发态开启（本机开发用）。
         """
-        cands = [project_dir(), DEFAULT_PROJECT_DIR]
+        cands = [project_dir(), default_project_dir()]
         if os.environ.get("DSH_ASSISTANT_DEV") == "1":
-            cands.append(HERE.parent.parent)      # 开发态：tools/<本工具> → dsh 检出根
+            cands.append(HERE.parent.parent)
         seen: set[Path] = set()
         for cand in cands:
             if cand in seen:
                 continue
             seen.add(cand)
-            if (cand / "package.json").exists() and (cand / "pnpm-workspace.yaml").exists():
+            if is_checkout(cand):
                 return cand
         return None
 
@@ -986,7 +1119,7 @@ class App(tk.Tk):
         project = self._resolve_web_project()
         if project is None:
             messagebox.showerror("未找到项目",
-                                 f"找不到项目源码目录；已检查 {project_dir()}")
+                                 f"找不到已安装的 DSH；当前安装位置：{project_dir()}")
             return
         self.clipboard_clear()
         self.clipboard_append(str(project))
@@ -1991,8 +2124,13 @@ def selfcheck() -> int:
         log_line(f"  {'✓' if ok else '—'} {name:<12} {path}")
 
     target = project_dir()
-    log_line(f"项目目录   : {target}  "
-             f"{'已存在' if target.exists() else '尚未安装'}")
+    if is_checkout(target):
+        state = "★ 已检测到已安装的 DSH，将直接使用"
+    elif target.exists():
+        state = "目录已存在，但不是 DSH 检出（安装时会克隆/解压到这里）"
+    else:
+        state = "尚未安装（安装时会克隆/解压到这里）"
+    log_line(f"项目目录   : {target}  {state}")
     log_line("=== 自检结束 ===")
     return 0
 
