@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -38,6 +39,25 @@ def write_plugin(root: Path, slug: str) -> Path:
         "name": f"@dsh-user/{slug}", "version": "0.0.1", "main": "./lib/index.js",
     }), encoding="utf-8")
     return d
+
+
+def write_plugin_like(root: Path, rel: str, name: str) -> Path:
+    """在 root/<rel> 写一个只有包名有意义的 package.json（用于身份判定用例）。"""
+    d = root / rel
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "package.json").write_text(json.dumps({"name": name}), encoding="utf-8")
+    return d
+
+
+class DumpGateProbe:
+    """结构门探针：放行并记下收到的补丁文本（不跑真的 dsh）。"""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def __call__(self, patch_path: Path) -> ps.DumpResult:
+        self.seen.append(patch_path.read_text(encoding="utf-8"))
+        return ps.DumpResult(ok=True, exit_code=0)
 
 
 class FakeGit:
@@ -161,11 +181,29 @@ class CatalogTest(unittest.TestCase):
 
     def test_discover_sources_without_cache_ignores_project(self):
         """不传 project_root 时不再扫描所在仓库的 plugins/（独立化）。"""
+        project = Path(tempfile.mkdtemp(prefix="dsh-proj-"))
+        write_plugin(project / "plugins", "sneaky")
         self.assertEqual(ps.discover_sources(None, None, None), [])
+        # 反过来：显式传入时必须能发现（证明上一条不是因为函数永远是空的）
+        found = [s.slug for s in ps.discover_sources(project, None, None)]
+        self.assertEqual(found, ["sneaky"])
+
+    def test_fetch_moves_broken_residue_aside(self):
+        """上次中断的 clone 残留（无 package.json）不能让它永远下载不了。"""
+        cache = make_cache()
+        slug = ps.PLUGIN_REPOS[0]["slug"]
+        (cache / slug).mkdir(parents=True)
+        (cache / slug / "README.md").write_text("half clone", encoding="utf-8")
+
+        target = ps.fetch_plugin(ps.PLUGIN_REPOS[0], cache, run_git=FakeGit())
+
+        self.assertTrue((target / "package.json").is_file())
+        residue = [p for p in cache.iterdir() if p.name.startswith(f".broken-{slug}")]
+        self.assertEqual(len(residue), 1, "残留目录应被移到 .broken-* 而不是被覆盖")
+        self.assertTrue((residue[0] / "README.md").is_file())
 
     def test_cloned_catalog_plugin_installs_end_to_end(self):
         """端到端：清单克隆 → 被当作来源发现 → 装进共享锚（独立仓库即可用）。"""
-        from test_plugin_store import DumpGateProbe  # 复用结构门探针（不跑真 dsh）
         home = Path(tempfile.mkdtemp(prefix="dsh-home-"))
         (home / "profiles" / "web").mkdir(parents=True)
         slug = ps.PLUGIN_REPOS[0]["slug"]
@@ -198,13 +236,13 @@ class InstallDirTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_default_is_plan_a(self):
-        """默认安装位 = %USERPROFILE%\\deepseek-harness（方案 A）。"""
+        """默认安装位 = <用户目录>\\deepseek-harness（方案 A），按字面量断言。"""
         self.assertEqual(installer.DEFAULT_PROJECT_DIR,
-                         installer.INSTALL_BASE / installer.SOURCE_DIR_NAME)
+                         Path.home() / "deepseek-harness")
         # 系统盘空间充足时应原样返回方案 A
         if installer.free_gb(installer.INSTALL_BASE) >= installer.MIN_FREE_GB:
             self.assertEqual(installer.default_project_dir(),
-                             installer.DEFAULT_PROJECT_DIR)
+                             Path.home() / "deepseek-harness")
 
     def _make_checkout(self, root: Path, name: str = "@deepseek-ai/dsh-root") -> Path:
         """造一个「假检出」：有结构标记，且带官方根包名（否则不算 DSH）。"""
@@ -241,23 +279,41 @@ class InstallDirTest(unittest.TestCase):
         root = self._make_checkout(self.tmp / "renamed", name="@deepseek-ai/dsh-app")
         self.assertTrue(installer.is_checkout(root))
 
-    def test_identity_accepts_official_group_layout_without_name(self):
-        """包名认不出时，靠 packages/core + packages/api 布局也能认。"""
+    def test_identity_accepts_official_subpackage_without_root_name(self):
+        """根包名认不出时，靠 packages/core 下的官方子包名也能认。"""
         root = self.tmp / "layout-only"
-        for group in ("core", "api"):
-            (root / "packages" / group).mkdir(parents=True)
-        (root / "package.json").write_text('{"name": "whatever"}', encoding="utf-8")
-        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
-        self.assertIn("packages/", installer.checkout_identity(root))
+        self._make_checkout(root, name="whatever")
+        write_plugin_like(root, "packages/core/session", "@deepseek-ai/dsh-session")
+        self.assertIn("@deepseek-ai/dsh-session", installer.checkout_identity(root))
         self.assertTrue(installer.is_checkout(root))
 
+    def test_identity_rejects_common_monorepo_layout(self):
+        """packages/core + packages/api 是很常见的命名——普通单仓不能被误认。
+
+        （评审实测过这条假阳性：会把用户自己的项目当成 DSH 去跑 pnpm install/build。）
+        """
+        root = self.tmp / "my-monorepo"
+        self._make_checkout(root, name="my-app")
+        for group in ("core", "api"):
+            (root / "packages" / group).mkdir(parents=True)
+        write_plugin_like(root, "packages/core/utils", "@my-app/utils")
+        self.assertEqual(installer.checkout_identity(root), "")
+        self.assertFalse(installer.is_checkout(root))
+
+    def test_identity_rejects_lookalike_scope(self):
+        """@deepseek-ai/dshmarket 这类「前缀相同但没有分隔符」的包名不能被认。"""
+        root = self._make_checkout(self.tmp / "lookalike",
+                                   name="@deepseek-ai/dshmarket")
+        self.assertEqual(installer.checkout_identity(root), "")
+        self.assertFalse(installer.is_checkout(root))
+
     def test_identity_survives_broken_package_json(self):
-        """package.json 坏了不能崩，只按布局判定。"""
+        """根 package.json 坏了不能崩，仍能按子包名认出来。"""
         root = self.tmp / "broken"
         (root / "packages" / "core").mkdir(parents=True)
-        (root / "packages" / "api").mkdir(parents=True)
         (root / "package.json").write_text("{ not json", encoding="utf-8")
         (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        write_plugin_like(root, "packages/core/agent", "@deepseek-ai/dsh-agent")
         self.assertTrue(installer.is_checkout(root))
 
     def test_plan_a_default_when_nothing_saved_or_installed(self):
@@ -321,8 +377,14 @@ class InstallDirTest(unittest.TestCase):
         plain = self.tmp / "plain"
         plain.mkdir()
         self.assertEqual(installer.App._normalize_picked(plain), plain)
-        self.assertEqual(installer.App._normalize_picked(Path("E:\\")),
-                         Path("E:\\") / installer.SOURCE_DIR_NAME)
+
+    def test_drive_root_pick_appends_default_name(self):
+        """选到盘根才补默认名（只在 Windows 盘符语义下成立）。"""
+        if os.name != "nt":
+            self.skipTest("盘根语义仅 Windows")
+        root = Path("E:\\")
+        self.assertEqual(installer.App._normalize_picked(root),
+                         root / installer.SOURCE_DIR_NAME)
 
     def test_check_install_dir_errors(self):
         errs, _ = installer.check_install_dir(Path("deepseek-harness"))
@@ -344,6 +406,82 @@ class InstallDirTest(unittest.TestCase):
         errs, warns = installer.check_install_dir(self.tmp / "deepseek-harness")
         self.assertEqual(errs, [])
         self.assertEqual(warns, [])
+
+
+class PrepareSourceTest(unittest.TestCase):
+    """安装前的最后一道闸：绝不在「无关项目」里跑 pnpm install/build。
+
+    评审复现过：只凭「有 package.json」就复用目录，会在用户自己的项目里执行
+    pnpm 安装与构建。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-prep-"))
+        self._old = (installer.CONFIG_DIR, installer.CONFIG_PATH)
+        installer.CONFIG_DIR = self.tmp
+        installer.CONFIG_PATH = self.tmp / "config.json"
+        installer.set_active_dir(None)
+        installer._DETECT_CACHE.clear()
+        self.logs: list[str] = []
+
+    def tearDown(self):
+        installer.set_active_dir(None)
+        installer._DETECT_CACHE.clear()
+        installer.CONFIG_DIR, installer.CONFIG_PATH = self._old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _engine(self) -> installer.Engine:
+        return installer.Engine(mode="auto", use_mirror=False, log=self.logs.append)
+
+    def test_refuses_foreign_project_with_package_json(self):
+        foreign = self.tmp / "my-app"
+        foreign.mkdir()
+        (foreign / "package.json").write_text('{"name": "my-app"}', encoding="utf-8")
+        installer.set_active_dir(foreign)
+        with self.assertRaises(installer.InstallError) as ctx:
+            self._engine().prepare_source()
+        self.assertIn("不是一个 DSH 检出", str(ctx.exception))
+        # 不得留下任何痕迹（没跑过 pnpm/tar/clone）
+        self.assertEqual(sorted(p.name for p in foreign.iterdir()), ["package.json"])
+
+    def test_reuses_existing_checkout(self):
+        root = self._make_checkout(self.tmp / "deepseek_harness")
+        installer.set_active_dir(root)
+        self.assertEqual(self._engine().prepare_source(), root)
+        self.assertTrue(any("已检测到现有 DSH" in m for m in self.logs), self.logs)
+
+    def _make_checkout(self, root: Path) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "package.json").write_text('{"name": "@deepseek-ai/dsh-root"}',
+                                           encoding="utf-8")
+        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        return root
+
+
+class PluginSourcesTest(unittest.TestCase):
+    """刷新与保存必须看到同一份来源，否则列表里的插件保存时会说「不在来源目录中」。"""
+
+    @staticmethod
+    def _slugs(home: Path, project: Path) -> list[str]:
+        return [s.slug for s in installer.App._plugin_sources(object(), home, project)]
+
+    def test_dev_mode_includes_project_plugins(self):
+        home = Path(tempfile.mkdtemp(prefix="dsh-home-"))
+        project = Path(tempfile.mkdtemp(prefix="dsh-proj-"))
+        write_plugin(project / "plugins", "devplug")
+
+        with mock.patch.dict(os.environ, {"DSH_ASSISTANT_DEV": "1"}):
+            self.assertIn("devplug", self._slugs(home, project))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertNotIn("devplug", self._slugs(home, project))
+
+    def test_cloned_cache_is_always_a_source(self):
+        home = Path(tempfile.mkdtemp(prefix="dsh-home-"))
+        project = Path(tempfile.mkdtemp(prefix="dsh-proj-"))
+        cache = ps.plugin_cache_dir(home)
+        ps.fetch_plugin(ps.PLUGIN_REPOS[0], cache, run_git=FakeGit())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIn(ps.PLUGIN_REPOS[0]["slug"], self._slugs(home, project))
 
 
 class MergeTest(unittest.TestCase):

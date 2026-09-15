@@ -471,6 +471,15 @@ def _git_runner(run_git: Optional[Callable[[list[str]], tuple[int, str, str]]]):
     return git
 
 
+def _unique_sibling(parent: Path, stem: str) -> Path:
+    """parent 下一个尚不存在的名字：<stem> / <stem>-1 / <stem>-2 …"""
+    for index in range(100):
+        cand = parent / (stem if index == 0 else f"{stem}-{index}")
+        if not cand.exists():
+            return cand
+    return parent / f"{stem}-{os.getpid()}"
+
+
 def fetch_plugin(source: dict, cache_dir: Path,
                  run_git: Optional[Callable[[list[str]], tuple[int, str, str]]] = None) -> Path:
     """按清单抓取插件源码：`git clone --depth 1 [--branch ref] <repo> <cache>/<slug>`。
@@ -485,6 +494,15 @@ def fetch_plugin(source: dict, cache_dir: Path,
     if (target / "package.json").is_file():
         return target
     cache_dir.mkdir(parents=True, exist_ok=True)
+    # 上次中断的 clone 会留下没有 package.json 的残留目录，直接再 clone 会
+    # 因「目标路径已存在」永久失败；先挪到一边，让用户仍能下载成功。
+    if target.exists():
+        broken = _unique_sibling(cache_dir, f".broken-{slug}")
+        try:
+            target.rename(broken)
+        except OSError as exc:
+            raise PluginError(
+                f"{target} 是上次下载的残留且无法移开（{exc}）；请手动删除后重试。") from exc
     argv = ["clone", "--depth", "1"]
     if ref:
         argv += ["--branch", ref]

@@ -151,11 +151,15 @@ def is_admin() -> bool:
 # ------------------------------------------------- 安装位置（可配置 + 持久化）
 # 结构必要条件：一个目录同时有这两样，才有可能是 DSH 检出。
 CHECKOUT_MARKERS = ("package.json", "pnpm-workspace.yaml")
-# 身份条件（任意一条成立才算 DSH）：官方根包名 / 官方包名前缀 / 官方分组目录。
+# 身份条件（任意一条成立才算 DSH）：官方根包名 / 官方包名前缀 / 官方子包名。
 # 只看结构会把**任意 pnpm 单仓**误判成 DSH，所以必须再认身份。
 DSH_ROOT_PACKAGE = "@deepseek-ai/dsh-root"
 DSH_PACKAGE_PREFIX = "@deepseek-ai/dsh"
-DSH_GROUP_DIRS = ("core", "api")
+# 自动检测的扫描预算：单次探测的总时间上限、每个盘根最多看多少个子目录。
+# 预算用完就停（宁可漏认也不能卡住界面）；结果整体缓存，正常只跑一次。
+DETECT_BUDGET_S = 3.0
+SHALLOW_LIMIT = 400
+DRIVE_FIXED = 3          # GetDriveTypeW 的 DRIVE_FIXED
 # 常见安装目录名（含下划线写法，用户的安装常叫 deepseek_harness）。
 INSTALL_DIR_NAMES = ("deepseek-harness", "deepseek_harness", "dsh-harness",
                      "dsh_harness", "DeepseekHarness")
@@ -198,9 +202,8 @@ def _roomy_other_drives(min_free_gb: float = 20.0) -> list[Path]:
     """非系统盘中可用空间充足者的候选安装位（用于系统盘吃紧时回退）。"""
     system = Path(os.environ.get("SystemDrive", "C:") + "\\")
     out: list[Path] = []
-    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
-        root = Path(f"{letter}:\\")
-        if root == system or not root.exists():
+    for root in _drive_roots():
+        if root == system:
             continue
         if free_gb(root) >= min_free_gb:
             out.append(root / "DSH" / SOURCE_DIR_NAME)
@@ -235,8 +238,8 @@ def checkout_identity(path: Path) -> str:
     结构（`package.json` + `pnpm-workspace.yaml`）只是必要条件——任意 pnpm 单仓都满足，
     所以还要认身份，任意一条成立即可：
       ① 根包名 = `@deepseek-ai/dsh-root`（官方根包名，最硬）
-      ② 根包名以 `@deepseek-ai/dsh` 开头（rescore/改名后仍认）
-      ③ 同时存在 `packages/core` 与 `packages/api`（官方分组布局，不依赖包名）
+      ② 根包名 = `@deepseek-ai/dsh` 或以 `@deepseek-ai/dsh-` 开头（官方改名后仍认）
+      ③ `packages/core/` 下存在 `@deepseek-ai/dsh-*` 子包（不依赖**根**包名）
     """
     try:
         if not all((path / m).is_file() for m in CHECKOUT_MARKERS):
@@ -246,10 +249,35 @@ def checkout_identity(path: Path) -> str:
     name = _pkg_name(path / "package.json")
     if name == DSH_ROOT_PACKAGE:
         return f"根包名 {name}"
-    if name.startswith(DSH_PACKAGE_PREFIX):
+    if name == DSH_PACKAGE_PREFIX or name.startswith(DSH_PACKAGE_PREFIX + "-"):
         return f"根包名 {name}"
-    if all((path / "packages" / g).is_dir() for g in DSH_GROUP_DIRS):
-        return "目录布局 packages/" + "+".join(DSH_GROUP_DIRS)
+    sub = _dsh_subpackage(path)
+    if sub:
+        return f"子包 {sub}"
+    return ""
+
+
+def _dsh_subpackage(path: Path, group: str = "core", limit: int = 40) -> str:
+    """在 `packages/<group>/` 下找一个 `@deepseek-ai/dsh-*` 子包，返回其包名。
+
+    不依赖根包名，但也不是「看目录名」——`packages/core` 是极常见命名，普通单仓
+    也有，所以必须真的读到官方包名才算数。
+    """
+    try:
+        with os.scandir(path / "packages" / group) as entries:
+            for index, entry in enumerate(entries):
+                if index >= limit:
+                    break
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                sub = _pkg_name(Path(entry.path) / "package.json")
+                if sub.startswith(DSH_PACKAGE_PREFIX + "-"):
+                    return sub
+    except OSError:
+        return ""
     return ""
 
 
@@ -258,19 +286,43 @@ def is_checkout(path: Path) -> bool:
     return bool(checkout_identity(path))
 
 
-def _drive_roots() -> list[Path]:
+def _drive_roots(*, fixed_only: bool = True) -> list[Path]:
+    """有盘符的根目录；默认只要**固定盘**（跳过可移动/网络/CD，避免扫盘卡死）。"""
     out: list[Path] = []
     for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
         root = Path(f"{letter}:\\")
         try:
-            if root.exists():
-                out.append(root)
+            if not root.exists():
+                continue
+            if fixed_only and _drive_type(root) not in (0, DRIVE_FIXED):
+                continue
+            out.append(root)
         except OSError:
             continue
     return out
 
 
-def _shallow_dirs(root: Path, limit: int = 60) -> list[Path]:
+def _drive_type(root: Path) -> int:
+    """盘类型（GetDriveTypeW）；取不到时返回 0 = 未知（按固定盘处理）。"""
+    try:
+        import ctypes
+        return int(ctypes.windll.kernel32.GetDriveTypeW(str(root)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _nonempty_dir(path: Path) -> bool:
+    """目录存在且非空；读不了也算非空（避免把读不到的目录当成空的去覆盖）。"""
+    try:
+        if not path.is_dir():
+            return False
+        with os.scandir(path) as entries:
+            return next(entries, None) is not None
+    except OSError:
+        return True
+
+
+def _shallow_dirs(root: Path, limit: int = SHALLOW_LIMIT) -> list[Path]:
     """一层子目录（跳系统目录、限量）——只用于有限探测，不遍历整盘。"""
     skip = {"$recycle.bin", "system volume information", "windows", "program files",
             "program files (x86)", "programdata", "recovery", "node_modules", ".git"}
@@ -305,6 +357,8 @@ def detect_installed_dir(*, refresh: bool = False) -> Path | None:
 
 
 def _detect_uncached() -> Path | None:
+    """便宜且高命中的候选先查，费时的逐盘浅扫放最后（受 DETECT_BUDGET_S 限制）。"""
+    deadline = time.monotonic() + DETECT_BUDGET_S
     here = HERE.resolve()
     for up in (here.parent, here.parent.parent, here.parent.parent.parent):
         if is_checkout(up):
@@ -313,12 +367,18 @@ def _detect_uncached() -> Path | None:
         if is_checkout(INSTALL_BASE / name):
             return INSTALL_BASE / name
     for drive in _drive_roots():
+        if time.monotonic() > deadline:
+            break
         for name in INSTALL_DIR_NAMES:
             if is_checkout(drive / name):
                 return drive / name
         if is_checkout(drive / "DSH" / SOURCE_DIR_NAME):
             return drive / "DSH" / SOURCE_DIR_NAME
         for sub in _shallow_dirs(drive):
+            if time.monotonic() > deadline:
+                break
+            if is_checkout(sub):        # 目录名任意（如 E:\Deepseek\deepseek_harness）
+                return sub
             for name in INSTALL_DIR_NAMES:
                 if is_checkout(sub / name):
                     return sub / name
@@ -595,10 +655,17 @@ class Engine:
 
     def prepare_source(self) -> Path:
         project = project_dir()
-        pkg = project / "package.json"
-        if pkg.exists():
-            self.log(f"④ 源码已存在：{project}（复用）")
+        if is_checkout(project):
+            self.log(f"④ 已检测到现有 DSH：{project}（复用，不重新下载）")
             return project
+        # 有 package.json 却不是 DSH 检出 = 用户自己的项目。绝不能在这里跑
+        # pnpm install/build（会改动/污染无关项目），必须让用户换目录。
+        if (project / "package.json").exists():
+            raise InstallError(
+                f"{project}\n"
+                "这个目录里有 package.json，但它不是一个 DSH 检出。\n"
+                "为避免在无关项目里执行 pnpm 安装/构建，安装已中止。\n"
+                "请把「安装位置」换成空目录，或指向已装好的 DeepSeek Harness 目录。")
         self.log(f"④ 准备项目源码 → {project}")
         offline = self.use_offline(
             SOURCE_ARCHIVE.exists() or STORE_DIR.exists(),
@@ -610,6 +677,10 @@ class Engine:
             if proc.returncode != 0:
                 raise InstallError(f"源码解压失败：\n{decode_proc(proc)}")
         else:
+            if _nonempty_dir(project):
+                raise InstallError(
+                    f"{project} 不是空目录，git clone 无法写入。\n"
+                    "请换一个空目录，或指向已装好的 DeepSeek Harness 目录。")
             git = find_git()
             if git is None:
                 raise InstallError(
@@ -621,8 +692,9 @@ class Engine:
             proc = run([git, "clone", "--depth", "1", HARNESS_GIT_URL, str(project)])
             if proc.returncode != 0:
                 raise InstallError(f"git clone 失败：\n{decode_proc(proc)}")
-        if not (project / "package.json").exists():
-            raise InstallError("源码就绪但缺少 package.json，安装中止")
+        if not is_checkout(project):
+            raise InstallError("源码就绪但不是 DSH 检出（缺 package.json/"
+                               "pnpm-workspace.yaml），安装中止")
         self.log(f"  源码就绪：{project}")
         return project
 
@@ -947,15 +1019,25 @@ class App(tk.Tk):
         raw = self.dir_var.get().strip()
         return Path(os.path.expandvars(raw)).expanduser() if raw else default_project_dir()
 
+    def _effective_dir(self) -> Path:
+        """生效的安装位：输入框有值就用它，空则交回正常优先级（配置/检测/默认）。"""
+        raw = self.dir_var.get().strip()
+        return Path(os.path.expandvars(raw)).expanduser() if raw else project_dir()
+
     def _on_dir_changed(self, *_args) -> None:
-        """输入框一动就立即生效：之后的「运行/自检/插件」都用这个目录。"""
-        set_active_dir(self._current_dir())
+        """输入框一动就立即生效：之后的「运行/自检/插件」都用这个目录。
+
+        清空输入框不等于「改用方案 A」——那会在用户重打路径的间隙把安装位
+        临时指到一个不存在的目录，所以空值时交回自动优先级。
+        """
+        set_active_dir(self._current_dir() if self.dir_var.get().strip() else None)
         self._dir_hint()
 
     def _on_dir_committed(self, _event=None) -> None:
-        """失焦/回车 = 用户确认了这个位置，顺手记进配置。"""
+        """失焦/回车 = 用户确认了这个位置，顺手记进配置（空值不动配置）。"""
         self._on_dir_changed()
-        set_project_dir(self._current_dir())
+        if self.dir_var.get().strip():
+            set_project_dir(self._current_dir())
 
     @staticmethod
     def _normalize_picked(chosen: Path) -> Path:
@@ -970,7 +1052,7 @@ class App(tk.Tk):
         return chosen
 
     def _on_pick_dir(self) -> None:
-        base = self._current_dir()
+        base = self._effective_dir()
         picked = filedialog.askdirectory(
             title="选择 DSH 安装位置（已装好的目录会被自动识别）", parent=self,
             initialdir=str(base if base.exists() else base.parent))
@@ -987,7 +1069,7 @@ class App(tk.Tk):
 
     def _dir_hint(self, _event=None) -> None:
         """即时反馈：红=不能装，橙=可装有风险，绿=已装好/可用（最多 2 条提示）。"""
-        target = self._current_dir()
+        target = self._effective_dir()
         errors, warns = check_install_dir(target)
         why = checkout_identity(target)
         if errors:
@@ -1353,6 +1435,15 @@ class App(tk.Tk):
             return
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
+    def _plugin_sources(self, home: Path, project: Path | None):
+        """插件来源集合：刷新与保存**必须共用同一份**，否则列表里有的插件保存时说找不到。
+
+        开发态（DSH_ASSISTANT_DEV=1）额外把项目 plugins/ 算作来源。
+        """
+        dev = os.environ.get("DSH_ASSISTANT_DEV") == "1"
+        return pstore.discover_sources(project if dev else None, ASSETS,
+                                       pstore.plugin_cache_dir(home))
+
     def _refresh_worker(self) -> None:
         try:
             env = self._plugin_env()
@@ -1360,11 +1451,7 @@ class App(tk.Tk):
                 self.after(0, lambda: self.plugin_hint_lbl.configure(text="环境未就绪"))
                 return
             home, project = env
-            # 独立化：插件默认只来自「内置清单（各自独立仓库）+ 离线资产」；
-            # 只有显式开发态才额外扫描项目 plugins/。
-            dev = os.environ.get("DSH_ASSISTANT_DEV") == "1"
-            cache = pstore.plugin_cache_dir(home)
-            sources = pstore.discover_sources(project if dev else None, ASSETS, cache)
+            sources = self._plugin_sources(home, project)
             patch_text = ""
             patch = pstore.web_patch(home)
             if patch.exists():
@@ -1712,7 +1799,7 @@ class App(tk.Tk):
             self._status(f"已下载 {slug}（可点「安装」）")
         except Exception as exc:  # noqa: BLE001
             self._plog(f"[插件] ✗ 下载 {slug} 失败：{exc}")
-            self._status("下载失败 ✗（详情见日志）")
+            self._status("下载失败 ✗（详情见日志）", "#b00000")
         finally:
             self.after(0, lambda: self._set_plugin_busy(False))
             self.after(0, self._refresh_plugins)
@@ -1763,8 +1850,7 @@ class App(tk.Tk):
             had_uninstall = any(a == "uninstall" for _, a in pending)
             if had_uninstall and was_running:
                 self._stop_web_internal(quiet=True)
-            sources = {s.slug: s for s in pstore.discover_sources(
-                None, ASSETS, pstore.plugin_cache_dir(home))}
+            sources = {s.slug: s for s in self._plugin_sources(home, project)}
             for slug, act in pending:
                 try:
                     if act == "install":
