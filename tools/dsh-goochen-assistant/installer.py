@@ -16,6 +16,7 @@ exe 用 PyInstaller（未来阶段）。当前直接用解释器运行。
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -48,7 +49,10 @@ PNPM_TGZ_ASSET = ASSETS / "pnpm.tgz"
 SOURCE_ARCHIVE = ASSETS / "source.tar.gz"          # 可选：离线源码包
 STORE_DIR = ASSETS / "pnpm-store"                  # 可选：离线依赖缓存
 INSTALL_BASE = Path(os.environ.get("USERPROFILE", str(Path.home())))
-PROJECT_DIR = INSTALL_BASE / SOURCE_DIR_NAME
+DEFAULT_PROJECT_DIR = INSTALL_BASE / SOURCE_DIR_NAME     # 方案 A：默认安装位
+MIN_FREE_GB = 8.0                                        # 安装所需最小可用空间
+CONFIG_DIR = INSTALL_BASE / ".dsh-assistant"             # 用户选择持久化
+CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = HERE / "installer.log"
 
 ALL_STEPS = ("detect", "node", "pnpm", "source", "deps", "build", "start")
@@ -142,6 +146,115 @@ def is_admin() -> bool:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:  # noqa: BLE001
         return False
+
+
+# ------------------------------------------------- 安装位置（可配置 + 持久化）
+def load_config() -> dict:
+    """读取小助手配置；文件缺失或损坏时返回空配置。"""
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(updates: dict) -> None:
+    """合并写入配置（只覆盖传入的键）。"""
+    cfg = load_config()
+    cfg.update(updates)
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
+    except OSError as exc:
+        log_line(f"[配置] 保存失败（本次运行仍生效）：{exc}")
+
+
+def free_gb(path: Path) -> float:
+    """所在磁盘可用 GB；查询失败返回 -1。"""
+    try:
+        return shutil.disk_usage(path).free / (1024 ** 3)
+    except OSError:
+        return -1.0
+
+
+def _roomy_other_drives(min_free_gb: float = 20.0) -> list[Path]:
+    """非系统盘中可用空间充足者的候选安装位（用于系统盘吃紧时回退）。"""
+    system = Path(os.environ.get("SystemDrive", "C:") + "\\")
+    out: list[Path] = []
+    for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+        root = Path(f"{letter}:\\")
+        if root == system or not root.exists():
+            continue
+        if free_gb(root) >= min_free_gb:
+            out.append(root / "DSH" / SOURCE_DIR_NAME)
+    return out
+
+
+def default_project_dir() -> Path:
+    """默认安装位（方案 A：%USERPROFILE%\\deepseek-harness）。
+
+    系统盘可用空间低于 MIN_FREE_GB 且存在其它空间充足的盘时，回退到
+    <盘>:\\DSH\\deepseek-harness；否则始终用方案 A。
+    """
+    home_free = free_gb(INSTALL_BASE)
+    if home_free < 0 or home_free >= MIN_FREE_GB:
+        return DEFAULT_PROJECT_DIR
+    others = _roomy_other_drives()
+    return others[0] if others else DEFAULT_PROJECT_DIR
+
+
+def project_dir() -> Path:
+    """实际安装位：用户配置优先，其次方案 A 默认（含空间回退）。"""
+    raw = str(load_config().get("installDir", "")).strip()
+    if raw:
+        return Path(os.path.expandvars(raw)).expanduser()
+    return default_project_dir()
+
+
+def set_project_dir(path: Path) -> None:
+    """记住用户选定的安装位（写入小助手自己的配置，不动 DSH 配置）。"""
+    save_config({"installDir": str(path)})
+
+
+def check_install_dir(path: Path) -> tuple[list[str], list[str]]:
+    """校验安装位，返回 (errors, warnings)：errors 阻断，warnings 提示但可继续。"""
+    errors: list[str] = []
+    warns: list[str] = []
+    if not path.is_absolute():
+        return ["必须是绝对路径（如 D:\\DSH\\deepseek-harness）"], warns
+    text = str(path)
+    low = text.lower().rstrip("\\")
+    if low.endswith(":\\windows") or "\\windows\\" in low:
+        errors.append("不能装在 Windows 系统目录内")
+    if "program files" in low:
+        errors.append("不能装在 Program Files（需要管理员权限，且构建会失败）")
+    if path.exists() and not path.is_dir():
+        errors.append("该路径已被同名文件占用")
+    probe = path if path.exists() else (path.parent if path.parent.exists() else None)
+    if probe is not None:
+        if not os.access(probe, os.W_OK):
+            errors.append(f"没有写入权限：{probe}")
+        free = free_gb(probe)
+        if 0 <= free < MIN_FREE_GB:
+            warns.append(f"所在磁盘仅剩 {free:.1f} GB（建议 ≥ {MIN_FREE_GB:.0f} GB）")
+    if len(text) > 120:
+        warns.append(f"路径偏长（{len(text)} 字符），node_modules 深层可能触及 Windows 260 上限")
+    if " " in text:
+        warns.append("路径含空格，个别工具链可能出问题")
+    if any(ord(ch) > 127 for ch in text):
+        warns.append("路径含中文等非 ASCII 字符，个别工具链可能出问题")
+    if "onedrive" in low:
+        warns.append("路径在 OneDrive 同步目录内，构建会产生大量同步流量")
+    return errors, warns
+
+
+def find_git() -> str | None:
+    """git 可执行文件；clone 插件/源码都依赖它。"""
+    try:
+        return shutil.which("git")
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------- engine
@@ -336,12 +449,12 @@ class Engine:
         return find_pnpm()
 
     def prepare_source(self) -> Path:
-        project = PROJECT_DIR
+        project = project_dir()
         pkg = project / "package.json"
         if pkg.exists():
             self.log(f"④ 源码已存在：{project}（复用）")
             return project
-        self.log("④ 准备项目源码 …")
+        self.log(f"④ 准备项目源码 → {project}")
         offline = self.use_offline(
             SOURCE_ARCHIVE.exists() or STORE_DIR.exists(),
             "源码包/依赖缓存")
@@ -352,9 +465,15 @@ class Engine:
             if proc.returncode != 0:
                 raise InstallError(f"源码解压失败：\n{decode_proc(proc)}")
         else:
-            self.log("  git clone 官方源码（取决于网络）…")
+            git = find_git()
+            if git is None:
+                raise InstallError(
+                    "未检测到 git，无法克隆官方源码。\n"
+                    "请先安装 Git for Windows（https://git-scm.com/download/win），"
+                    "或改用『离线安装』（需随包 source.tar.gz）。")
+            self.log(f"  git clone 官方源码（取决于网络）…（git: {git}）")
             project.parent.mkdir(parents=True, exist_ok=True)
-            proc = run(["git", "clone", "--depth", "1", HARNESS_GIT_URL, str(project)])
+            proc = run([git, "clone", "--depth", "1", HARNESS_GIT_URL, str(project)])
             if proc.returncode != 0:
                 raise InstallError(f"git clone 失败：\n{decode_proc(proc)}")
         if not (project / "package.json").exists():
@@ -484,6 +603,22 @@ class App(tk.Tk):
                         variable=self.mode, value="online").pack(anchor="w")
         ttk.Checkbutton(box, text="在线安装时使用国内镜像 npmmirror 加速", variable=self.mirror
                         ).pack(anchor="w")
+
+        # 安装位置（可配置；默认方案 A：%USERPROFILE%\deepseek-harness）
+        loc = ttk.LabelFrame(tab_run, text="安装位置（产品会独立克隆到这里）", padding=8)
+        loc.pack(fill="x", pady=4)
+        lrow = ttk.Frame(loc)
+        lrow.pack(fill="x")
+        self.dir_var = tk.StringVar(value=str(project_dir()))
+        dir_ent = ttk.Entry(lrow, textvariable=self.dir_var)
+        dir_ent.pack(side="left", fill="x", expand=True)
+        dir_ent.bind("<FocusOut>", self._dir_hint)
+        dir_ent.bind("<Return>", self._dir_hint)
+        ttk.Button(lrow, text="浏览…", command=self._on_pick_dir).pack(side="left", padx=(6, 0))
+        ttk.Button(lrow, text="恢复默认", command=self._on_reset_dir).pack(side="left", padx=(6, 0))
+        self.dir_hint = ttk.Label(loc, text="", foreground="#666")
+        self.dir_hint.pack(anchor="w", pady=(4, 0))
+        self._dir_hint()
 
         # 按钮
         btns = ttk.Frame(tab_run)
@@ -641,10 +776,65 @@ class App(tk.Tk):
     def on_full(self) -> None:
         if self.busy:
             return
+        target = self._current_dir()
+        errors, warns = check_install_dir(target)
+        if errors:
+            messagebox.showerror(
+                "安装位置不可用",
+                "当前安装位置有问题，请先修改：\n\n" +
+                "\n".join(f"· {e}" for e in errors), parent=self)
+            return
+        if warns and not messagebox.askyesno(
+                "安装位置提醒",
+                f"安装位置：{target}\n\n" +
+                "\n".join(f"· {w}" for w in warns) +
+                "\n\n仍要继续吗？", parent=self):
+            return
+        set_project_dir(target)
+        self._append(f"[安装位置] {target}")
         self._set_busy(True)
         eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
                      log=self._append)
         threading.Thread(target=self._job, args=(eng,), daemon=True).start()
+
+    def _current_dir(self) -> Path:
+        raw = self.dir_var.get().strip()
+        return Path(os.path.expandvars(raw)).expanduser() if raw else default_project_dir()
+
+    def _on_pick_dir(self) -> None:
+        base = self._current_dir()
+        picked = filedialog.askdirectory(
+            title="选择安装位置（产品将装在其下的 deepseek-harness 里）", parent=self,
+            initialdir=str(base.parent) if base.parent.exists() else None)
+        if not picked:
+            return
+        chosen = Path(picked)
+        # 选中的若是父目录，自动补产品目录名，避免源码摊在盘根/桌面
+        if chosen.name.lower() != SOURCE_DIR_NAME:
+            chosen = chosen / SOURCE_DIR_NAME
+        self.dir_var.set(str(chosen))
+        self._dir_hint()
+
+    def _on_reset_dir(self) -> None:
+        self.dir_var.set(str(default_project_dir()))
+        self._dir_hint()
+
+    def _dir_hint(self, _event=None) -> None:
+        """即时反馈安装位置可用性：错误红、警告橙、正常绿（最多显示 2 条提示）。"""
+        target = self._current_dir()
+        errors, warns = check_install_dir(target)
+        if errors:
+            text, color = "✗ " + errors[0], "#b00000"
+        elif warns:
+            shown = "；".join(warns[:2]) + ("…" if len(warns) > 2 else "")
+            text, color = "⚠ " + shown, "#a05a00"
+        else:
+            probe = target if target.exists() else (
+                target.parent if target.parent.exists() else INSTALL_BASE)
+            free = free_gb(probe)
+            text = (f"✓ 可用（所在磁盘剩余 {free:.0f} GB）" if free >= 0 else "✓ 可用")
+            color = "#1a6b1a"
+        self.dir_hint.configure(text=text, foreground=color)
 
     def _job(self, eng: Engine) -> None:
         try:
@@ -665,11 +855,19 @@ class App(tk.Tk):
             self._set_busy(False)
 
     def _resolve_web_project(self) -> Path | None:
-        """可用项目目录：优先用户目录安装位，其次脚本仓库（本机验证用）。"""
-        cands = [PROJECT_DIR,
-                 HERE.parent.parent,          # tools/dsh-offline-installer → 仓库根
-                 HERE.parent / "deepseek-harness"]
+        """可用项目目录：用户配置/默认安装位优先；仓库根仅在显式开发态兜底。
+
+        小助手默认与所在仓库解耦（产品由官方链接独立克隆），因此仓库根不再
+        作为常规候选；本机开发时设 DSH_ASSISTANT_DEV=1 可恢复该兜底。
+        """
+        cands = [project_dir(), DEFAULT_PROJECT_DIR]
+        if os.environ.get("DSH_ASSISTANT_DEV") == "1":
+            cands.append(HERE.parent.parent)      # 开发态：tools/<本工具> → dsh 检出根
+        seen: set[Path] = set()
         for cand in cands:
+            if cand in seen:
+                continue
+            seen.add(cand)
             if (cand / "package.json").exists() and (cand / "pnpm-workspace.yaml").exists():
                 return cand
         return None
@@ -688,7 +886,7 @@ class App(tk.Tk):
         if project is None:
             messagebox.showerror("未找到项目",
                                  f"找不到已安装的 deepseek-harness。请先执行「一键完整安装」。\n"
-                                 f"已检查：{PROJECT_DIR}")
+                                 f"已检查：{project_dir()}")
             return False
         if shutil.which("pnpm") is None:
             messagebox.showerror("缺少 pnpm",
@@ -788,7 +986,7 @@ class App(tk.Tk):
         project = self._resolve_web_project()
         if project is None:
             messagebox.showerror("未找到项目",
-                                 f"找不到项目源码目录；已检查 {PROJECT_DIR}")
+                                 f"找不到项目源码目录；已检查 {project_dir()}")
             return
         self.clipboard_clear()
         self.clipboard_append(str(project))
@@ -993,7 +1191,11 @@ class App(tk.Tk):
                 self.after(0, lambda: self.plugin_hint_lbl.configure(text="环境未就绪"))
                 return
             home, project = env
-            sources = pstore.discover_sources(project, ASSETS)
+            # 独立化：插件默认只来自「内置清单（各自独立仓库）+ 离线资产」；
+            # 只有显式开发态才额外扫描项目 plugins/。
+            dev = os.environ.get("DSH_ASSISTANT_DEV") == "1"
+            cache = pstore.plugin_cache_dir(home)
+            sources = pstore.discover_sources(project if dev else None, ASSETS, cache)
             patch_text = ""
             patch = pstore.web_patch(home)
             if patch.exists():
@@ -1005,22 +1207,26 @@ class App(tk.Tk):
                 dump = pstore.parse_dump("")
             cards = pstore.status_view(home, sources, dump)
             entries = pstore.market_entries(home, project, ASSETS)
-            self.after(0, lambda: self._apply_plugins(cards, entries, home, project))
+            catalog = pstore.catalog_entries(home)
+            self.after(0, lambda: self._apply_plugins(cards, entries, home, project,
+                                                      catalog))
         except Exception as exc:  # noqa: BLE001
             self._append(f"[插件] 刷新失败：{exc}")
 
-    def _apply_plugins(self, cards, entries, home: Path, project: Path) -> None:
+    def _apply_plugins(self, cards, entries, home: Path, project: Path,
+                       catalog=()) -> None:
         self.plugin_cards = cards
         self.plugin_home_dir, self.plugin_project = home, project
-        items = self._merge_plugins(cards, entries)
+        self.plugin_catalog = {c["slug"]: c for c in catalog}
+        items = self._merge_plugins(cards, entries, catalog)
         self.plugin_items = items
         for child in self.plugin_rows.winfo_children():
             child.destroy()
         self.plugin_btns.clear()
         if not items:
             ttk.Label(self.plugin_rows,
-                      text="（没有插件：可在项目 plugins/ 或 assets/plugins/ 放置，"
-                           "或「从文件夹导入」「链接下载」添加）",
+                      text="（没有插件：可点未下载插件的「下载」，"
+                           "或用「从文件夹导入」「链接下载」添加）",
                       foreground="#888").pack(anchor="w")
             self.plugin_hint_lbl.configure(text="无插件")
         else:
@@ -1200,14 +1406,25 @@ class App(tk.Tk):
             env["PATH"] = str(Path(pnpm).parent) + os.pathsep + env.get("PATH", "")
         return env
 
-    def _merge_plugins(self, cards, entries) -> list[dict]:
+    def _merge_plugins(self, cards, entries, catalog=()) -> list[dict]:
         items: list[dict] = []
+        known: set[str] = set()
         for card in cards:
+            known.add(card.slug)
             items.append({
                 "kind": "managed", "name": card.slug, "version": "",
                 "state": card.state, "desc": (card.description or "")[:40],
                 "warning": card.validation_errors[0][:24] if card.validation_errors else "",
                 "value": card.slug, "spec": card.slug,
+            })
+        # 内置清单里尚未下载（未克隆）的插件
+        for c in catalog:
+            if c["slug"] in known:
+                continue
+            items.append({
+                "kind": "catalog", "name": c["slug"], "version": "",
+                "state": "nodl", "desc": (c["description"] or "")[:24],
+                "warning": "", "value": c["slug"], "spec": c["repo"],
             })
         for e in entries:
             st = "installed" if e.installed else ("downloaded" if e.downloaded else "nodl")
@@ -1247,6 +1464,8 @@ class App(tk.Tk):
         s = it["state"]
         if it["kind"] == "managed":
             return self.STATE_CN.get(s, s), self.STATE_COLOR.get(s, "#000")
+        if it["kind"] == "catalog":
+            return {"nodl": ("未下载", "#999")}.get(s, (s, "#000"))
         return {"installed": ("已安装", "#2a6b2a"),
                 "downloaded": ("已下载", "#1a6bb0"),
                 "nodl": ("可下载", "#999")}.get(s, (s, "#000"))
@@ -1254,6 +1473,8 @@ class App(tk.Tk):
     def _actions_for(self, it) -> list[tuple[str, str, str]]:
         if it["kind"] == "managed":
             return self._managed_actions(it)
+        if it["kind"] == "catalog":
+            return [("下载", "fetch", it["value"])]
         return self._bundle_actions(it)
 
     def _managed_actions(self, it) -> list[tuple[str, str, str]]:
@@ -1291,8 +1512,41 @@ class App(tk.Tk):
     def _act(self, kind: str, value: str, action: str) -> None:
         if kind == "managed":
             self._plugin_act(value, action)
+        elif kind == "catalog":
+            self._catalog_run(value, action)
         else:
             self._market_run(value, action)
+
+    def _catalog_run(self, slug: str, action: str) -> None:
+        """内置清单插件动作：下载 = 从该插件自己的独立仓库克隆到缓存。"""
+        if self.plugin_busy:
+            return
+        self._set_plugin_busy(True)
+        threading.Thread(target=self._catalog_worker, args=(slug, action),
+                         daemon=True).start()
+
+    def _catalog_worker(self, slug: str, action: str) -> None:
+        try:
+            env = self._plugin_env()
+            if env is None:
+                return
+            home, _project = env
+            entry = pstore.catalog_entry(home, slug)
+            if entry is None:
+                raise pstore.PluginError(f"{slug} 不在内置插件清单里")
+            if find_git() is None:
+                raise pstore.PluginError(
+                    "未检测到 git，无法从独立仓库下载插件。\n"
+                    "请先安装 Git for Windows（https://git-scm.com/download/win）。")
+            target = pstore.fetch_plugin(entry, pstore.plugin_cache_dir(home))
+            self._plog(f"[插件] ✓ 已下载 {slug}：{target}")
+            self._status(f"已下载 {slug}（可点「安装」）")
+        except Exception as exc:  # noqa: BLE001
+            self._plog(f"[插件] ✗ 下载 {slug} 失败：{exc}")
+            self._status("下载失败 ✗（详情见日志）")
+        finally:
+            self.after(0, lambda: self._set_plugin_busy(False))
+            self.after(0, self._refresh_plugins)
 
     def _plugin_act(self, slug: str, action: str) -> None:
         if self.plugin_busy or action == "none":
@@ -1340,7 +1594,8 @@ class App(tk.Tk):
             had_uninstall = any(a == "uninstall" for _, a in pending)
             if had_uninstall and was_running:
                 self._stop_web_internal(quiet=True)
-            sources = {s.slug: s for s in pstore.discover_sources(project, ASSETS)}
+            sources = {s.slug: s for s in pstore.discover_sources(
+                None, ASSETS, pstore.plugin_cache_dir(home))}
             for slug, act in pending:
                 try:
                     if act == "install":
@@ -1437,10 +1692,6 @@ class App(tk.Tk):
         if self.plugin_busy:
             return
         home = plugin_home()
-        project = self._resolve_web_project()
-        if project is None:
-            messagebox.showerror("未找到项目", "找不到项目源码目录，无法导入。")
-            return
         picked = filedialog.askdirectory(title="选择插件目录（含 package.json）")
         if not picked:
             return
@@ -1453,7 +1704,8 @@ class App(tk.Tk):
         if not v.ok:
             messagebox.showerror("校验失败", "\n".join(v.errors))
             return
-        dst = project / "plugins" / slug
+        # 导入到小助手自己的插件来源目录（目录名 = slug），不写进 dsh 检出
+        dst = pstore.plugin_cache_dir(home) / slug
         dst.parent.mkdir(parents=True, exist_ok=True)
         if dst.exists():
             messagebox.showerror("已存在", f"{dst} 已存在，请先处理。")
@@ -1731,11 +1983,14 @@ def selfcheck() -> int:
     pnpm = find_pnpm()
     log_line(f"pnpm       : {pnpm or '未检测到'}")
 
+    git = find_git()
+    log_line(f"git        : {git or '未检测到（在线安装/下载插件需要它）'}")
+
     log_line("离线数据（assets/）：")
     for name, path, ok in Engine.describe_assets():
         log_line(f"  {'✓' if ok else '—'} {name:<12} {path}")
 
-    target = PROJECT_DIR
+    target = project_dir()
     log_line(f"项目目录   : {target}  "
              f"{'已存在' if target.exists() else '尚未安装'}")
     log_line("=== 自检结束 ===")

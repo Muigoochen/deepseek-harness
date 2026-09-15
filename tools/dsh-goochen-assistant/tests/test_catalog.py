@@ -1,0 +1,272 @@
+# -*- coding: utf-8 -*-
+"""插件独立仓库清单 + 安装位置（可配置）单元测试。
+
+标准库 unittest，不联网、不碰真实用户目录：
+  - fetch_plugin / update_plugin 一律注入假的 run_git；
+  - 安装位置配置写入临时 CONFIG_PATH（不写真实 %USERPROFILE%\\.dsh-assistant）。
+
+运行（在 tools/dsh-goochen-assistant 下）：
+  python -m unittest discover -s tests -p "test_*.py"
+"""
+from __future__ import annotations
+
+import json
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import installer  # noqa: E402
+import plugin_store as ps  # noqa: E402
+
+
+def make_cache() -> Path:
+    return Path(tempfile.mkdtemp(prefix="dsh-cache-"))
+
+
+def write_plugin(root: Path, slug: str) -> Path:
+    """在 root/<slug> 造一个合法的 @dsh-user 插件包（仓库根即插件根）。"""
+    d = root / slug
+    (d / "lib").mkdir(parents=True, exist_ok=True)
+    (d / "lib" / "index.js").write_text("export const x = 1\n", encoding="utf-8")
+    (d / "package.json").write_text(json.dumps({
+        "name": f"@dsh-user/{slug}", "version": "0.0.1", "main": "./lib/index.js",
+    }), encoding="utf-8")
+    return d
+
+
+class FakeGit:
+    """记录调用的假 git：clone 时在目标目录生成插件包（或按需失败/不生成）。"""
+
+    def __init__(self, *, code: int = 0, create: bool = True):
+        self.code = code
+        self.create = create
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: list[str]):
+        self.calls.append(list(args))
+        if self.code == 0 and "clone" in args:
+            target = Path(args[-1])
+            if self.create:
+                write_plugin(target.parent, target.name)
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+        return self.code, "", ("boom" if self.code else "")
+
+    def subcommands(self) -> list[str]:
+        return [a for a in (c[0] if c[0] != "-C" else c[2] for c in self.calls)]
+
+
+class CatalogTest(unittest.TestCase):
+    def test_catalog_shape_is_sane(self):
+        """内置清单：slug 合法、仓库 URL 为 https、slug 不重复。"""
+        slugs = [item["slug"] for item in ps.PLUGIN_REPOS]
+        self.assertEqual(len(slugs), len(set(slugs)), "slug 重复")
+        for item in ps.PLUGIN_REPOS:
+            self.assertTrue(ps.is_valid_slug(item["slug"]), item["slug"])
+            self.assertTrue(item["repo"].startswith("https://"), item["repo"])
+
+    def test_catalog_entries_report_clone_state(self):
+        home = Path(tempfile.mkdtemp(prefix="dsh-home-"))
+        entries = ps.catalog_entries(home)
+        self.assertEqual(len(entries), len(ps.PLUGIN_REPOS))
+        self.assertTrue(all(not e["cloned"] for e in entries))
+        self.assertEqual(entries[0]["local"],
+                         ps.plugin_cache_dir(home) / entries[0]["slug"])
+        # 已克隆 → cloned=True
+        write_plugin(ps.plugin_cache_dir(home), entries[0]["slug"])
+        again = {e["slug"]: e for e in ps.catalog_entries(home)}
+        self.assertTrue(again[entries[0]["slug"]]["cloned"])
+        # 查找
+        self.assertIsNotNone(ps.catalog_entry(home, entries[0]["slug"]))
+        self.assertIsNone(ps.catalog_entry(home, "no-such-plugin"))
+
+    def test_fetch_clones_into_slug_named_dir(self):
+        cache = make_cache()
+        git = FakeGit()
+        target = ps.fetch_plugin(ps.PLUGIN_REPOS[0], cache, run_git=git)
+        # 目录名必须等于 slug（安装校验要求 name == @dsh-user/<目录名>）
+        self.assertEqual(target, cache / ps.PLUGIN_REPOS[0]["slug"])
+        self.assertTrue((target / "package.json").is_file())
+        self.assertEqual(git.calls[0][:3], ["clone", "--depth", "1"])
+
+    def test_fetch_honors_ref(self):
+        cache = make_cache()
+        git = FakeGit()
+        ps.fetch_plugin(dict(ps.PLUGIN_REPOS[1], ref="v1.2.0"), cache, run_git=git)
+        self.assertIn("--branch", git.calls[0])
+        self.assertIn("v1.2.0", git.calls[0])
+
+    def test_fetch_reuses_existing_clone_without_git(self):
+        cache = make_cache()
+        slug = ps.PLUGIN_REPOS[0]["slug"]
+        write_plugin(cache, slug)
+        git = FakeGit()
+        target = ps.fetch_plugin(ps.PLUGIN_REPOS[0], cache, run_git=git)
+        self.assertEqual(target, cache / slug)
+        self.assertEqual(git.calls, [], "已克隆时不应再调用 git")
+
+    def test_fetch_rejects_repo_without_root_package_json(self):
+        """仓库根不是插件包根 → 明确报错（否则装不上）。"""
+        cache = make_cache()
+        with self.assertRaises(ps.PluginError) as ctx:
+            ps.fetch_plugin(ps.PLUGIN_REPOS[0], cache,
+                            run_git=FakeGit(create=False))
+        self.assertIn("package.json", str(ctx.exception))
+
+    def test_fetch_reports_git_failure(self):
+        cache = make_cache()
+        with self.assertRaises(ps.PluginError) as ctx:
+            ps.fetch_plugin(ps.PLUGIN_REPOS[0], cache, run_git=FakeGit(code=128))
+        self.assertIn("克隆", str(ctx.exception))
+
+    def test_fetch_rejects_invalid_slug(self):
+        cache = make_cache()
+        with self.assertRaises(ps.PluginError):
+            ps.fetch_plugin({"slug": "Bad Slug", "repo": "https://x/y.git"},
+                            cache, run_git=FakeGit())
+
+    def test_update_falls_back_to_fetch_when_not_cloned(self):
+        cache = make_cache()
+        git = FakeGit()
+        target = ps.update_plugin(ps.PLUGIN_REPOS[0], cache, run_git=git)
+        self.assertTrue((target / "package.json").is_file())
+        self.assertIn("clone", git.calls[0])
+
+    def test_update_refreshes_existing_clone(self):
+        cache = make_cache()
+        slug = ps.PLUGIN_REPOS[0]["slug"]
+        write_plugin(cache, slug)
+        (cache / slug / ".git").mkdir()
+        git = FakeGit()
+        ps.update_plugin(ps.PLUGIN_REPOS[0], cache, run_git=git)
+        subs = [c[2] for c in git.calls if c[:1] == ["-C"]]
+        self.assertIn("fetch", subs)
+        self.assertIn("reset", subs)
+
+    def test_discover_sources_includes_cloned_catalog(self):
+        """克隆后的插件成为「来源」，目录名即 slug，origin=catalog。"""
+        cache = make_cache()
+        ps.fetch_plugin(ps.PLUGIN_REPOS[0], cache, run_git=FakeGit())
+        found = ps.discover_sources(None, None, cache)
+        slugs = [s.slug for s in found]
+        self.assertIn(ps.PLUGIN_REPOS[0]["slug"], slugs)
+        self.assertEqual(next(s for s in found
+                              if s.slug == ps.PLUGIN_REPOS[0]["slug"]).origin, "catalog")
+
+    def test_discover_sources_without_cache_ignores_project(self):
+        """不传 project_root 时不再扫描所在仓库的 plugins/（独立化）。"""
+        self.assertEqual(ps.discover_sources(None, None, None), [])
+
+    def test_cloned_catalog_plugin_installs_end_to_end(self):
+        """端到端：清单克隆 → 被当作来源发现 → 装进共享锚（独立仓库即可用）。"""
+        from test_plugin_store import DumpGateProbe  # 复用结构门探针（不跑真 dsh）
+        home = Path(tempfile.mkdtemp(prefix="dsh-home-"))
+        (home / "profiles" / "web").mkdir(parents=True)
+        slug = ps.PLUGIN_REPOS[0]["slug"]
+        cache = ps.plugin_cache_dir(home)
+        ps.fetch_plugin(ps.PLUGIN_REPOS[0], cache, run_git=FakeGit())
+
+        src = {s.slug: s for s in ps.discover_sources(None, None, cache)}[slug]
+        ps.install(home, src, run_dump=DumpGateProbe())
+
+        anchor = ps.anchor_dir(home, slug)
+        self.assertTrue((anchor / "package.json").is_file())
+        self.assertTrue((anchor / "lib" / "index.js").is_file())
+        self.assertIsNotNone(ps.ledger_load(home).row(slug))
+        self.assertIn(f"id: {slug}", ps.web_patch(home).read_text(encoding="utf-8"))
+
+
+class InstallDirTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-cfg-"))
+        self._old_dir, self._old_path = installer.CONFIG_DIR, installer.CONFIG_PATH
+        installer.CONFIG_DIR = self.tmp
+        installer.CONFIG_PATH = self.tmp / "config.json"
+
+    def tearDown(self):
+        installer.CONFIG_DIR, installer.CONFIG_PATH = self._old_dir, self._old_path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_default_is_plan_a(self):
+        """默认安装位 = %USERPROFILE%\\deepseek-harness（方案 A）。"""
+        self.assertEqual(installer.DEFAULT_PROJECT_DIR,
+                         installer.INSTALL_BASE / installer.SOURCE_DIR_NAME)
+        # 系统盘空间充足时应原样返回方案 A
+        if installer.free_gb(installer.INSTALL_BASE) >= installer.MIN_FREE_GB:
+            self.assertEqual(installer.default_project_dir(),
+                             installer.DEFAULT_PROJECT_DIR)
+
+    def test_project_dir_defaults_then_honors_config(self):
+        self.assertEqual(installer.project_dir(), installer.default_project_dir())
+        custom = self.tmp / "my" / "deepseek-harness"
+        installer.set_project_dir(custom)
+        self.assertEqual(installer.project_dir(), custom)
+        saved = json.loads(installer.CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(saved["installDir"], str(custom))
+
+    def test_check_install_dir_errors(self):
+        errs, _ = installer.check_install_dir(Path("deepseek-harness"))
+        self.assertTrue(errs, "相对路径应报错")
+        errs, _ = installer.check_install_dir(Path("C:/Program Files/deepseek-harness"))
+        self.assertTrue(any("Program Files" in e for e in errs))
+        errs, _ = installer.check_install_dir(Path("C:/Windows/deepseek-harness"))
+        self.assertTrue(any("Windows" in e for e in errs))
+
+    def test_check_install_dir_warns_but_allows(self):
+        for raw, needle in (("C:/my dir/deepseek-harness", "空格"),
+                            ("C:/用户目录/deepseek-harness", "非 ASCII"),
+                            ("C:/Users/x/OneDrive/deepseek-harness", "OneDrive")):
+            errs, warns = installer.check_install_dir(Path(raw))
+            self.assertEqual(errs, [], raw)
+            self.assertTrue(any(needle in w for w in warns), f"{raw} → {warns}")
+
+    def test_check_install_dir_accepts_temp_dir(self):
+        errs, warns = installer.check_install_dir(self.tmp / "deepseek-harness")
+        self.assertEqual(errs, [])
+        self.assertEqual(warns, [])
+
+
+class MergeTest(unittest.TestCase):
+    """GUI 行合并：清单里未下载的插件要出现在列表里（kind=catalog，动作=下载）。"""
+
+    class _Stub:
+        _plugin_rank = staticmethod(installer.App._plugin_rank)
+        STATE_CN = installer.App.STATE_CN
+        STATE_COLOR = installer.App.STATE_COLOR
+
+    def test_uncloned_catalog_rows_appear_as_nodl(self):
+        home = Path(tempfile.mkdtemp(prefix="dsh-home-"))
+        catalog = ps.catalog_entries(home)
+        items = installer.App._merge_plugins(self._Stub(), [], [], catalog)
+        self.assertEqual(len(items), len(ps.PLUGIN_REPOS))
+        self.assertTrue(all(i["kind"] == "catalog" for i in items))
+        self.assertTrue(all(i["state"] == "nodl" for i in items))
+        # 行上给出的是「下载」，且携带该插件自己的仓库地址
+        repos = {c["slug"]: c["repo"] for c in catalog}
+        for it in items:
+            self.assertEqual(installer.App._actions_for(self._Stub(), it),
+                             [("下载", "fetch", it["name"])])
+            self.assertEqual(it["spec"], repos[it["name"]])
+            self.assertEqual(installer.App._state_display(self._Stub(), it)[0], "未下载")
+
+    def test_cloned_catalog_entry_is_not_duplicated(self):
+        """已克隆（已被 managed 卡片表示）时不再重复出现 catalog 行。"""
+        home = Path(tempfile.mkdtemp(prefix="dsh-home-"))
+        catalog = ps.catalog_entries(home)
+        slug = catalog[0]["slug"]
+        card = SimpleNamespace(slug=slug, state="downloaded",
+                               description="d", validation_errors=())
+        items = installer.App._merge_plugins(self._Stub(), [card], [], catalog)
+        names = [i["name"] for i in items]
+        self.assertEqual(len(items), len(ps.PLUGIN_REPOS))
+        self.assertEqual(names.count(slug), 1)
+        self.assertEqual(next(i for i in items if i["name"] == slug)["kind"], "managed")
+
+
+if __name__ == "__main__":
+    unittest.main()

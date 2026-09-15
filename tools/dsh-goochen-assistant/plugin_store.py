@@ -180,6 +180,11 @@ def anchor_dir(home: Path, slug: str) -> Path:
     return anchor_root(home) / slug
 
 
+def plugin_cache_dir(home: Path) -> Path:
+    """插件源码缓存位：按清单克隆来的插件放这里，目录名 = slug（安装校验要求）。"""
+    return home / "plugins-src"
+
+
 def is_valid_slug(slug: str) -> bool:
     return bool(SLUG_RE.match(slug))
 
@@ -416,13 +421,99 @@ def _scan_base(base: Path, origin: str) -> list[PluginSource]:
     return out
 
 
-def discover_sources(project_root: Optional[Path], assets_dir: Optional[Path] = None) -> list[PluginSource]:
+def discover_sources(project_root: Optional[Path], assets_dir: Optional[Path] = None,
+                     cache_dir: Optional[Path] = None) -> list[PluginSource]:
     out: list[PluginSource] = []
     if project_root is not None:
         out += _scan_base(project_root / "plugins", "project")
     if assets_dir is not None:
         out += _scan_base(assets_dir / "plugins", "asset")
+    if cache_dir is not None:
+        out += _scan_base(cache_dir, "catalog")
     return out
+
+
+# ---------------------------------------------------------------- 插件仓库清单
+
+def catalog_entries(home: Path) -> list[dict]:
+    """内置清单 + 本地克隆状态（每个插件一个独立公开仓库）。"""
+    cache = plugin_cache_dir(home)
+    out: list[dict] = []
+    for item in PLUGIN_REPOS:
+        local = cache / str(item["slug"])
+        out.append({
+            "slug": str(item["slug"]),
+            "repo": str(item["repo"]),
+            "ref": str(item.get("ref") or ""),
+            "description": str(item.get("description") or ""),
+            "local": local,
+            "cloned": (local / "package.json").is_file(),
+        })
+    return out
+
+
+def catalog_entry(home: Path, slug: str) -> Optional[dict]:
+    for item in catalog_entries(home):
+        if item["slug"] == slug:
+            return item
+    return None
+
+
+def _git_runner(run_git: Optional[Callable[[list[str]], tuple[int, str, str]]]):
+    def git(args: list[str]) -> tuple[int, str, str]:
+        if run_git is not None:
+            return run_git(args)
+        try:
+            proc = subprocess.run(["git"] + args, capture_output=True, text=True)
+            return proc.returncode, proc.stdout, proc.stderr
+        except OSError as exc:
+            raise PluginError(f"无法运行 git（是否已安装 Git for Windows？）：{exc}") from exc
+    return git
+
+
+def fetch_plugin(source: dict, cache_dir: Path,
+                 run_git: Optional[Callable[[list[str]], tuple[int, str, str]]] = None) -> Path:
+    """按清单抓取插件源码：`git clone --depth 1 [--branch ref] <repo> <cache>/<slug>`。
+
+    目标目录名固定为 slug——安装校验要求 `name == @dsh-user/<目录名>`；已克隆则复用。
+    """
+    slug, repo = str(source["slug"]), str(source["repo"])
+    ref = str(source.get("ref") or "")
+    if not is_valid_slug(slug):
+        raise PluginError(f"清单里的 slug 非法：{slug!r}")
+    target = cache_dir / slug
+    if (target / "package.json").is_file():
+        return target
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    argv = ["clone", "--depth", "1"]
+    if ref:
+        argv += ["--branch", ref]
+    argv += [repo, str(target)]
+    code, out, err = _git_runner(run_git)(argv)
+    if code != 0:
+        raise PluginError(f"克隆 {slug} 失败（{repo}）：\n{_tail(out, err)}")
+    if not (target / "package.json").is_file():
+        raise PluginError(f"{slug} 的仓库根缺 package.json（仓库根必须就是插件包根）")
+    return target
+
+
+def update_plugin(source: dict, cache_dir: Path,
+                  run_git: Optional[Callable[[list[str]], tuple[int, str, str]]] = None) -> Path:
+    """把已克隆的插件更新到远端最新；尚未克隆时等价于首次抓取。"""
+    slug = str(source["slug"])
+    target = cache_dir / slug
+    if not (target / ".git").is_dir():
+        return fetch_plugin(source, cache_dir, run_git)
+    git = _git_runner(run_git)
+    ref = str(source.get("ref") or "")
+    code, out, err = git(["-C", str(target), "fetch", "--depth", "1", "origin"])
+    if code != 0:
+        raise PluginError(f"拉取 {slug} 更新失败：\n{_tail(out, err)}")
+    dest = f"origin/{ref}" if ref else "FETCH_HEAD"
+    code, out, err = git(["-C", str(target), "reset", "--hard", dest])
+    if code != 0:
+        raise PluginError(f"把 {slug} 切到远端最新失败：\n{_tail(out, err)}")
+    return target
 
 
 # ---------------------------------------------------------------- dump 解析
@@ -1003,6 +1094,30 @@ CURATED_BUNDLES = (
     {"name": "dsh-lsp-actions", "npm": "dsh-lsp-actions",
      "git": "https://github.com/PerryLink/dsh-lsp-actions.git",
      "description": "LSP 动作（打开文件、运行测试等）"},
+)
+
+# 内置插件仓库清单：每个插件一个**独立公开仓库**，小助手按此独立克隆，
+# 不依赖小助手所在的仓库。slug 必须等于仓库根 package.json 的 @dsh-user/<slug>。
+# ref 留空 = 默认分支。
+PLUGIN_REPOS = (
+    {"slug": "lsp-echo",
+     "repo": "https://github.com/Muigoochen/dsh-lsp-echo.git",
+     "description": "多语言 LSP 诊断（Godot / TypeScript 引擎）"},
+    {"slug": "repeat-stream-guard",
+     "repo": "https://github.com/Muigoochen/dsh-repeat-stream-guard.git",
+     "description": "截断周期性重复输出"},
+    {"slug": "compaction-director",
+     "repo": "https://github.com/Muigoochen/dsh-compaction-director.git",
+     "description": "压缩策略编排"},
+    {"slug": "conversation-summary",
+     "repo": "https://github.com/Muigoochen/dsh-conversation-summary.git",
+     "description": "会话摘要"},
+    {"slug": "toast",
+     "repo": "https://github.com/Muigoochen/dsh-toast.git",
+     "description": "界面/桌面提示气泡"},
+    {"slug": "workspace-files",
+     "repo": "https://github.com/Muigoochen/dsh-workspace-files.git",
+     "description": "工作区文件树与浏览"},
 )
 
 
