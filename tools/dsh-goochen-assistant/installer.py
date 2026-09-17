@@ -789,6 +789,11 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 raise InstallError(f"Node 下载失败：{exc}") from exc
         self.log("  静默安装（如弹出系统权限确认，请点【是】）…")
+        # 故意**不**走 childproc：MSI 的真正安装动作由 Windows Installer 服务完成
+        # （那不是我们的子进程），客户端被中途杀掉只会让它回滚或留下半装的 Node；
+        # 它还可能弹 UAC，提权后的进程也不在我们的 Job 里。所以这条既不进 Job、
+        # 也不进关窗清理——让它自己跑完或自己回滚，比打断它安全。装完若界面已关，
+        # 下次「一键完整安装」会重新检测到 Node 并接着往下走。
         proc = subprocess.run(["msiexec", "/i", str(msi), "/qn", "/norestart"],
                               capture_output=True)
         if proc.returncode not in (0, 3010):
