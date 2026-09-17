@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 #: 还在跑的、由本助手启动的子进程。
 _CHILDREN: "set[subprocess.Popen]" = set()
@@ -25,6 +25,8 @@ _LOCK = threading.Lock()
 
 #: 单次 taskkill 的等待上限（秒）。
 KILL_TIMEOUT = 15
+#: 关窗那一条路的等待上限：反正 Job Object 会在进程退出时兜底，不必让界面干等。
+CLOSE_KILL_TIMEOUT = 5
 
 #: Job Object 句柄（仅 Windows）。取不到时全程为 None，退回 kill_all 那条路。
 _JOB: Optional[int] = None
@@ -82,15 +84,24 @@ def _win_job() -> Optional[int]:
                             ("PeakJobMemoryUsed", ctypes.c_size_t)]
 
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # 显式声明签名：HANDLE 在 64 位下是 8 字节，交给 ctypes 默认的 int 编组会截断
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
             handle = kernel32.CreateJobObjectW(None, None)
             if not handle:
                 return None
             info = _ExtendedLimit()
             info.BasicLimitInformation.LimitFlags = _KILL_ON_JOB_CLOSE
             if not kernel32.SetInformationJobObject(
-                    wintypes.HANDLE(handle), _EXTENDED_LIMIT, ctypes.byref(info),
-                    ctypes.sizeof(info)):
-                kernel32.CloseHandle(wintypes.HANDLE(handle))
+                    handle, _EXTENDED_LIMIT, ctypes.byref(info), ctypes.sizeof(info)):
+                kernel32.CloseHandle(handle)
                 return None
             _JOB = handle
             return _JOB
@@ -158,12 +169,16 @@ def kill_tree(proc: subprocess.Popen, *, timeout: int = KILL_TIMEOUT) -> None:
         pass
 
 
-def kill_all() -> int:
-    """结束所有登记在册、还在跑的子进程；返回结束了几个。"""
+def kill_all(*, timeout: int = KILL_TIMEOUT) -> int:
+    """结束所有登记在册、还在跑的子进程；返回结束了几个。
+
+    关窗时可以用更短的 `timeout`：Job Object 会在本进程退出（句柄关闭）时兜底
+    结束全部成员，所以不必为了个别赖着不走的进程让界面干等。
+    """
     with _LOCK:
         procs = [p for p in _CHILDREN if p.poll() is None]
     for proc in procs:
-        kill_tree(proc)
+        kill_tree(proc, timeout=timeout)
     return len(procs)
 
 
@@ -172,9 +187,12 @@ def run(argv: Any, *, cwd: Optional[Any] = None, env: Optional[dict] = None,
         encoding: Optional[str] = None) -> subprocess.CompletedProcess:
     """跑一条命令并登记句柄，返回 `subprocess.CompletedProcess`。
 
-    语义等同于 `subprocess.run(..., capture_output=True)`，唯一的区别是命令
-    在跑的时候句柄登记在册，所以关窗时能被 `kill_all()` 一起结束。字符串命令
-    加 `shell=True`（Windows 上跑 `pnpm.cmd` 这类批处理需要）。
+    与 `subprocess.run(..., capture_output=True)` 的三处差异（都是刻意的）：
+    ① 命令在跑的时候句柄登记在册，关窗时能被 `kill_all()` 一起结束；
+    ② `stdin` 指向空设备——子进程读输入会立刻拿到 EOF，而不是跟界面抢键盘；
+    ③ 超时抛出的 `TimeoutExpired` **不带**已读到的部分输出（那种情况下本来也没读全）。
+    返回值（args/returncode/stdout/stderr）与老写法一致，调用方无需改动。
+    字符串命令加 `shell=True`（Windows 上跑 `pnpm.cmd` 这类批处理需要）。
     """
     proc = subprocess.Popen(
         argv,

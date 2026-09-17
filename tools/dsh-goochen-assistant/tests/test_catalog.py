@@ -730,7 +730,21 @@ class InterruptedInstallTest(unittest.TestCase):
         project = self._checkout()
         installer.set_interrupted_target(str(self.tmp / "another"))
         installer.clear_interrupted(project)      # 不匹配就不该清掉
-        self.assertEqual(installer.interrupted_target(), str(self.tmp / "another"))
+        self.assertEqual(installer.interrupted_targets(), [str(self.tmp / "another")])
+
+    def test_two_interrupted_directories_are_both_remembered(self):
+        """单槽会互相抹掉：先打断 A、再打断 B，A 的坑不能丢（否则 A 下次白跳过依赖与构建）。"""
+        first = self._checkout("deepseek-harness")
+        second = self._checkout("my-dsh")
+        installer.set_interrupted_target(str(first))
+        installer.set_interrupted_target(str(second))
+        installer.set_interrupted_target(str(first))      # 同一目录重复记不该出现两条
+        self.assertTrue(installer.install_was_interrupted(first))
+        self.assertTrue(installer.install_was_interrupted(second))
+        self.assertEqual(len(installer.interrupted_targets()), 2)
+        installer.clear_interrupted(second)               # 只清掉跑完的那个
+        self.assertTrue(installer.install_was_interrupted(first))
+        self.assertFalse(installer.install_was_interrupted(second))
 
     def test_force_redoes_deps_and_build_after_an_interrupt(self):
         project = self._checkout()
@@ -779,6 +793,67 @@ class InterruptedInstallTest(unittest.TestCase):
             eng.run_full(headless=False, start=False)
         self.assertFalse(installer.install_was_interrupted(project),
                          "装完了就该取消标记，别让以后每次安装都白重做一遍")
+
+
+class CloseMarksOpTargetTest(unittest.TestCase):
+    """关窗这条接线：记的是**正在安装的那个目录**，不是关窗那一刻路径框里的值。
+
+    否则装 A 时随手把路径改成 B 再关窗，标记会写到 B 上：A 的半成品被当成装好了
+    （下次 force 落空），B 反而被无谓地整体重装一遍。同理，只是读一下 git 信息
+    （打开界面、改路径后的自动刷新）不该弹窗、更不该写标记。
+
+    不建真窗口：`_on_close` 只碰 `self` 上的几个属性和模块级函数，用桩对象就能验接线。
+    """
+
+    @staticmethod
+    def _stub(**kw):
+        app = SimpleNamespace(
+            busy=False, git_busy=False, plugin_busy=False, mig_busy=False,
+            _op_target=None, _closing=False,
+            _stop_web_internal=lambda quiet=True: None,
+            _drain_ui_queue=lambda: None,
+            destroy=lambda: None)
+        app.__dict__.update(kw)
+        app._long_task_running = installer.App._long_task_running.__get__(app)
+        app._on_close = installer.App._on_close.__get__(app)
+        return app
+
+    @staticmethod
+    def _close(app, confirm: bool):
+        marked: list[str] = []
+        asked: list[int] = []
+        with mock.patch.object(installer.messagebox, "askyesno",
+                               lambda *a, **k: (asked.append(1), confirm)[1]), \
+                mock.patch.object(installer, "set_interrupted_target", marked.append), \
+                mock.patch.object(installer.childproc, "kill_all", lambda **k: 0):
+            app._on_close()
+        return marked, asked
+
+    def test_marks_the_directory_being_installed(self):
+        marked, asked = self._close(self._stub(_op_target=r"C:\installing\A"), True)
+        self.assertEqual(asked, [1])
+        self.assertEqual(marked, [r"C:\installing\A"])
+
+    def test_cancel_keeps_the_window_and_writes_nothing(self):
+        app = self._stub(_op_target=r"C:\installing\A")
+        marked, _ = self._close(app, False)
+        self.assertEqual(marked, [])
+        self.assertFalse(app._closing, "用户选了「否」就不该进入关闭流程")
+
+    def test_reading_git_is_not_a_long_task(self):
+        app = self._stub(git_busy=True)
+        self.assertFalse(app._long_task_running())
+        marked, asked = self._close(app, True)
+        self.assertEqual(asked, [], "只是读 git 信息，不该弹「任务还在进行」")
+        self.assertEqual(marked, [], "更不该把好端端的目录记成「被打断」")
+
+    def test_plugins_and_migration_ask_but_do_not_mark_installs(self):
+        for flag in ("plugin_busy", "mig_busy"):
+            app = self._stub(**{flag: True})
+            self.assertTrue(app._long_task_running(), flag)
+            marked, asked = self._close(app, True)
+            self.assertEqual(asked, [1], flag)
+            self.assertEqual(marked, [], f"{flag} 不是安装，不该写安装标记")
 
 
 class PluginSourcesTest(unittest.TestCase):

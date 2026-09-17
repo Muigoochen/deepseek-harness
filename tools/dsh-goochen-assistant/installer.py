@@ -64,6 +64,10 @@ LEFT_COL_MIN = 340
 LEFT_COL_MAX = 900
 LOG_COL_MIN = 320
 WRAP_LEFT = 396
+#: 分隔条本体的宽度（ttk 的 sash）：算「日志栏还剩多少」时要减掉它。
+SASH_PX = 6
+#: 日志区最多保留多少行（长时间跑安装/服务时不让 Text 无上限增长）。
+LOG_MAX_LINES = 5000
 
 #: 安装方式的短名——折叠起来之后，标题上仍要看得出现在选的是哪个。
 MODE_CN = {
@@ -212,8 +216,9 @@ def saved_left_col_width() -> int:
     return LEFT_COL_WIDTH
 
 
-#: 记着哪个目录的安装/更新被「关窗」打断了——下次要重新装依赖并重新构建。
+#: 记着哪些目录的安装/更新被「关窗」打断了——下次要重新装依赖并重新构建。
 #: 因为 `node_modules` 存在就跳过安装，被打断的半成品否则会被当成装好了。
+#: 存的是**列表**：先中断 A、后来又中断 B 时，A 的坑不能被抹掉。
 INTERRUPTED_KEY = "interruptedInstall"
 
 
@@ -221,29 +226,35 @@ def _norm_path(text: str) -> str:
     return os.path.normcase(os.path.normpath(text))
 
 
-def set_interrupted_target(path: str) -> None:
-    """记下被打断的安装目录（关窗时调用）。"""
-    save_config({INTERRUPTED_KEY: path})
-
-
-def interrupted_target() -> str:
-    """上次被打断的安装目录；没有则空字符串。"""
+def interrupted_targets() -> list[str]:
+    """所有被打断过的安装目录（兼容旧版只存一个字符串的格式）。"""
     value = load_config().get(INTERRUPTED_KEY)
-    return value if isinstance(value, str) else ""
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str) and v]
+    return []
+
+
+def set_interrupted_target(path: str) -> None:
+    """记下被打断的安装目录（关窗时调用）；已经记过的不重复记。"""
+    saved = interrupted_targets()
+    if any(_norm_path(p) == _norm_path(path) for p in saved):
+        return
+    save_config({INTERRUPTED_KEY: saved + [path]})
 
 
 def install_was_interrupted(path: Path) -> bool:
     """这个目录上次的安装/更新是不是被中途关窗打断了。"""
-    saved = interrupted_target()
-    if not saved:
-        return False
-    return _norm_path(saved) == _norm_path(str(path))
+    return any(_norm_path(p) == _norm_path(str(path)) for p in interrupted_targets())
 
 
 def clear_interrupted(path: Path) -> None:
-    """这个目录的安装/更新顺利跑完了，取消标记。"""
-    if install_was_interrupted(path):
-        save_config({INTERRUPTED_KEY: ""})
+    """这个目录的安装/更新顺利跑完了，把它从名单里去掉（别的目录不受影响）。"""
+    saved = interrupted_targets()
+    keep = [p for p in saved if _norm_path(p) != _norm_path(str(path))]
+    if keep != saved:
+        save_config({INTERRUPTED_KEY: keep})
 
 
 def free_gb(path: Path) -> float:
@@ -932,6 +943,21 @@ class Engine:
 
 
 # ---------------------------------------------------------------- GUI
+def bind_wheel_tree(root: tk.Misc, handler) -> None:
+    """给 root 及其所有子控件挂滚轮（每个控件只挂一次）。
+
+    不用 `bind_all`：那是整个解释器共用的**一个槽**，本程序的插件列表也在用，
+    一方 `unbind_all` 会把另一方的滚轮一起摘掉（评审实测过）。
+    """
+    stack = [root]
+    while stack:
+        widget = stack.pop()
+        if not getattr(widget, "_wheel_bound", False):
+            widget._wheel_bound = True
+            widget.bind("<MouseWheel>", handler, add="+")
+        stack.extend(widget.winfo_children())
+
+
 class App(tk.Tk):
     WIDTH, HEIGHT = 1000, 720
 
@@ -963,6 +989,9 @@ class App(tk.Tk):
         self.mig_rows: list[dict[str, str]] = []
         # --- 版本与更新（真 git 命令）状态 ---
         self.git_busy = False
+        #: 正在安装/更新的目标目录。关窗时用它写「被打断」标记——现场算
+        #: `project_dir()` 会被「用户随手改了路径框」带偏，把标记写到别的目录上。
+        self._op_target: str | None = None
         self._git_after: str | None = None
         self._closing = False
         # 还没被确认身份、正在靠「试跑」定案的目录（跑成功就记进安装标记）
@@ -1062,25 +1091,32 @@ class App(tk.Tk):
         self._wrap_labels.append(self.git_note)
 
         # 安装方式（可折叠：装好之后基本不用动；标题上始终显示当前选择）
-        # 已经装好时默认收起，把空间让给日志
+        # 只有「本助手装过的目录」才默认收起——不然在本仓库里跑（工具就在检出内）
+        # 会判定成「已装好」而对所有人默认收起，小白第一眼看不到安装方式。
         self.mode_title = tk.StringVar()
-        mbody = self._collapsible(left, self.mode_title,
-                                 expanded=not is_checkout(project_dir()))
+        installed_by_us = bool(read_install_marker(project_dir()))
+        mbody = self._collapsible(left, self.mode_title, expanded=not installed_by_us)
+        # 离线数据的有无放在折叠块**外面**：小白必须看得见「没检测到离线数据、会联网」
         hints = Engine.describe_assets()
         hint_txt = "已检测到离线数据：" if any(f for _, _, f in hints) else "未检测到离线数据（将走网络）："
         marks = "  ".join(f"{'✓' if ok else '—'}{name}" for name, _path, ok in hints)
-        asset_lbl = ttk.Label(mbody, text=f"{hint_txt}\n{marks}", foreground="#666",
+        asset_lbl = ttk.Label(left, text=f"{hint_txt}\n{marks}", foreground="#666",
                               justify="left", wraplength=WRAP_LEFT)
-        asset_lbl.pack(anchor="w")
+        asset_lbl.pack(anchor="w", pady=(6, 0))
         self._wrap_labels.append(asset_lbl)
         for value, text in (
-                ("auto", "自动选择（推荐）——有离线包走离线，缺的自动联网补"),
-                ("offline", "离线安装——完全不依赖网络（需随包离线数据）"),
-                ("online", "在线安装——从网络源下载（较慢）")):
+                ("auto", "自动选择（推荐）"),
+                ("offline", "离线安装——完全不依赖网络"),
+                ("online", "在线安装——从网络源下载")):
             ttk.Radiobutton(mbody, text=text, variable=self.mode, value=value,
                             command=self._refresh_mode_title).pack(anchor="w")
         ttk.Checkbutton(mbody, text="在线安装时使用国内镜像 npmmirror 加速",
                         variable=self.mirror).pack(anchor="w")
+        # 说明放在可换行的灰字里：ttk 的单选/复选文字不支持换行，长了会被裁掉
+        mode_hint = ttk.Label(mbody, text="自动选择＝有离线数据就走离线，缺的自动联网补。",
+                              foreground="#666", justify="left", wraplength=WRAP_LEFT)
+        mode_hint.pack(anchor="w", pady=(4, 0))
+        self._wrap_labels.append(mode_hint)
         self._refresh_mode_title()
 
         # 打开与复制（可折叠：日常偶尔用，收起来给日志让位）
@@ -1113,34 +1149,26 @@ class App(tk.Tk):
         # 中间的竖线：拖动即调宽窄；拖完夹回合理区间并记住，双击回到默认。
         # 记的是「左栏内容宽度」（不含滚动条占位），下次启动直接用它建画布，
         # 位置能原样还原，不会每开一次就涨一点。
-        def drag_done(_event=None) -> None:
-            try:
-                pos = cols.sashpos(0)
-            except tk.TclError:            # 拖动中或窗口销毁时的瞬时状态
-                return
-            if pos <= 1:                   # 布局未完成时 sashpos 会返回 0/1
-                return
-            limit = max(LEFT_COL_MIN, cols.winfo_width() - LOG_COL_MIN)
-            pos = min(max(pos, LEFT_COL_MIN), limit)
-            if pos != cols.sashpos(0):
-                cols.sashpos(0, pos)
-            cols.update_idletasks()        # 等重排完成，再读左栏的真实内容宽度
-            save_config({"leftColWidth": max(LEFT_COL_MIN, canvas.winfo_width())})
-
-        cols.bind("<ButtonRelease-1>", drag_done)
+        # 窗口**每次改变大小**都要重夹一遍：限位是按窗口宽度算的，只夹拖动那一刻的话，
+        # 把窗口缩小会让左栏不让位、把日志栏压到几十像素。
+        self._skip_sash_save = False
+        cols.bind("<Configure>", lambda _e: self._apply_left_width(cols, canvas))
+        cols.bind("<ButtonRelease-1>", lambda _e: self._release_sash(cols, canvas))
         cols.bind("<Double-Button-1>", lambda _e: self._reset_left_col(cols, canvas))
         # height/width 只是「至少这么大」；width 用小值，别让文本宽度反过来撑大窗口
         self.txt = tk.Text(lf, height=20, width=20, wrap="word",
-                           font=("Microsoft YaHei UI", 9))
+                           font=("Microsoft YaHei UI", 9), state="disabled")
         sb = ttk.Scrollbar(lf, command=self.txt.yview)
         self.txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.txt.pack(fill="both", expand=True)
-        # 只读但可选中/复制：拦截编辑类按键，保留 Ctrl 快捷键与鼠标选择
-        self.txt.bind("<Key>", self._ro_key)
-        self.txt.bind("<<Paste>>", lambda e: "break")
-        self.txt.bind("<<Cut>>", lambda e: "break")
+        # 只读用 state 锁：拦按键的写法挡不住 Tk 自带的 Ctrl+H/D/K/O/T/I（实测能删字、
+        # 插换行与制表符，且没有 undo）。锁上之后鼠标选择与复制/全选照常可用。
         self.txt.bind("<Button-3>", self._log_popup)
+        # 右键菜单只建一次：每次右键新建 tk.Menu 会一直挂在 self.children 上泄漏
+        self._log_menu = tk.Menu(self, tearoff=0)
+        self._log_menu.add_command(label="复制选中", command=self._log_copy_sel)
+        self._log_menu.add_command(label="复制全部", command=self._log_copy_all)
 
         # ---------------- Tab 2：插件 ----------------
         self._build_plugin_ui(tab_plug)
@@ -1180,28 +1208,28 @@ class App(tk.Tk):
             self.after(60, self._drain_ui_queue)
 
     def _append(self, msg: str) -> None:
+        """追加一行日志（界面线程里执行；工作线程经 _post 调用）。
+
+        两个细节：① 只读 Text 靠 `state` 锁，插入时才临时解锁；② 用户往上翻看历史
+        时不要把他拽回底部，只有本来就在底部才自动跟随。行数也有上限，长时间跑
+        `pnpm install` / `dsh web` 不会把控件撑爆。
+        """
         def write() -> None:
+            at_bottom = self.txt.yview()[1] > 0.999
+            self.txt.configure(state="normal")
             self.txt.insert("end", str(msg) + "\n")
-            self.txt.see("end")
+            if int(self.txt.index("end-1c").split(".")[0]) > LOG_MAX_LINES:
+                self.txt.delete("1.0", f"end-{LOG_MAX_LINES}lines")
+            self.txt.configure(state="disabled")
+            if at_bottom:
+                self.txt.see("end")
         self._post(write)
 
-    def _ro_key(self, e) -> str | None:
-        """只读保护：拦截会改动文本的按键，保留方向键与 Ctrl 组合（复制/全选）。"""
-        if e.state & 0x0004:            # Control
-            return None
-        if e.keysym in ("Left", "Right", "Up", "Down", "Home", "End",
-                        "Prior", "Next"):
-            return None
-        return "break"
-
     def _log_popup(self, e) -> None:
-        m = tk.Menu(self, tearoff=0)
-        m.add_command(label="复制选中", command=self._log_copy_sel)
-        m.add_command(label="复制全部", command=self._log_copy_all)
         try:
-            m.tk_popup(e.x_root, e.y_root)
+            self._log_menu.tk_popup(e.x_root, e.y_root)
         finally:
-            m.grab_release()
+            self._log_menu.grab_release()
 
     def _log_copy_sel(self) -> None:
         try:
@@ -1238,16 +1266,21 @@ class App(tk.Tk):
                 b.configure(state="disabled" if busy or self.plugin_busy else "normal")
             except Exception:  # noqa: BLE001
                 pass
+        self._set_git_buttons(not busy)        # 安装期间不许碰 git（同一目录会打架）
         self.btn_open_page.configure(state=state)
         self._update_run_buttons()
 
     def _update_run_buttons(self) -> None:
-        """「运行」与「停止服务」互斥：运行中=运行灰、停止可用；否则反之。"""
+        """「运行」与「停止服务」互斥：运行中=运行灰、停止可用；否则反之。
+
+        长任务（安装/更新/插件/迁移）进行中不许点【运行】：那时 `node_modules` 正
+        在被写，起来也会撞上文件锁。
+        """
         def apply() -> None:
             try:
                 running = self.web_proc is not None and self.web_proc.poll() is None
                 self.btn_term.configure(
-                    state="disabled" if (running or self.busy) else "normal")
+                    state="disabled" if (running or self._long_task_running()) else "normal")
                 self.btn_stop.configure(
                     state="normal" if (running and not self.busy) else "disabled")
             except Exception:  # noqa: BLE001
@@ -1255,7 +1288,7 @@ class App(tk.Tk):
         try:
             running = self.web_proc is not None and self.web_proc.poll() is None
             self.btn_term.configure(
-                state="disabled" if (running or self.busy) else "normal")
+                state="disabled" if (running or self._long_task_running()) else "normal")
             self.btn_stop.configure(
                 state="normal" if (running and not self.busy) else "disabled")
         except Exception:  # noqa: BLE001  窗口销毁后控件不可用，忽略即可
@@ -1268,7 +1301,10 @@ class App(tk.Tk):
         self._post(setit)
 
     def on_full(self) -> None:
-        if self.busy:
+        if self.busy or self.git_busy or self.plugin_busy or self.mig_busy:
+            # 安装和更新会往同一个 node_modules 里写：必须互斥，否则两个 pnpm 打架
+            messagebox.showinfo("有任务在进行",
+                                "正在进行的任务结束之后再开始安装。", parent=self)
             return
         target = self._current_dir()
         errors, warns = check_install_dir(target)
@@ -1290,6 +1326,8 @@ class App(tk.Tk):
         ident = verify_install_dir(target)
         self._append(f"[安装位置] {'✓ ' + ident.evidence if ident.ok else '尚未安装，将全新装到这里'}")
         self._set_busy(True)
+        # 记下本次装到哪：关窗时用它写「被打断」标记，不用现场算 project_dir()
+        self._op_target = str(target)
         retry = install_was_interrupted(target)
         if retry:
             self._append("[安装位置] 上次安装被中途关窗打断过，这次重新装依赖并重新构建")
@@ -1397,7 +1435,7 @@ class App(tk.Tk):
 
     def on_git_refresh(self) -> None:
         self._git_after = None
-        if self.git_busy or self._closing:
+        if self.git_busy or self.busy or self._closing:
             return
         target = self._effective_dir()
         self.git_busy = True
@@ -1467,7 +1505,7 @@ class App(tk.Tk):
 
     def on_check_update(self) -> None:
         """联网 `git fetch` 后与远端比较——落后多少个提交是 git 算出来的。"""
-        if self.git_busy or self._closing:
+        if self.git_busy or self.busy or self._closing:
             return
         target = self._effective_dir()
         self.git_busy = True
@@ -1534,6 +1572,7 @@ class App(tk.Tk):
         if was_running:
             self._stop_web_internal(quiet=False)
         self.git_busy = True
+        self._op_target = str(target)      # 更新也是长任务：关窗要认得出目标目录
         self._set_git_buttons(False)
         self._set_label(self.git_note, "正在更新…（进度见下方日志）", "#a05a00")
         mirror = bool(self.mirror.get())           # Tk 变量只在界面线程读
@@ -1564,6 +1603,7 @@ class App(tk.Tk):
 
     def _update_done(self, ok: bool, detail: str, was_running: bool) -> None:
         self.git_busy = False
+        self._op_target = None
         self._set_git_buttons(True)
         if not ok:
             self._append(f"[更新] ✗ 更新失败：{detail}")
@@ -1583,16 +1623,21 @@ class App(tk.Tk):
         """安装/构建的工作线程：碰界面一律经 _post（tkinter 不是线程安全的）。"""
         try:
             self._status("安装进行中…", "#b36b00")
-            eng.run_full(headless=False, start=True)
-            self._status("完成 ✓ 已启动网页版", "#1a6b1a")
+            # start=False：服务改由界面线程用 _launch_web 启动。Engine.start 是阻塞的
+            # （pnpm dsh web 会一直跑到服务结束），在这里调它会让 busy 一直为真——
+            # 停止按钮全程不可用，而且成功的安装还会被关窗逻辑记成「被打断」。
+            eng.run_full(headless=False, start=False)
+            self._status("完成 ✓ 正在启动网页版…", "#1a6b1a")
+            self._post(self._launch_web)          # 输出照样实时进日志区
             self._post(messagebox.showinfo, "完成",
-                       f"安装完成！\n浏览器将打开 {WEB_URL}。\n日常使用点「运行」。")
+                       "安装完成！\n网页服务正在启动，点【打开登录页】即可进入。")
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             self._append(f"\n✗ 失败：{msg}")
             self._status("失败 ✗（详情见日志，可复制反馈）", "#b00000")
             self._post(messagebox.showerror, "操作失败", msg)
         finally:
+            self._op_target = None                # 长任务结束，关窗不再算它
             self.busy = False                     # 立刻生效，按钮不用多禁用一会儿
             self._post(self._set_busy, False)     # 界面线程侧刷新按钮
 
@@ -1629,6 +1674,9 @@ class App(tk.Tk):
             if project is None:
                 return False
         if shutil.which("pnpm") is None:
+            # 还没真跑就退出：清掉「等运行验证」的标记，否则下次在**别的**目录跑成功
+            # 会把刚记下的这个旧目录写成 verifiedByRun
+            self._unconfirmed_dir = None
             messagebox.showerror("缺少 pnpm",
                                  "未检测到 pnpm。请先执行「一键完整安装」。")
             return False
@@ -1656,6 +1704,7 @@ class App(tk.Tk):
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except Exception as exc:  # noqa: BLE001
+            self._unconfirmed_dir = None      # 同样：没跑起来就不该留下验证标记
             messagebox.showerror("启动失败", str(exc))
             self._append(f"[终端] ✗ 启动失败：{exc}")
             return False
@@ -1887,30 +1936,16 @@ class App(tk.Tk):
 
         inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
 
+        def wheel(event) -> None:
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            return "break"
+
         def refit(event) -> None:
             canvas.itemconfigure(window, width=event.width)
             self._fit_wraps(event.width)          # 栏宽变了，长文字的换行宽度跟着变
+            bind_wheel_tree(inner, wheel)         # 新出现的子控件也挂上滚轮
 
         canvas.bind("<Configure>", refit)
-
-        def wheel(event) -> None:
-            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
-
-        def enter(_event=None) -> None:
-            canvas.bind_all("<MouseWheel>", wheel)
-
-        def leave(event) -> None:
-            # 指针移进子控件时也会触发 <Leave>（Tcl 的 NotifyInferior，但 tkinter
-            # 的事件对象没有 detail 字段），所以用「指针底下还是不是这一块」来判断。
-            under = outer.winfo_containing(event.x_root, event.y_root)
-            while under is not None:
-                if under is outer:
-                    return
-                under = getattr(under, "master", None)
-            canvas.unbind_all("<MouseWheel>")
-
-        outer.bind("<Enter>", enter)
-        outer.bind("<Leave>", leave)
         return outer, inner, canvas
 
     def _fit_wraps(self, width: int) -> None:
@@ -1920,15 +1955,52 @@ class App(tk.Tk):
             if label.winfo_exists():
                 label.configure(wraplength=wrap)
 
+    def _sash_gap(self, cols: ttk.Panedwindow, canvas: tk.Canvas) -> int:
+        """滚动条占位：`sashpos(0)`（第一栏宽度）减去画布实际宽度。"""
+        try:
+            return max(0, cols.sashpos(0) - canvas.winfo_width())
+        except tk.TclError:          # 还没布局完 / 正在销毁
+            return 0
+
+    def _max_content_width(self, cols: ttk.Panedwindow, gap: int) -> int:
+        """当前窗口宽度下左栏内容最多能有多宽（日志栏要留得住）。"""
+        room = cols.winfo_width() - gap - SASH_PX - LOG_COL_MIN
+        return min(LEFT_COL_MAX, max(LEFT_COL_MIN, room))
+
+    def _apply_left_width(self, cols: ttk.Panedwindow, canvas: tk.Canvas, *,
+                          want: int | None = None, save: bool = False) -> None:
+        """把左栏宽度夹回合理区间（给了 want 就先设成它），必要时记进配置。
+
+        夹的是「内容宽度」：`sashpos(0)` 是第一栏宽度（含滚动条占位），换算时补上
+        `gap` 才对得上配置里的值。
+        """
+        try:
+            gap = self._sash_gap(cols, canvas)
+            content = (cols.sashpos(0) - gap) if want is None else want
+            content = min(max(content, LEFT_COL_MIN), self._max_content_width(cols, gap))
+            if cols.sashpos(0) != content + gap:
+                cols.sashpos(0, content + gap)
+            if save:
+                save_config({"leftColWidth": content})
+        except tk.TclError:          # 布局还没完成 / 窗口正在销毁
+            return
+
+    def _release_sash(self, cols: ttk.Panedwindow, canvas: tk.Canvas) -> None:
+        """拖动结束：夹回区间并记住（刚复位过则跳过，别覆盖复位写的值）。"""
+        if self._skip_sash_save:
+            self._skip_sash_save = False
+            return
+        self._apply_left_width(cols, canvas, save=True)
+
     def _reset_left_col(self, cols: ttk.Panedwindow, canvas: tk.Canvas) -> None:
         """双击中间的竖线：左栏宽度回到默认值，并记住这个默认值。
 
-        `sashpos(0)` 是**第一栏的宽度**（含滚动条占位），所以要补上那点占位
-        才能让内容宽度正好等于 `LEFT_COL_WIDTH`。这里**不要**顺手去改画布的
-        请求宽度：Panedwindow 会按子控件的请求反过来挪竖线，把滚动条挤没。
+        双击在 Tk 里是 press/release/press/double-release——复位之后还会再来一个
+        `<ButtonRelease-1>`，所以置个短标志，让那次收尾别把刚写下的默认值覆盖掉。
+        存的是**默认值本身**（而不是夹后的值），这样窗口放大后还是回到 430。
         """
-        gap = max(0, cols.sashpos(0) - canvas.winfo_width())
-        cols.sashpos(0, LEFT_COL_WIDTH + gap)
+        self._skip_sash_save = True
+        self._apply_left_width(cols, canvas, want=LEFT_COL_WIDTH, save=False)
         save_config({"leftColWidth": LEFT_COL_WIDTH})
 
     def _collapsible(self, parent, title, *, expanded: bool = True) -> ttk.Frame:
@@ -1953,7 +2025,9 @@ class App(tk.Tk):
             state["open"] = not state["open"]
             arrow.configure(text="▾" if state["open"] else "▸")
             if state["open"]:
-                body.pack(fill="x", pady=(4, 0))
+                # 必须指定 after=head：pack 不带它的话是「追加到父控件末尾」，
+                # 收起再展开会把这块内容搬到左栏最下面（实测过）。
+                body.pack(fill="x", pady=(4, 0), after=head)
             else:
                 body.pack_forget()
 
@@ -2830,28 +2904,39 @@ class App(tk.Tk):
             self._mig_fail(exc)
 
     def _on_close(self) -> None:
-        """关窗口前先停 dsh web 与还在跑的安装/更新，再销毁窗口。
+        """关窗口前先停 dsh web 与还在跑的长任务，再销毁窗口。
 
         安装、构建、克隆都是几分钟的命令，而执行它们的工作线程随窗口一起消失：
         不在这里结束子进程，它们会变成孤儿继续往安装目录写文件——用户以为关了，
-        其实还在装，下次重开还可能撞上文件锁。
+        其实还在装，下次重开还会撞上文件锁。
         """
-        busy = self.busy or self.git_busy
-        if busy and not messagebox.askyesno(
-                "安装/更新还在进行",
+        if self._long_task_running() and not messagebox.askyesno(
+                "任务还在进行",
                 "现在关闭会中断它。已经写进去的文件会留着，\n"
                 "下次点【一键完整安装】会重新装依赖并重新构建。\n\n"
                 "确定要关闭吗？", parent=self):
             return
         self._closing = True
-        if busy:
-            set_interrupted_target(str(project_dir()))
+        if self._op_target is not None:
+            set_interrupted_target(self._op_target)
         self._stop_web_internal(quiet=False)
-        childproc.kill_all()
+        # 用较短的等待：个别进程赖着不走时不必让界面干等，Job Object 会在本进程
+        # 退出（句柄关闭）时兜底结束它们。
+        childproc.kill_all(timeout=childproc.CLOSE_KILL_TIMEOUT)
+        self._drain_ui_queue()             # 把「正在停止 / 已停止」这几句先刷出来
         try:
             self.destroy()
         except Exception:  # noqa: BLE001  已经在销毁中时 destroy 会报错，无需处理
             pass
+
+    def _long_task_running(self) -> bool:
+        """有没有「中途关掉会留下半成品」的长任务在跑（安装/更新/插件/迁移）。
+
+        只看真正的长任务，**不看 `git_busy`**：读 git 信息（启动后与每次改路径都会
+        排期）只是一次探测，把它当成「正在安装」会在启动后马上关窗时平白弹窗，
+        还会把好端端的目录记进「被打断」名单、害得下次白重装一遍。
+        """
+        return (self._op_target is not None or self.plugin_busy or self.mig_busy)
 
 
 def selfcheck() -> int:
