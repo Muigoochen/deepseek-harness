@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
 
+import childproc
+
 #: 官方仓库：**owner 与仓库名都对得上**才算官方（已用 `git ls-remote` 确认该仓库存在）。
 OFFICIAL_OWNER = "deepseek-ai"
 REPO_SLUG = "deepseek-harness"
@@ -47,8 +49,8 @@ def run_git(args: Sequence[str], cwd: Optional[Path] = None, *,
         return GIT_MISSING, "", "未检测到 git（请先安装 Git for Windows）"
     argv = [exe] + (["-C", str(cwd)] if cwd is not None else []) + list(args)
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=timeout)
+        # 经 childproc 跑：句柄登记在册，关窗时能连同子孙一起结束（fetch 可能跑很久）
+        proc = childproc.run(argv, text=True, encoding="utf-8", timeout=timeout)
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except subprocess.TimeoutExpired:
         return GIT_TIMEOUT, "", f"git 超时（{timeout} 秒）：{' '.join(args[:2])}"

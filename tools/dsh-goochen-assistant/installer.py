@@ -30,6 +30,7 @@ from collections import deque
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import childproc               # 子进程登记（关窗时连子孙一起结束）
 import plugin_store as pstore  # 插件管理原语（同目录模块）
 import gitinfo as ginfo        # 真 git 命令层（识别/校验/版本/更新）
 
@@ -97,9 +98,8 @@ def version_ok(version: str) -> bool:
 
 def run(argv: list[str], cwd: Path | None = None,
         env: dict | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, cwd=str(cwd) if cwd else None,
-                          env=env if env is not None else dict(os.environ),
-                          capture_output=True, text=False)
+    """跑一条命令（阻塞到结束）；句柄登记在册，关窗时会被一起结束。"""
+    return childproc.run(argv, cwd=cwd, env=env)
 
 
 def run_cli(argv: list[str], cwd: Path | None = None,
@@ -107,12 +107,9 @@ def run_cli(argv: list[str], cwd: Path | None = None,
     """Windows 下经 cmd shell 执行（能解析 pnpm.cmd 等批处理），
     其他平台退化到原生 run()。GUI 进程/线程都可用。"""
     if os.name == "nt":
-        import subprocess as sp
         cmdline = " ".join(f'"{a}"' if (" " in a or a.endswith((".cmd", ".exe"))) and not a.startswith('"') else a
                            for a in argv)
-        return sp.run(cmdline, cwd=str(cwd) if cwd else None,
-                      env=env if env is not None else dict(os.environ),
-                      capture_output=True, text=False, shell=True)
+        return childproc.run(cmdline, cwd=cwd, env=env, shell=True)
     return run(argv, cwd=cwd, env=env)
 
 
@@ -213,6 +210,40 @@ def saved_left_col_width() -> int:
     if isinstance(value, int) and not isinstance(value, bool) and LEFT_COL_MIN <= value <= LEFT_COL_MAX:
         return value
     return LEFT_COL_WIDTH
+
+
+#: 记着哪个目录的安装/更新被「关窗」打断了——下次要重新装依赖并重新构建。
+#: 因为 `node_modules` 存在就跳过安装，被打断的半成品否则会被当成装好了。
+INTERRUPTED_KEY = "interruptedInstall"
+
+
+def _norm_path(text: str) -> str:
+    return os.path.normcase(os.path.normpath(text))
+
+
+def set_interrupted_target(path: str) -> None:
+    """记下被打断的安装目录（关窗时调用）。"""
+    save_config({INTERRUPTED_KEY: path})
+
+
+def interrupted_target() -> str:
+    """上次被打断的安装目录；没有则空字符串。"""
+    value = load_config().get(INTERRUPTED_KEY)
+    return value if isinstance(value, str) else ""
+
+
+def install_was_interrupted(path: Path) -> bool:
+    """这个目录上次的安装/更新是不是被中途关窗打断了。"""
+    saved = interrupted_target()
+    if not saved:
+        return False
+    return _norm_path(saved) == _norm_path(str(path))
+
+
+def clear_interrupted(path: Path) -> None:
+    """这个目录的安装/更新顺利跑完了，取消标记。"""
+    if install_was_interrupted(path):
+        save_config({INTERRUPTED_KEY: ""})
 
 
 def free_gb(path: Path) -> float:
@@ -689,10 +720,12 @@ class InstallError(RuntimeError):
 class Engine:
     """核心安装流程：由 worker 线程执行，log 回调发回 UI。"""
 
-    def __init__(self, mode: str, use_mirror: bool, log=log_line):
+    def __init__(self, mode: str, use_mirror: bool, log=log_line,
+                 force: bool = False):
         self.mode = mode                # "auto" | "offline" | "online"
         self.use_mirror = use_mirror
         self.log = log
+        self.force = force              # 上次被打断过：不再看「已存在就跳过」，重做依赖与构建
         self.registry = REGISTRY_MIRROR if use_mirror else REGISTRY_OFFICIAL
 
     @staticmethod
@@ -884,8 +917,9 @@ class Engine:
         self.install_node(env)
         self.install_pnpm()
         project = self.prepare_source()
-        self.install_deps(project)
-        self.build(project)
+        self.install_deps(project, force=self.force)
+        self.build(project, force=self.force)
+        clear_interrupted(project)      # 依赖与构建都过了，恢复常态
         if start:
             self.start(project)
         else:
@@ -1251,8 +1285,11 @@ class App(tk.Tk):
         ident = verify_install_dir(target)
         self._append(f"[安装位置] {'✓ ' + ident.evidence if ident.ok else '尚未安装，将全新装到这里'}")
         self._set_busy(True)
+        retry = install_was_interrupted(target)
+        if retry:
+            self._append("[安装位置] 上次安装被中途关窗打断过，这次重新装依赖并重新构建")
         eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
-                     log=self._append)
+                     log=self._append, force=retry)
         threading.Thread(target=self._job, args=(eng,), daemon=True).start()
 
     def _current_dir(self) -> Path:
@@ -1506,6 +1543,7 @@ class App(tk.Tk):
             self._append("[更新] 源码有变化，重新装依赖并重新构建 …")
             eng.install_deps(target, force=True)
             eng.build(target, force=True)
+            clear_interrupted(target)   # 更新跑完了，取消「上次被打断」的标记
         except Exception as exc:  # noqa: BLE001  依赖/构建失败原因要如实报给用户
             self._post(self._update_done, False, str(exc), was_running)
             return
@@ -1790,14 +1828,7 @@ class App(tk.Tk):
             return
         if not quiet:
             self._append("[终端] 正在停止 dsh web …")
-        try:
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                           capture_output=True, timeout=15)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        childproc.kill_tree(proc)       # 连子孙一起：只杀 cmd 的话 node 会留下来占端口
         self.web_proc = None
         self.web_auth_url = None
         self._update_web_buttons()
@@ -2785,9 +2816,24 @@ class App(tk.Tk):
             self._mig_fail(exc)
 
     def _on_close(self) -> None:
-        """关窗口前先停 dsh web，再销毁窗口。"""
+        """关窗口前先停 dsh web 与还在跑的安装/更新，再销毁窗口。
+
+        安装、构建、克隆都是几分钟的命令，而执行它们的工作线程随窗口一起消失：
+        不在这里结束子进程，它们会变成孤儿继续往安装目录写文件——用户以为关了，
+        其实还在装，下次重开还可能撞上文件锁。
+        """
+        busy = self.busy or self.git_busy
+        if busy and not messagebox.askyesno(
+                "安装/更新还在进行",
+                "现在关闭会中断它。已经写进去的文件会留着，\n"
+                "下次点【一键完整安装】会重新装依赖并重新构建。\n\n"
+                "确定要关闭吗？", parent=self):
+            return
         self._closing = True
+        if busy:
+            set_interrupted_target(str(project_dir()))
         self._stop_web_internal(quiet=False)
+        childproc.kill_all()
         try:
             self.destroy()
         except Exception:  # noqa: BLE001  已经在销毁中时 destroy 会报错，无需处理

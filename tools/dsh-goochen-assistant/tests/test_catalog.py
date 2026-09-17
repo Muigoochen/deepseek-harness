@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -683,6 +684,101 @@ class PrepareSourceTest(unittest.TestCase):
                                            encoding="utf-8")
         (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
         return root
+
+
+class InterruptedInstallTest(unittest.TestCase):
+    """关窗打断安装要留下痕迹，下次必须重做依赖与构建。
+
+    否则会掉进这个坑：`install_deps` 看到 `node_modules` 存在就跳过，`build` 看到
+    构建标记就跳过——被打断的半成品会被当成装好了，用户点【一键完整安装】什么也没发生。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-intr-"))
+        self._old = (installer.CONFIG_DIR, installer.CONFIG_PATH)
+        installer.CONFIG_DIR = self.tmp
+        installer.CONFIG_PATH = self.tmp / "config.json"
+        installer.set_active_dir(None)
+        installer._DETECT_CACHE.clear()
+        self.logs: list[str] = []
+
+    def tearDown(self):
+        installer.set_active_dir(None)
+        installer._DETECT_CACHE.clear()
+        installer.CONFIG_DIR, installer.CONFIG_PATH = self._old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _checkout(self, name: str = "deepseek-harness") -> Path:
+        root = self.tmp / name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "package.json").write_text('{"name": "@deepseek-ai/dsh-root"}',
+                                           encoding="utf-8")
+        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        return root
+
+    def test_flag_matches_the_same_directory_written_differently(self):
+        project = self._checkout()
+        self.assertFalse(installer.install_was_interrupted(project), "默认不该有标记")
+        installer.set_interrupted_target(str(project).upper().replace("\\", "/"))
+        self.assertTrue(installer.install_was_interrupted(project),
+                        "大小写与斜杠写法不同也要认得出是同一个目录")
+        self.assertFalse(installer.install_was_interrupted(self.tmp / "other"))
+        installer.clear_interrupted(project)
+        self.assertFalse(installer.install_was_interrupted(project))
+
+    def test_clear_leaves_another_directory_alone(self):
+        project = self._checkout()
+        installer.set_interrupted_target(str(self.tmp / "another"))
+        installer.clear_interrupted(project)      # 不匹配就不该清掉
+        self.assertEqual(installer.interrupted_target(), str(self.tmp / "another"))
+
+    def test_force_redoes_deps_and_build_after_an_interrupt(self):
+        project = self._checkout()
+        (project / "node_modules").mkdir()
+        mark = project / installer.BUILD_MARK
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        mark.write_text("{}", encoding="utf-8")
+        installer.set_active_dir(project)
+        calls: list[list[str]] = []
+
+        def fake_run_cli(argv, cwd=None, env=None):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        def full_install(force: bool) -> None:
+            with mock.patch.object(installer, "run_cli", fake_run_cli), \
+                    mock.patch.object(installer.Engine, "check_env", lambda self: {}), \
+                    mock.patch.object(installer.Engine, "install_node",
+                                      lambda self, env: None), \
+                    mock.patch.object(installer.Engine, "install_pnpm", lambda self: None):
+                installer.Engine(mode="auto", use_mirror=False, log=self.logs.append,
+                                 force=force).run_full(headless=False, start=False)
+
+        full_install(force=False)
+        self.assertEqual(calls, [], "都装好了、也没被打断过，就该跳过")
+
+        installer.set_interrupted_target(str(project))
+        full_install(force=installer.install_was_interrupted(project))
+        self.assertEqual(len(calls), 2, f"被打断过就必须重做依赖与构建：{calls}")
+        self.assertTrue(any("install" in c for c in calls[0]), calls)
+
+    def test_successful_full_install_clears_the_flag(self):
+        project = self._checkout()
+        installer.set_active_dir(project)
+        installer.set_interrupted_target(str(project))
+
+        def fake_run_cli(argv, cwd=None, env=None):
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with mock.patch.object(installer, "run_cli", fake_run_cli), \
+                mock.patch.object(installer.Engine, "check_env", lambda self: {}), \
+                mock.patch.object(installer.Engine, "install_node", lambda self, env: None), \
+                mock.patch.object(installer.Engine, "install_pnpm", lambda self: None):
+            eng = installer.Engine(mode="auto", use_mirror=False, log=self.logs.append,
+                                   force=True)
+            eng.run_full(headless=False, start=False)
+        self.assertFalse(installer.install_was_interrupted(project),
+                         "装完了就该取消标记，别让以后每次安装都白重做一遍")
 
 
 class PluginSourcesTest(unittest.TestCase):
