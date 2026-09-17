@@ -236,16 +236,21 @@ def checkout_identity(path: Path) -> str:
     """这个目录凭什么被认成 DSH 检出；返回判定依据，'' 表示不是。
 
     结构（`package.json` + `pnpm-workspace.yaml`）只是必要条件——任意 pnpm 单仓都满足，
-    所以还要认身份，任意一条成立即可：
+    所以还要认身份，任意一条成立即可（都不会被用来**否决**别的依据）：
+      ⓪ 有本助手写的安装标记（离线装的目录只有这一条）
       ① 根包名 = `@deepseek-ai/dsh-root`（官方根包名，最硬）
       ② 根包名 = `@deepseek-ai/dsh` 或以 `@deepseek-ai/dsh-` 开头（官方改名后仍认）
       ③ `packages/core/` 下存在 `@deepseek-ai/dsh-*` 子包（不依赖**根**包名）
+      ④ `.git/config` 里有含 `deepseek-harness` 的远端（fork 也认，链接里带着仓库名）
     """
     try:
         if not all((path / m).is_file() for m in CHECKOUT_MARKERS):
             return ""
     except OSError:
         return ""
+    marker = read_install_marker(path)
+    if marker:
+        return f"本助手安装标记（{marker.get('mode', '未知')}）"
     name = _pkg_name(path / "package.json")
     if name == DSH_ROOT_PACKAGE:
         return f"根包名 {name}"
@@ -254,6 +259,9 @@ def checkout_identity(path: Path) -> str:
     sub = _dsh_subpackage(path)
     if sub:
         return f"子包 {sub}"
+    for url in _git_remote_urls(path):
+        if SOURCE_DIR_NAME in url.lower():
+            return f"git 远端 {url}"
     return ""
 
 
@@ -284,6 +292,67 @@ def _dsh_subpackage(path: Path, group: str = "core", limit: int = 40) -> str:
 def is_checkout(path: Path) -> bool:
     """该目录是否是一个 DSH 检出（= 已装好，可直接运行、无需重装）。"""
     return bool(checkout_identity(path))
+
+
+# ------------------------------------------------- 安装标记（离线装的身份证）
+INSTALL_MARKER = ".dsh-assistant.json"
+
+
+def write_install_marker(project: Path, mode: str) -> None:
+    """在安装目录写一份「本助手安装」标记，把官方仓库链接一并绑定下来。
+
+    离线解压出来的目录没有 `.git`，这份标记就是它唯一的身份凭据；在线克隆的目录
+    本身有 `.git/config`，标记则额外记下安装方式与时间。
+    """
+    data = {
+        "tool": APP_TITLE,
+        "app": SOURCE_DIR_NAME,
+        "source": HARNESS_GIT_URL,
+        "mode": mode,
+        "installedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    try:
+        (project / INSTALL_MARKER).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        log_line(f"[标记] 写入失败（不影响安装）：{exc}")
+
+
+def read_install_marker(path: Path) -> dict:
+    """读安装标记；不存在/损坏/不是本助手写的 → 返回 {}。"""
+    try:
+        data = json.loads((path / INSTALL_MARKER).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data if str(data.get("tool", "")).startswith("DSH-孤辰小助手") else {}
+
+
+def _git_remote_urls(path: Path) -> list[str]:
+    """从 `.git/config` 读远端 URL——**不启动 git 进程**（0.02ms，比调 git 快千倍）。
+
+    `.git` 可能是文件（worktree/submodule，内容形如 `gitdir: <路径>`），顺着读；
+    没有 `.git`（离线解压出来的目录就是这样）或没配 remote 时返回空列表。
+    """
+    try:
+        dot = path / ".git"
+        if dot.is_file():
+            pointer = dot.read_text(encoding="utf-8", errors="replace").strip()
+            if ":" not in pointer:
+                return []
+            dot = (path / pointer.split(":", 1)[1].strip()).resolve()
+        config = dot / "config"
+        if not config.is_file():
+            return []
+        urls: list[str] = []
+        for line in config.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip().lower().startswith("url") and value.strip():
+                urls.append(value.strip())
+        return urls
+    except (OSError, ValueError):
+        return []
 
 
 def _drive_roots(*, fixed_only: bool = True) -> list[Path]:
@@ -676,6 +745,7 @@ class Engine:
             proc = run(["tar", "-xzf", str(SOURCE_ARCHIVE), "-C", str(project)])
             if proc.returncode != 0:
                 raise InstallError(f"源码解压失败：\n{decode_proc(proc)}")
+            mode = "offline"
         else:
             if _nonempty_dir(project):
                 raise InstallError(
@@ -692,10 +762,13 @@ class Engine:
             proc = run([git, "clone", "--depth", "1", HARNESS_GIT_URL, str(project)])
             if proc.returncode != 0:
                 raise InstallError(f"git clone 失败：\n{decode_proc(proc)}")
+            mode = "online"
         if not is_checkout(project):
             raise InstallError("源码就绪但不是 DSH 检出（缺 package.json/"
                                "pnpm-workspace.yaml），安装中止")
-        self.log(f"  源码就绪：{project}")
+        # 写下标记：离线解压的目录没有 .git，靠它才能被认出来；同时绑定官方链接
+        write_install_marker(project, mode)
+        self.log(f"  源码就绪：{project}（已写入安装标记 {INSTALL_MARKER}）")
         return project
 
     def install_deps(self, project: Path) -> None:

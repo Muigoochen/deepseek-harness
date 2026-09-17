@@ -316,6 +316,67 @@ class InstallDirTest(unittest.TestCase):
         write_plugin_like(root, "packages/core/agent", "@deepseek-ai/dsh-agent")
         self.assertTrue(installer.is_checkout(root))
 
+    # ---- 安装标记（离线装的目录没有 .git，靠它当身份证）----
+
+    def test_marker_identifies_renamed_fork_without_dsh_names(self):
+        """包名全被改过的目录也能靠本助手的标记认出来。"""
+        root = self._make_checkout(self.tmp / "renamed", name="my-dsh-fork")
+        installer.write_install_marker(root, "offline")
+        self.assertEqual(installer.checkout_identity(root),
+                         "本助手安装标记（offline）")
+        self.assertTrue(installer.is_checkout(root))
+
+    def test_marker_rejects_a_foreign_file(self):
+        """别人写的同名文件不算数。"""
+        root = self._make_checkout(self.tmp / "foreign", name="my-app")
+        (root / installer.INSTALL_MARKER).write_text(
+            json.dumps({"tool": "别的工具", "mode": "offline"}), encoding="utf-8")
+        self.assertEqual(installer.checkout_identity(root), "")
+
+    def test_marker_survives_broken_json(self):
+        root = self._make_checkout(self.tmp / "badmarker", name="my-app")
+        (root / installer.INSTALL_MARKER).write_text("{ 坏文件", encoding="utf-8")
+        self.assertEqual(installer.checkout_identity(root), "")
+
+    # ---- git 远端（直接读 .git/config，不启动 git 进程）----
+
+    @staticmethod
+    def _write_git_config(root: Path, url: str) -> None:
+        (root / ".git").mkdir(parents=True, exist_ok=True)
+        (root / ".git" / "config").write_text(
+            '[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n'
+            f"\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+            encoding="utf-8")
+
+    def test_identity_from_git_remote_official(self):
+        root = self._make_checkout(self.tmp / "gitd", name="renamed-root")
+        self._write_git_config(
+            root, "https://github.com/deepseek-ai/deepseek-harness.git")
+        self.assertIn("git 远端", installer.checkout_identity(root))
+        self.assertTrue(installer.is_checkout(root))
+
+    def test_identity_from_git_remote_fork(self):
+        """fork 的远端链接里同样带着仓库名，所以也认。"""
+        root = self._make_checkout(self.tmp / "gitfork", name="renamed-root")
+        self._write_git_config(root, "git@github.com:Muigoochen/deepseek-harness.git")
+        self.assertIn("git 远端", installer.checkout_identity(root))
+
+    def test_identity_rejects_unrelated_git_remote(self):
+        root = self._make_checkout(self.tmp / "gitother", name="my-app")
+        self._write_git_config(root, "git@github.com:someone/my-app.git")
+        self.assertEqual(installer.checkout_identity(root), "")
+
+    def test_identity_follows_gitdir_pointer(self):
+        """`.git` 是文件（worktree/submodule）时顺着指针读。"""
+        root = self._make_checkout(self.tmp / "worktree", name="renamed-root")
+        real = self.tmp / "real-gitdir"
+        real.mkdir(parents=True)
+        (real / "config").write_text(
+            '[remote "origin"]\n\turl = git@github.com:deepseek-ai/deepseek-harness.git\n',
+            encoding="utf-8")
+        (root / ".git").write_text(f"gitdir: {real}\n", encoding="utf-8")
+        self.assertIn("git 远端", installer.checkout_identity(root))
+
     def test_plan_a_default_when_nothing_saved_or_installed(self):
         with mock.patch.object(installer, "detect_installed_dir", return_value=None):
             self.assertEqual(installer.project_dir(), installer.default_project_dir())
@@ -430,8 +491,8 @@ class PrepareSourceTest(unittest.TestCase):
         installer.CONFIG_DIR, installer.CONFIG_PATH = self._old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _engine(self) -> installer.Engine:
-        return installer.Engine(mode="auto", use_mirror=False, log=self.logs.append)
+    def _engine(self, mode: str = "auto") -> installer.Engine:
+        return installer.Engine(mode=mode, use_mirror=False, log=self.logs.append)
 
     def test_refuses_foreign_project_with_package_json(self):
         foreign = self.tmp / "my-app"
@@ -449,6 +510,38 @@ class PrepareSourceTest(unittest.TestCase):
         installer.set_active_dir(root)
         self.assertEqual(self._engine().prepare_source(), root)
         self.assertTrue(any("已检测到现有 DSH" in m for m in self.logs), self.logs)
+
+    def test_offline_install_writes_marker(self):
+        """离线解压出来的目录没有 .git → 装完必须写下安装标记（绑定官方链接）。"""
+        archive = self.tmp / "source.tar.gz"
+        self._make_tiny_archive(archive)
+        project = self.tmp / "deepseek-harness"
+        installer.set_active_dir(project)
+        with mock.patch.object(installer, "SOURCE_ARCHIVE", archive):
+            self.assertEqual(self._engine("offline").prepare_source(), project)
+
+        self.assertFalse((project / ".git").exists(), "离线包本身不含 .git")
+        marker = installer.read_install_marker(project)
+        self.assertEqual(marker["mode"], "offline")
+        self.assertEqual(marker["source"], installer.HARNESS_GIT_URL)
+        self.assertEqual(installer.checkout_identity(project),
+                         "本助手安装标记（offline）")
+
+    @staticmethod
+    def _make_tiny_archive(path: Path) -> None:
+        """造一个只含最小 DSH 结构的源码包（模拟 assets/source.tar.gz）。"""
+        import io
+        import tarfile
+        files = {
+            "package.json": json.dumps({"name": "@deepseek-ai/dsh-root"}),
+            "pnpm-workspace.yaml": "packages: []\n",
+        }
+        with tarfile.open(path, "w:gz") as tf:
+            for name, text in files.items():
+                data = text.encode("utf-8")
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
 
     def _make_checkout(self, root: Path) -> Path:
         root.mkdir(parents=True, exist_ok=True)
