@@ -81,6 +81,7 @@ class RepoInfo:
     dirty: int = 0
     remotes: dict[str, str] = field(default_factory=dict)
     version: str = ""
+    shallow: bool = False
     error: str = ""
 
     @property
@@ -126,20 +127,26 @@ def repo_info(path: Path) -> RepoInfo:
                 remotes[parts[0]] = parts[1]
 
     upstream, ahead, behind = "", 0, 0
+    code, out, _ = run_git(["rev-parse", "--is-shallow-repository"], path)
+    shallow = code == 0 and _first_line(out) == "true"
     code, out, _ = run_git(
         ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], path)
     if code == 0 and out.strip():
         upstream = _first_line(out)
-        code, out, _ = run_git(["rev-list", "--left-right", "--count", "@{u}...HEAD"], path)
-        if code == 0 and out.strip():
-            nums = out.split()
-            if len(nums) == 2:
-                behind, ahead = int(nums[0]), int(nums[1])   # 左=上游独有(落后)，右=本地独有(领先)
+        # 浅克隆（线上安装用的 git clone --depth 1）里祖先关系被截断，
+        # 两个方向都会把边界提交各算一次 → 数字不可信，索性不报（置 0）。
+        if not shallow:
+            code, out, _ = run_git(
+                ["rev-list", "--left-right", "--count", "@{u}...HEAD"], path)
+            if code == 0 and out.strip():
+                nums = out.split()
+                if len(nums) == 2:
+                    behind, ahead = int(nums[0]), int(nums[1])  # 左=上游独有，右=本地独有
 
     return RepoInfo(ok=True, root=root, branch=branch, commit=commit, short=short,
                     subject=subject, committed_at=committed_at, upstream=upstream,
                     ahead=ahead, behind=behind, dirty=dirty, remotes=remotes,
-                    version=_package_version(root))
+                    version=_package_version(root), shallow=shallow)
 
 
 def _package_version(root: Path) -> str:
@@ -213,8 +220,8 @@ def check_update(path: Path, *, remote: str = "origin") -> UpdateStatus:
         return UpdateStatus(ok=False, branch=branch, remote=remote,
                             error=f"没有名为 {remote} 的远端")
 
-    code, _out, err = run_git(["fetch", "--depth", "1", remote, branch], path,
-                              timeout=FETCH_TIMEOUT)
+    # 不带 --depth：带它会给本地仓库凭空加一个浅边界，把本来完整的祖先关系弄断
+    code, _out, err = run_git(["fetch", remote, branch], path, timeout=FETCH_TIMEOUT)
     if code != 0:
         return UpdateStatus(ok=False, branch=branch, remote=remote,
                             error=f"git fetch 失败：{_first_line(err)}")
@@ -224,12 +231,79 @@ def check_update(path: Path, *, remote: str = "origin") -> UpdateStatus:
     code, out, _ = run_git(["log", "-1", "--format=%s", "FETCH_HEAD"], path)
     subject = _first_line(out) if code == 0 else ""
 
+    # 落后数用 `HEAD..FETCH_HEAD`：浅克隆里也准（数的是远端独有的提交）。
+    # 领先数在浅克隆里会被边界提交污染，所以只在完整克隆上才报。
     behind = ahead = 0
-    code, out, _ = run_git(["rev-list", "--left-right", "--count", "FETCH_HEAD...HEAD"], path)
+    code, out, _ = run_git(["rev-list", "--count", "HEAD..FETCH_HEAD"], path)
     if code == 0 and out.strip():
-        nums = out.split()
-        if len(nums) == 2:
-            behind, ahead = int(nums[0]), int(nums[1])
+        behind = int(out.strip().split()[0])
+    code, out, _ = run_git(["rev-parse", "--is-shallow-repository"], path)
+    shallow = code == 0 and _first_line(out) == "true"
+    if not shallow:
+        code, out, _ = run_git(["rev-list", "--count", "FETCH_HEAD..HEAD"], path)
+        if code == 0 and out.strip():
+            ahead = int(out.strip().split()[0])
 
     return UpdateStatus(ok=True, behind=behind, ahead=ahead, branch=branch,
                         remote=remote, latest=latest, latest_subject=subject)
+
+
+@dataclass(frozen=True)
+class UpdateResult:
+    """一次更新的结果；changed=False 表示本来就是最新（不是失败）。"""
+    ok: bool
+    changed: bool = False
+    before: str = ""
+    after: str = ""
+    subject: str = ""
+    behind: int = 0
+    error: str = ""
+
+
+def update_repo(path: Path, *, remote: str = "origin") -> UpdateResult:
+    """把安装目录**快进**到远端最新。只走 fast-forward，绝不产生合并提交。
+
+    三道前置检查，任一不过就拒绝并说明原因，绝不硬来：
+    ① 工作区必须干净——否则可能覆盖用户自己的改动；
+    ② 必须在分支上、远端可达；
+    ③ 「能不能快进」**交给 git 自己判断**（`merge --ff-only`），不自己数提交数：
+       线上安装用的是 `git clone --depth 1`（浅克隆），祖先关系被截断，
+       `rev-list` 两个方向都会把边界提交各算一次，自己算会误判成「有本地独有提交」而瞎拒绝；
+       而 git 的合并机制在浅克隆里判断是准的。
+    于是「已是最新」返回 `changed=False` 的成功，而不是失败。
+    """
+    info = repo_info(path)
+    if not info.ok:
+        return UpdateResult(ok=False, error=info.error)
+    if info.dirty:
+        return UpdateResult(ok=False, error=(
+            f"工作区有 {info.dirty} 处本地改动；为避免覆盖你的改动，"
+            "请先提交或撤销这些改动，再更新"))
+    if not info.branch or info.branch == "HEAD":
+        return UpdateResult(ok=False, error="处于分离头（detached HEAD）状态，无法更新")
+    if remote not in info.remotes:
+        return UpdateResult(ok=False, error=f"没有名为 {remote} 的远端")
+
+    code, _out, err = run_git(["fetch", remote, info.branch], path,
+                              timeout=FETCH_TIMEOUT)
+    if code != 0:
+        return UpdateResult(ok=False, error=f"git fetch 失败：{_first_line(err)}")
+
+    behind = 0
+    code, out, _ = run_git(["rev-list", "--count", "HEAD..FETCH_HEAD"], path)
+    if code == 0 and out.strip():
+        behind = int(out.strip().split()[0])
+    if behind == 0:
+        return UpdateResult(ok=True, changed=False, before=info.short, after=info.short)
+
+    code, _out, err = run_git(["merge", "--ff-only", "FETCH_HEAD"], path)
+    if code != 0:
+        return UpdateResult(ok=False, behind=behind, error=(
+            "不是快进关系（你本地可能有自己的提交），已中止，你的文件没有被改动。"
+            f"git 说：{_first_line(err) or '无法快进'}"))
+    code, out, _ = run_git(["rev-parse", "--short", "HEAD"], path)
+    after = _first_line(out) if code == 0 else ""
+    code, out, _ = run_git(["log", "-1", "--format=%s"], path)
+    subject = _first_line(out) if code == 0 else ""
+    return UpdateResult(ok=True, changed=True, before=info.short, after=after,
+                        subject=subject, behind=behind)

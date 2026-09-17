@@ -155,8 +155,8 @@ class IdentityTest(unittest.TestCase):
 
 
 @unittest.skipIf(GIT is None, "未安装 git，跳过 git 层测试")
-class CheckUpdateTest(unittest.TestCase):
-    """用本地裸仓库当 origin：不需要网络也能验证落后计数。"""
+class OriginPairTest(unittest.TestCase):
+    """本地裸仓库当 origin + 一个克隆：不联网也能验证比对与快进。"""
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="dsh-git-"))
@@ -170,10 +170,22 @@ class CheckUpdateTest(unittest.TestCase):
         git("clone", "-q", str(self.origin), str(self.work), cwd=self.tmp)
         # 让本地 HEAD 跟踪 origin/main，供 repo_info 读 ahead/behind
         git("branch", "-q", "--set-upstream-to=origin/main", "main", cwd=self.work)
+        self.head_before = git("rev-parse", "--short", "HEAD", cwd=self.work).strip()
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def remote_commit(self, name: str = "CHANGELOG.md", text: str = "new\n",
+                      message: str = "远端新提交") -> None:
+        """在 origin 侧造一个提交，模拟别人推出了新版本。"""
+        (self.seed / name).write_text(text, encoding="utf-8")
+        git("add", "-A", cwd=self.seed)
+        git("commit", "-q", "-m", message, cwd=self.seed)
+        git("push", "-q", "origin", "main", cwd=self.seed)
+
+
+@unittest.skipIf(GIT is None, "未安装 git，跳过 git 层测试")
+class CheckUpdateTest(OriginPairTest):
     def test_reports_up_to_date(self) -> None:
         status = gi.check_update(self.work)
         self.assertTrue(status.ok, status.error)
@@ -181,11 +193,7 @@ class CheckUpdateTest(unittest.TestCase):
         self.assertEqual(status.branch, "main")
 
     def test_detects_new_commits_on_remote(self) -> None:
-        (self.seed / "CHANGELOG.md").write_text("new\n", encoding="utf-8")
-        git("add", "-A", cwd=self.seed)
-        git("commit", "-q", "-m", "远端新提交", cwd=self.seed)
-        git("push", "-q", "origin", "main", cwd=self.seed)
-
+        self.remote_commit()
         status = gi.check_update(self.work)
         self.assertTrue(status.ok, status.error)
         self.assertEqual(status.behind, 1)
@@ -202,6 +210,106 @@ class CheckUpdateTest(unittest.TestCase):
         status = gi.check_update(self.work, remote="broken")
         self.assertFalse(status.ok)
         self.assertIn("fetch 失败", status.error)
+
+
+@unittest.skipIf(GIT is None, "未安装 git，跳过 git 层测试")
+class UpdateRepoTest(OriginPairTest):
+    def test_reports_already_latest_without_changes(self) -> None:
+        res = gi.update_repo(self.work)
+        self.assertTrue(res.ok, res.error)
+        self.assertFalse(res.changed)
+        self.assertEqual(res.after, self.head_before)
+
+    def test_fast_forwards_to_remote_head(self) -> None:
+        self.remote_commit()
+        res = gi.update_repo(self.work)
+        self.assertTrue(res.ok, res.error)
+        self.assertTrue(res.changed)
+        self.assertEqual(res.before, self.head_before)
+        self.assertNotEqual(res.after, self.head_before)
+        self.assertEqual(res.subject, "远端新提交")
+        # 文件真的落地了，且与远端不再有差距
+        self.assertTrue((self.work / "CHANGELOG.md").exists())
+        self.assertEqual(gi.repo_info(self.work).behind, 0)
+
+    def test_refuses_dirty_working_tree(self) -> None:
+        self.remote_commit()
+        (self.work / "package.json").write_text("{}", encoding="utf-8")
+        res = gi.update_repo(self.work)
+        self.assertFalse(res.ok)
+        self.assertIn("本地改动", res.error)
+        # 拒绝时绝不半途改工作区
+        self.assertEqual(gi.repo_info(self.work).short, self.head_before)
+        self.assertFalse((self.work / "CHANGELOG.md").exists())
+
+    def test_refuses_when_local_has_own_commits(self) -> None:
+        self.remote_commit()
+        (self.work / "mine.txt").write_text("x", encoding="utf-8")
+        git("add", "-A", cwd=self.work)
+        git("commit", "-q", "-m", "我自己的提交", cwd=self.work)
+        res = gi.update_repo(self.work)
+        self.assertFalse(res.ok)
+        self.assertIn("不是快进关系", res.error)
+        # 拒绝时保持原样：本地提交还在，远端提交没被拉进来
+        self.assertEqual(gi.repo_info(self.work).subject, "我自己的提交")
+        self.assertFalse((self.work / "CHANGELOG.md").exists())
+
+    def test_refuses_without_remote(self) -> None:
+        res = gi.update_repo(self.work, remote="upstream")
+        self.assertFalse(res.ok)
+        self.assertIn("远端", res.error)
+
+
+@unittest.skipIf(GIT is None, "未安装 git，跳过 git 层测试")
+class ShallowUpdateTest(OriginPairTest):
+    """线上安装用的是 `git clone --depth 1`（浅克隆）——这是**真实**的安装形态。
+
+    浅克隆里祖先关系被截断，`rev-list` 数提交数会把边界提交各算一次，
+    所以「能不能快进」必须交给 git 自己判断，不能自己数。
+    """
+
+    def make_shallow_clone(self) -> Path:
+        work = self.tmp / "shallow"
+        # 必须走 file:// 才会真的浅克隆（本地路径 git 会忽略 --depth）
+        url = "file:///" + str(self.origin).replace("\\", "/")
+        git("clone", "-q", "--depth", "1", url, str(work), cwd=self.tmp)
+        git("branch", "-q", "--set-upstream-to=origin/main", "main", cwd=work)
+        self.assertEqual(
+            git("rev-parse", "--is-shallow-repository", cwd=work).strip(), "true")
+        return work
+
+    def test_repo_info_marks_shallow(self) -> None:
+        info = gi.repo_info(self.make_shallow_clone())
+        self.assertTrue(info.ok, info.error)
+        self.assertTrue(info.shallow)
+
+    def test_still_detects_new_remote_commits(self) -> None:
+        work = self.make_shallow_clone()
+        self.remote_commit()
+        status = gi.check_update(work)
+        self.assertTrue(status.ok, status.error)
+        self.assertEqual(status.behind, 1)      # 落后数在浅克隆里也准
+        self.assertEqual(status.ahead, 0)       # 浅克隆下不报领先，避免报错数
+        self.assertEqual(status.latest_subject, "远端新提交")
+
+    def test_fast_forwards_in_shallow_clone(self) -> None:
+        work = self.make_shallow_clone()
+        self.remote_commit()
+        res = gi.update_repo(work)
+        self.assertTrue(res.ok, res.error)
+        self.assertTrue(res.changed)
+        self.assertEqual(res.subject, "远端新提交")
+        self.assertTrue((work / "CHANGELOG.md").exists())
+        self.assertEqual(gi.check_update(work).behind, 0)
+
+    def test_refuses_dirty_tree_in_shallow_clone(self) -> None:
+        work = self.make_shallow_clone()
+        self.remote_commit()
+        (work / "package.json").write_text("{}", encoding="utf-8")
+        res = gi.update_repo(work)
+        self.assertFalse(res.ok)
+        self.assertIn("本地改动", res.error)
+        self.assertFalse((work / "CHANGELOG.md").exists())
 
 
 if __name__ == "__main__":

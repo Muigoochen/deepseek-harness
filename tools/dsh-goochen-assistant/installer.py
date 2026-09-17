@@ -795,8 +795,8 @@ class Engine:
         self.log(f"  源码就绪：{project}（已写入安装标记 {INSTALL_MARKER}）")
         return project
 
-    def install_deps(self, project: Path) -> None:
-        if (project / "node_modules").exists():
+    def install_deps(self, project: Path, *, force: bool = False) -> None:
+        if not force and (project / "node_modules").exists():
             self.log("⑤ node_modules 已存在，跳过依赖安装")
             return
         self.log("⑤ 安装项目依赖 …")
@@ -812,8 +812,8 @@ class Engine:
             raise InstallError(f"依赖安装失败：\n{decode_proc(proc)}")
         self.log("  依赖安装完成（离线模式几十秒，在线模式视网速）")
 
-    def build(self, project: Path) -> None:
-        if (project / BUILD_MARK).exists():
+    def build(self, project: Path, *, force: bool = False) -> None:
+        if not force and (project / BUILD_MARK).exists():
             self.log("⑥ 构建产物已存在，跳过 pnpm run build")
             return
         self.log("⑥ 编译项目（本地编译、不联网；首次约 5–15 分钟）…")
@@ -957,6 +957,9 @@ class App(tk.Tk):
         self.btn_git_update = ttk.Button(grow, text="检查更新", width=10,
                                          command=self.on_check_update)
         self.btn_git_update.pack(side="left", padx=(6, 0))
+        self.btn_git_apply = ttk.Button(grow, text="更新到最新", width=11,
+                                        command=self.on_update_now)
+        self.btn_git_apply.pack(side="left", padx=(6, 0))
         self.git_note = ttk.Label(grow, text="检查更新需要联网", foreground="#888",
                                   font=("Microsoft YaHei UI", 8))
         self.git_note.pack(side="left", padx=(8, 0))
@@ -1291,7 +1294,7 @@ class App(tk.Tk):
         if info.branch:
             bits.append(f"分支 {info.branch}")
         bits.append("工作区干净" if info.dirty == 0 else f"工作区有 {info.dirty} 处本地改动")
-        if info.upstream:
+        if info.upstream and not info.shallow:
             bits.append(f"相对 {info.upstream}：领先 {info.ahead} / 落后 {info.behind}")
         self._set_label(self.git_info_lbl, " · ".join(bits) + f"\n依据：{evidence}",
                         "#1a6b1a")
@@ -1304,7 +1307,7 @@ class App(tk.Tk):
 
     def _set_git_buttons(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
-        for btn in (self.btn_git_refresh, self.btn_git_update):
+        for btn in (self.btn_git_refresh, self.btn_git_update, self.btn_git_apply):
             try:
                 btn.configure(state=state)
             except Exception:  # noqa: BLE001  同上：窗口可能已销毁
@@ -1343,6 +1346,80 @@ class App(tk.Tk):
         if status.ahead:
             text += f"；本地领先 {status.ahead} 个提交"
         self._set_label(self.git_note, text, color)
+
+    def on_update_now(self) -> None:
+        """把安装目录**快进**到远端最新，再重装依赖、重新构建。"""
+        if self.git_busy or self.busy:
+            return
+        target = self._effective_dir()
+        info = ginfo.repo_info(target)
+        confirmed, evidence = verify_install_dir(target, info)
+        if not confirmed:
+            messagebox.showerror("无法更新", f"{target}\n\n{evidence}", parent=self)
+            return
+        if info.dirty:
+            messagebox.showwarning(
+                "无法更新",
+                f"工作区有 {info.dirty} 处本地改动。\n\n"
+                "为避免覆盖你自己的改动，请先提交或撤销这些改动，再更新。",
+                parent=self)
+            return
+        if not messagebox.askyesno(
+                "更新到最新",
+                f"目录：{target}\n"
+                f"当前：{info.short}（分支 {info.branch}）\n"
+                f"写法：git fetch → 只做快进（不产生合并提交，也不动你已提交的内容）\n"
+                f"之后：重装依赖 → 重新构建（首次较慢）\n\n继续吗？",
+                parent=self):
+            return
+        # 服务在跑就先停：Windows 上 node_modules 里的文件被占用时无法被替换
+        was_running = self.web_proc is not None and self.web_proc.poll() is None
+        if was_running:
+            self._stop_web_internal(quiet=False)
+        self.git_busy = True
+        self._set_git_buttons(False)
+        self._set_label(self.git_note, "正在更新…（进度见下方日志）", "#a05a00")
+        mirror = bool(self.mirror.get())           # Tk 变量只在界面线程读
+        threading.Thread(target=self._update_worker,
+                         args=(target, was_running, mirror), daemon=True).start()
+
+    def _update_worker(self, target: Path, was_running: bool, mirror: bool) -> None:
+        eng = Engine(mode="auto", use_mirror=mirror, log=self._append)
+        try:
+            self._append(f"[更新] 正在比对 {target} 与远端 …")
+            res = ginfo.update_repo(target)
+            if not res.ok:
+                self._post(self._update_done, False, res.error, was_running)
+                return
+            if not res.changed:
+                self._append("[更新] 已是最新，无需更新。")
+                self._post(self._update_done, True, "已是最新", was_running)
+                return
+            self._append(f"[更新] 已快进 {res.before} → {res.after}：{res.subject}")
+            self._append("[更新] 源码有变化，重新装依赖并重新构建 …")
+            eng.install_deps(target, force=True)
+            eng.build(target, force=True)
+        except Exception as exc:  # noqa: BLE001  依赖/构建失败原因要如实报给用户
+            self._post(self._update_done, False, str(exc), was_running)
+            return
+        self._post(self._update_done, True, f"{res.before} → {res.after}", was_running)
+
+    def _update_done(self, ok: bool, detail: str, was_running: bool) -> None:
+        self.git_busy = False
+        self._set_git_buttons(True)
+        if not ok:
+            self._append(f"[更新] ✗ 更新失败：{detail}")
+            if was_running:
+                self._append("[更新] 服务已停止（更新前在运行）；"
+                             "处理完上面的问题后点【运行】重新启动。")
+            self._set_label(self.git_note, f"更新失败：{detail}", "#b00000")
+            return
+        self._append(f"[更新] ✓ 更新完成：{detail}")
+        self._set_label(self.git_note, f"✓ 更新完成（{detail}）", "#1a6b1a")
+        self._schedule_git_refresh(200)
+        if was_running:
+            self._append("[更新] 服务原本在运行，正在重新启动 …")
+            self.on_terminal()
 
     def _job(self, eng: Engine) -> None:
         try:
@@ -2519,9 +2596,11 @@ def selfcheck() -> int:
             log_line(f"提交       : {info.short}  {info.subject}")
             log_line(f"提交时间   : {info.committed_at}")
         if info.branch:
-            log_line(f"分支       : {info.branch}"
-                     f"（相对 {info.upstream}：领先 {info.ahead} / 落后 {info.behind}）"
-                     if info.upstream else f"分支       : {info.branch}")
+            note = ""
+            if info.upstream and not info.shallow:
+                note = f"（相对 {info.upstream}：领先 {info.ahead} / 落后 {info.behind}）"
+            log_line(f"分支       : {info.branch}{note}")
+        log_line(f"克隆方式   : {'浅克隆（--depth 1，本地独有提交数算不准，更新交给 git 判断）' if info.shallow else '完整克隆'}")
         log_line(f"工作区     : {'干净' if info.dirty == 0 else f'有 {info.dirty} 处本地改动'}")
         for name, url in info.remotes.items():
             log_line(f"远端 {name:<7}: {url}")
