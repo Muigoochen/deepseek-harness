@@ -10,6 +10,7 @@ Windows 上父进程结束不会带走子进程，而安装/构建的工作线�
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -69,6 +70,20 @@ class TrackTest(unittest.TestCase):
             childproc.run([sys.executable, "-c", "import time; time.sleep(30)"],
                           timeout=0.5)
         self.assertEqual(childproc.running(), 0, "超时的命令不能留在登记表里")
+
+    def test_job_object_is_available_on_windows(self):
+        """Job Object 是「父死子必死」的保险：Windows 上应当总能建出来。"""
+        self.assertIsInstance(childproc.job_available(), bool)
+        if os.name == "nt":
+            self.assertTrue(childproc.job_available())
+
+    def test_assign_reports_failure_instead_of_raising(self):
+        """放进 Job 失败（例如已在别的 Job 里且不允许嵌套）也只返回 False，不抛。"""
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)"])
+        try:
+            self.assertIsInstance(childproc.assign(proc), bool)
+        finally:
+            childproc.kill_tree(proc)
 
 
 @unittest.skipIf(NODE is None, "需要 node 才能造「父进程 + 孙子进程」的真实进程树")

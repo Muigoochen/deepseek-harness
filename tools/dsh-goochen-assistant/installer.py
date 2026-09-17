@@ -1372,7 +1372,15 @@ class App(tk.Tk):
     # ---------------- 版本与更新（结论全部来自真实 git 命令）----------------
 
     def _schedule_git_refresh(self, delay: int = 400) -> None:
-        """输入变化后延迟跑一次 git 探测（一次约 0.2 秒，不能每敲一键就跑）。"""
+        """输入变化后延迟跑一次 git 探测（一次约 0.2 秒，不能每敲一键就跑）。
+
+        可能被工作线程调用（登录地址是在读日志的线程里捕获的），所以排期统一
+        交给界面线程做——tkinter 的 after 只允许主线程调用。
+        """
+        self._post(self._arm_git_refresh, delay)
+
+    def _arm_git_refresh(self, delay: int) -> None:
+        """界面线程侧：取消上一次待跑的，重排一次。"""
         if self._closing:
             return
         if self._git_after is not None:
@@ -1567,22 +1575,21 @@ class App(tk.Tk):
             self.on_terminal()
 
     def _job(self, eng: Engine) -> None:
+        """安装/构建的工作线程：碰界面一律经 _post（tkinter 不是线程安全的）。"""
         try:
             self._status("安装进行中…", "#b36b00")
             eng.run_full(headless=False, start=True)
             self._status("完成 ✓ 已启动网页版", "#1a6b1a")
-            messagebox.showinfo("完成", f"安装完成！\n浏览器将打开 {WEB_URL}。\n"
-                                        "日常使用点「运行」。")
+            self._post(messagebox.showinfo, "完成",
+                       f"安装完成！\n浏览器将打开 {WEB_URL}。\n日常使用点「运行」。")
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             self._append(f"\n✗ 失败：{msg}")
             self._status("失败 ✗（详情见日志，可复制反馈）", "#b00000")
-            try:
-                messagebox.showerror("操作失败", msg)
-            except Exception:  # noqa: BLE001
-                pass
+            self._post(messagebox.showerror, "操作失败", msg)
         finally:
-            self._set_busy(False)
+            self.busy = False                     # 立刻生效，按钮不用多禁用一会儿
+            self._post(self._set_busy, False)     # 界面线程侧刷新按钮
 
     def _resolve_web_project(self) -> Path | None:
         """可运行的项目目录：界面当前选择/配置/自动检测到的已安装位。
@@ -1648,6 +1655,7 @@ class App(tk.Tk):
             self._append(f"[终端] ✗ 启动失败：{exc}")
             return False
         self.web_proc = proc
+        childproc.track(proc)           # 登记进 Job：就算本进程被强杀，它也会跟着结束
         self._update_run_buttons()
         self._status("dsh web 运行中（输出见日志区）", "#1a6b1a")
         threading.Thread(target=self._pump_web, args=(proc,), daemon=True).start()
@@ -1720,11 +1728,9 @@ class App(tk.Tk):
             else:
                 self._append("[运行验证] 服务跑起来了，但安装标记写不进去（目录不可写？），"
                              "下次仍需人工确认。")
-        try:
-            self.after(0, self._update_web_buttons)
-            self.after(0, self._poll_pending_open)
-        except Exception:  # noqa: BLE001  窗口已销毁时 after 会报错，忽略
-            pass
+        # 本方法由读日志的工作线程调用：界面更新一律走 _post
+        self._post(self._update_web_buttons)
+        self._post(self._poll_pending_open)
 
     def _open_selected_browser(self, url: str) -> None:
         message = open_in_browser(self.browser_var.get(), self.custom_browser, url)
@@ -1809,10 +1815,13 @@ class App(tk.Tk):
             if self.web_proc is proc:
                 self.web_proc = None
             self.web_auth_url = None
-            self._update_web_buttons()
-            self.after(0, self._poll_pending_open)
-            self.after(0, self._update_run_buttons)
-            self.after(0, lambda: self._status("就绪"))
+            childproc.untrack(proc)
+            # 这里是**工作线程**（读子进程输出那个）：碰界面一律走 _post 队列。
+            # 直接用 after()/控件方法在别的线程里不是线程安全的。
+            self._post(self._update_web_buttons)
+            self._post(self._poll_pending_open)
+            self._post(self._update_run_buttons)
+            self._post(self._status, "就绪")
 
     def on_stop_terminal(self) -> None:
         """终止窗口内运行的 dsh web（连同其子进程树）。"""
@@ -2847,6 +2856,7 @@ def selfcheck() -> int:
     log_line(f"Windows    : {os.environ.get('OS', '?')} / "
              f"{os.environ.get('PROCESSOR_ARCHITECTURE', '?')}")
     log_line(f"管理员权限 : {'是' if is_admin() else '否'}")
+    log_line(f"关窗保险   : {'✓ 子进程已绑定 Job Object（本进程无论怎么死都跟着结束）' if childproc.job_available() else '— 不可用，仅正常关窗时结束子进程'}")
 
     node = find_node()
     if node:
