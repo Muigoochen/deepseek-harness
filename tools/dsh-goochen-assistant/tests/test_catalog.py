@@ -512,8 +512,8 @@ class VerifyInstallDirTest(unittest.TestCase):
         self.assertTrue(ident.ok, ident.evidence)
         self.assertEqual(ident.tier, "unofficial")
 
-    def test_same_name_repo_without_dsh_content_is_rejected(self):
-        """**关键安全用例**：碰巧也叫 deepseek-harness 的仓库，内容不像 DSH → 拒绝。"""
+    def test_same_name_repo_without_dsh_content_is_only_suspect(self):
+        """碰巧也叫 deepseek-harness 的仓库：不确认，但也不硬拒——留一句「可以试跑」。"""
         repo = self.tmp / "lookalike"
         repo.mkdir()
         (repo / "README.md").write_text("不是 DSH\n", encoding="utf-8")
@@ -523,22 +523,65 @@ class VerifyInstallDirTest(unittest.TestCase):
         add_remote(repo, "origin", "git@github.com:bob/deepseek-harness.git")
         ident = installer.verify_install_dir(repo)
         self.assertFalse(ident.ok)
+        self.assertEqual(ident.tier, "suspect")
         self.assertIn("内容不像 DSH", ident.evidence)
+        self.assertIn("试跑", ident.evidence)
 
-    def test_own_project_with_official_remote_is_rejected(self):
+    def test_own_project_with_official_remote_is_not_confirmed(self):
         """**关键安全用例**：自己的单仓里只是加了官方远端 → 绝不能当 DSH 跑 pnpm。"""
         repo = make_repo(self.tmp / "myapp", root_name="my-app")
         add_remote(repo, "upstream",
                    "https://github.com/deepseek-ai/deepseek-harness.git")
         ident = installer.verify_install_dir(repo)
         self.assertFalse(ident.ok)
+        self.assertEqual(ident.tier, "suspect")
         self.assertIn("内容不像 DSH", ident.evidence)
         self.assertFalse(installer.is_checkout(repo))
 
-    def test_plain_pnpm_repo_without_remote_is_rejected(self):
+    def test_plain_pnpm_repo_without_remote_is_not_confirmed(self):
         repo = make_repo(self.tmp / "plain", root_name="my-app")
         ident = installer.verify_install_dir(repo)
         self.assertFalse(ident.ok)
+        self.assertEqual(ident.tier, "suspect")
+
+    # ---- 运行验证：两条证据都不成立时，用「能不能真的跑起来」定案 ----
+
+    def test_verified_run_turns_suspect_into_confirmed(self):
+        """认不出的目录跑成功一次 → 记进安装标记 → 从此按已安装处理。"""
+        repo = make_repo(self.tmp / "renamed", root_name="totally-renamed")
+        self.assertEqual(installer.verify_install_dir(repo).tier, "suspect")
+
+        self.assertTrue(installer.mark_run_verified(repo))
+        ident = installer.verify_install_dir(repo)
+        self.assertTrue(ident.ok, ident.evidence)
+        self.assertEqual(ident.tier, "file")
+        self.assertIn("运行验证通过", ident.evidence)
+        self.assertTrue(installer.is_checkout(repo))
+
+    def test_verified_run_keeps_the_original_install_mode(self):
+        """离线安装写的标记只补一个字段，不覆盖原有安装方式。"""
+        root = self.tmp / "offline"
+        root.mkdir()
+        installer.write_install_marker(root, "offline")
+        self.assertTrue(installer.mark_run_verified(root))
+        marker = installer.read_install_marker(root)
+        self.assertEqual(marker["mode"], "offline")
+        self.assertTrue(marker[installer.RUN_VERIFIED_KEY])
+
+    def test_verified_run_is_idempotent(self):
+        root = self.tmp / "twice"
+        root.mkdir()
+        self.assertTrue(installer.mark_run_verified(root))
+        first = installer.read_install_marker(root)["installedAt"]
+        self.assertTrue(installer.mark_run_verified(root))
+        marker = installer.read_install_marker(root)
+        self.assertEqual(marker["installedAt"], first)      # 首装时间不被刷掉
+        self.assertEqual(len(list(root.glob(".dsh-assistant.json"))), 1)
+
+    def test_verified_run_on_unwritable_dir_reports_failure(self):
+        """写不进去就如实返回失败（界面据此提示「下次仍需人工确认」）。"""
+        root = self.tmp / "nope"
+        self.assertFalse(installer.mark_run_verified(root))
 
     def test_offline_dir_without_git_uses_marker(self):
         """离线装出来的目录没有 `.git`：靠安装标记判为 tier=file。"""

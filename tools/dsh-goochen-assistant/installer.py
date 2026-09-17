@@ -255,7 +255,8 @@ def checkout_identity(path: Path) -> str:
         return ""
     marker = read_install_marker(path)
     if marker:
-        return f"本助手安装标记（{marker.get('mode', '未知')}）"
+        tag = "，运行验证通过" if marker.get(RUN_VERIFIED_KEY) else ""
+        return f"本助手安装标记（{marker.get('mode', '未知')}{tag}）"
     name = _pkg_name(path / "package.json")
     if name == DSH_ROOT_PACKAGE:
         return f"根包名 {name}"
@@ -318,11 +319,17 @@ def verify_install_dir(path: Path, info=None) -> ginfo.DshIdentity:
     if ident.ok:
         if why:
             return ident
-        return ginfo.DshIdentity(False, "none", (
+        return ginfo.DshIdentity(False, "suspect", (
             f"{ident.evidence}；但目录内容不像 DSH"
-            "（既没有官方包名，也没有本助手的安装标记）"))
+            "（既没有官方包名，也没有本助手的安装标记）"
+            "——可以先点【运行】试跑一次，跑起来了就说明是"))
     if why:
         return ginfo.DshIdentity(True, "file", why)
+    if _nonempty_dir(path):
+        return ginfo.DshIdentity(False, "suspect", (
+            "目录里已有内容，但认不出这是 DSH"
+            "（没有官方包名/安装标记，远端也不像）"
+            "——可以先点【运行】试跑一次，跑起来了就说明是"))
     return ginfo.DshIdentity(False, "none", ident.evidence)
 
 
@@ -348,6 +355,36 @@ def write_install_marker(project: Path, mode: str) -> None:
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as exc:
         log_line(f"[标记] 写入失败（不影响安装）：{exc}")
+
+
+#: 安装标记里记「真的把 dsh web 跑起来过」的字段。
+RUN_VERIFIED_KEY = "verifiedByRun"
+
+
+def mark_run_verified(project: Path) -> bool:
+    """记下「这个目录真的把 dsh web 跑起来过」；返回是否写入成功。
+
+    **运行验证是最硬的一份证据**：`pnpm dsh web` 只有在目录里确实有 DSH 时才打得开网页。
+    内容认不出、远端也认不出时，就靠它定案——跑成功了从此按「本助手安装标记」认这个目录。
+    已有标记（例如离线安装写的）只补一个字段，不覆盖原有安装方式。
+    """
+    data = read_install_marker(project)
+    if not data:
+        data = {
+            "tool": APP_TITLE,
+            "app": SOURCE_DIR_NAME,
+            "source": HARNESS_GIT_URL,
+            "mode": "run-verified",
+            "installedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+    data[RUN_VERIFIED_KEY] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        (project / INSTALL_MARKER).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except OSError as exc:
+        log_line(f"[标记] 写入运行验证失败：{exc}")
+        return False
 
 
 def read_install_marker(path: Path) -> dict:
@@ -742,7 +779,9 @@ class Engine:
                 f"{project}\n"
                 "这个目录里有 package.json，但它不是一个 DSH 检出。\n"
                 "为避免在无关项目里执行 pnpm 安装/构建，安装已中止。\n"
-                "请把「安装位置」换成空目录，或指向已装好的 DeepSeek Harness 目录。")
+                "请把「安装位置」换成空目录，或指向已装好的 DeepSeek Harness 目录。\n"
+                "如果它其实是你自己改过的 DSH（例如包名全改了），可以先点【运行】试跑一次：\n"
+                "能打开网页就说明确实是，我会把它记下来，之后就能直接复用。")
         self.log(f"④ 准备项目源码 → {project}")
         offline = self.use_offline(
             SOURCE_ARCHIVE.exists() or STORE_DIR.exists(),
@@ -864,6 +903,8 @@ class App(tk.Tk):
         self.git_busy = False
         self._git_after: str | None = None
         self._closing = False
+        # 还没被确认身份、正在靠「试跑」定案的目录（跑成功就记进安装标记）
+        self._unconfirmed_dir: Path | None = None
         # 工作线程 → 界面线程的唯一安全通道（见 _post）
         self._ui_queue: queue.Queue = queue.Queue()
         self._build_ui()
@@ -1213,6 +1254,9 @@ class App(tk.Tk):
             text, color = "✗ " + errors[0], "#b00000"
         elif why:
             text, color = f"✓ 已检测到已安装的 DSH（{why}），将直接使用", "#1a6b1a"
+        elif _nonempty_dir(target):
+            text = "？这里有内容，但认不出是 DSH —— 可以先点【运行】试跑确认"
+            color = "#a05a00"
         elif warns:
             shown = "；".join(warns[:2]) + ("…" if len(warns) > 2 else "")
             text, color = "⚠ " + shown, "#a05a00"
@@ -1266,8 +1310,10 @@ class App(tk.Tk):
         self.git_busy = False
         self._set_git_buttons(True)
         if not ident.ok:
-            self._set_label(self.git_info_lbl, f"✗ 未确认是 DSH 安装：{ident.evidence}",
-                            "#b00000")
+            suspect = ident.tier == "suspect"
+            head = "？无法确认是不是 DSH" if suspect else "✗ 未确认是 DSH 安装"
+            self._set_label(self.git_info_lbl, f"{head}：{ident.evidence}",
+                            "#a05a00" if suspect else "#b00000")
             return
         bits: list[str] = []
         if info.version:
@@ -1466,10 +1512,9 @@ class App(tk.Tk):
         """启动内嵌 dsh web（stdout 流式进日志）。返回是否成功启动。"""
         project = self._resolve_web_project()
         if project is None:
-            messagebox.showerror("未找到项目",
-                                 f"找不到已安装的 deepseek-harness。请先执行「一键完整安装」。\n"
-                                 f"已检查：{project_dir()}")
-            return False
+            project = self._offer_unconfirmed_run()
+            if project is None:
+                return False
         if shutil.which("pnpm") is None:
             messagebox.showerror("缺少 pnpm",
                                  "未检测到 pnpm。请先执行「一键完整安装」。")
@@ -1535,14 +1580,49 @@ class App(tk.Tk):
             return
         self.after(400, self._poll_pending_open)
 
+    def _offer_unconfirmed_run(self) -> Path | None:
+        """两条身份证据都不成立时：**先提醒，再由用户决定要不要试跑**。
+
+        「能不能真的跑起来」比读包名更硬：`pnpm dsh web` 只有在目录里确实是 DSH 时
+        才打得开网页。跑成功 → 记进安装标记（运行验证通过），以后直接认；跑失败 →
+        说明它不是，原因就摆在日志里。
+        """
+        target = project_dir()
+        ident = verify_install_dir(target)
+        if ident.tier != "suspect":
+            messagebox.showerror(
+                "未找到项目",
+                f"找不到已安装的 deepseek-harness。请先执行「一键完整安装」。\n"
+                f"已检查：{target}")
+            return None
+        if not messagebox.askyesno(
+                "不确定这是不是 DSH",
+                f"目录：{target}\n\n{ident.evidence}\n\n"
+                "要试着运行一次吗？能打开网页就说明它确实是 DSH，我会记下来，"
+                "以后这个目录就直接按已安装处理；跑不起来就说明不是——"
+                "失败原因会显示在日志里。", parent=self):
+            return None
+        self._unconfirmed_dir = target
+        return target
+
     def _on_auth_url(self, url: str) -> None:
         """记录从 dsh web 输出里捕获的登录地址并刷新按钮状态。"""
         self.web_auth_url = url
         self._append("[浏览器] 已捕获登录地址，可『复制登录地址』或『打开登录页』。")
+        # 网页真的起来了 = 运行验证通过（未确认过的目录在这一刻被定性）
+        if self._unconfirmed_dir is not None:
+            project, self._unconfirmed_dir = self._unconfirmed_dir, None
+            if mark_run_verified(project):
+                self._append(f"[运行验证] ✓ dsh web 真的跑起来了：{project}")
+                self._append("[运行验证] 已记入安装标记 —— 以后这个目录会被直接认定为 DSH。")
+                self._schedule_git_refresh(200)
+            else:
+                self._append("[运行验证] 服务跑起来了，但安装标记写不进去（目录不可写？），"
+                             "下次仍需人工确认。")
         try:
             self.after(0, self._update_web_buttons)
             self.after(0, self._poll_pending_open)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001  窗口已销毁时 after 会报错，忽略
             pass
 
     def _open_selected_browser(self, url: str) -> None:
@@ -1621,6 +1701,10 @@ class App(tk.Tk):
             except Exception:  # noqa: BLE001
                 pass
             self._append("[终端] dsh web 已退出（详情看上面日志）。")
+            if self._unconfirmed_dir is not None:
+                self._unconfirmed_dir = None
+                self._append("[运行验证] ✗ 没能跑起来 —— 这个目录不是能用的 DSH 安装"
+                             "（原因见上面的日志）。")
             if self.web_proc is proc:
                 self.web_proc = None
             self.web_auth_url = None
