@@ -5,6 +5,7 @@
 - 「检查更新」用**本地裸仓库**当 origin，所以不需要网络也能验证落后计数；
 - 提交一律用 `-c user.email/-c user.name` 传入，不读写用户的全局 git 配置；
 - 没装 git 时整个模块跳过（离线机器上不该因此变红）。
+- 真 git 的小工具在 `git_helpers.py`，与 test_catalog 共用。
 
 运行（在 tools/dsh-goochen-assistant 下）：
   python -m unittest discover -s tests -p "test_*.py"
@@ -12,7 +13,6 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,32 +20,10 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gitinfo as gi  # noqa: E402
-
-GIT = gi.git_exe()
-IDENT = ["-c", "user.email=test@example.com", "-c", "user.name=Test",
-         "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"]
-
-
-def git(*args: str, cwd: Path) -> str:
-    """跑一条 git（测试专用）：失败就抛，避免测试静默通过。"""
-    proc = subprocess.run([GIT, *IDENT, *args], cwd=str(cwd), capture_output=True,
-                          text=True, encoding="utf-8", errors="replace")
-    if proc.returncode != 0:
-        raise AssertionError(f"git {' '.join(args)} 失败：{proc.stderr.strip()}")
-    return proc.stdout
-
-
-def make_repo(root: Path, *, message: str = "init") -> Path:
-    root.mkdir(parents=True, exist_ok=True)
-    git("init", "-q", cwd=root)
-    (root / "package.json").write_text('{"name": "@deepseek-ai/dsh-root", '
-                                       '"version": "1.2.3"}', encoding="utf-8")
-    (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
-    git("add", "-A", cwd=root)
-    git("commit", "-q", "-m", message, cwd=root)
-    return root
+from git_helpers import GIT, add_remote, git, make_repo, write_pkg  # noqa: E402,F401
 
 
 @unittest.skipIf(GIT is None, "未安装 git，跳过 git 层测试")

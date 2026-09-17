@@ -21,9 +21,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import installer  # noqa: E402
 import plugin_store as ps  # noqa: E402
+from git_helpers import GIT, add_remote, git, make_repo, write_pkg  # noqa: E402
 
 
 def make_cache() -> Path:
@@ -338,44 +340,18 @@ class InstallDirTest(unittest.TestCase):
         (root / installer.INSTALL_MARKER).write_text("{ 坏文件", encoding="utf-8")
         self.assertEqual(installer.checkout_identity(root), "")
 
-    # ---- git 远端（直接读 .git/config，不启动 git 进程）----
+    # ---- 远端不再靠读文本判：交给真 git（见下面的 VerifyInstallDirTest）----
 
-    @staticmethod
-    def _write_git_config(root: Path, url: str) -> None:
+    def test_identity_ignores_git_remote_text(self):
+        """手写一份 `.git/config`（连 git 仓库都不是）不能当身份依据。"""
+        root = self._make_checkout(self.tmp / "fakegit", name="renamed-root")
         (root / ".git").mkdir(parents=True, exist_ok=True)
         (root / ".git" / "config").write_text(
-            '[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n'
-            f"\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+            '[remote "origin"]\n'
+            "\turl = git@github.com:deepseek-ai/deepseek-harness.git\n",
             encoding="utf-8")
-
-    def test_identity_from_git_remote_official(self):
-        root = self._make_checkout(self.tmp / "gitd", name="renamed-root")
-        self._write_git_config(
-            root, "https://github.com/deepseek-ai/deepseek-harness.git")
-        self.assertIn("git 远端", installer.checkout_identity(root))
-        self.assertTrue(installer.is_checkout(root))
-
-    def test_identity_from_git_remote_fork(self):
-        """fork 的远端链接里同样带着仓库名，所以也认。"""
-        root = self._make_checkout(self.tmp / "gitfork", name="renamed-root")
-        self._write_git_config(root, "git@github.com:Muigoochen/deepseek-harness.git")
-        self.assertIn("git 远端", installer.checkout_identity(root))
-
-    def test_identity_rejects_unrelated_git_remote(self):
-        root = self._make_checkout(self.tmp / "gitother", name="my-app")
-        self._write_git_config(root, "git@github.com:someone/my-app.git")
         self.assertEqual(installer.checkout_identity(root), "")
-
-    def test_identity_follows_gitdir_pointer(self):
-        """`.git` 是文件（worktree/submodule）时顺着指针读。"""
-        root = self._make_checkout(self.tmp / "worktree", name="renamed-root")
-        real = self.tmp / "real-gitdir"
-        real.mkdir(parents=True)
-        (real / "config").write_text(
-            '[remote "origin"]\n\turl = git@github.com:deepseek-ai/deepseek-harness.git\n',
-            encoding="utf-8")
-        (root / ".git").write_text(f"gitdir: {real}\n", encoding="utf-8")
-        self.assertIn("git 远端", installer.checkout_identity(root))
+        self.assertFalse(installer.is_checkout(root))
 
     def test_plan_a_default_when_nothing_saved_or_installed(self):
         with mock.patch.object(installer, "detect_installed_dir", return_value=None):
@@ -467,6 +443,119 @@ class InstallDirTest(unittest.TestCase):
         errs, warns = installer.check_install_dir(self.tmp / "deepseek-harness")
         self.assertEqual(errs, [])
         self.assertEqual(warns, [])
+
+
+@unittest.skipIf(GIT is None, "未安装 git，跳过真 git 身份测试")
+class VerifyInstallDirTest(unittest.TestCase):
+    """`verify_install_dir`：**内容 + git 两条都要过**，各种 fork 布局都要判对。
+
+    用真 git 临时仓库（不联网）。要覆盖的用户情形：
+      · 装的就是官方仓库（origin = 官方）
+      · 自己 fork 了、origin 指向自己的 fork（**没有**官方远端）
+      · 自己 fork 了、同时把 upstream 指向官方（本机就是这种）
+      · 碰巧同名的别的仓库 / 自己的项目里只是加了官方远端 → **必须拒绝**
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-ident-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _dsh_repo(self, name: str, *, root_name: str = "@deepseek-ai/dsh-root",
+                  with_subpackage: bool = False,
+                  remotes: tuple[tuple[str, str], ...] = ()) -> Path:
+        """造一个「内容像 DSH」的真 git 仓库。"""
+        repo = make_repo(self.tmp / name, root_name=root_name)
+        if with_subpackage:
+            write_pkg(repo, "packages/core/session", "@deepseek-ai/dsh-session")
+            git("add", "-A", cwd=repo)
+            git("commit", "-q", "-m", "add subpackage", cwd=repo)
+        for remote_name, url in remotes:
+            add_remote(repo, remote_name, url)
+        return repo
+
+    def test_official_remote_is_official(self):
+        repo = self._dsh_repo("official", remotes=(
+            ("origin", "https://github.com/deepseek-ai/deepseek-harness.git"),))
+        ident = installer.verify_install_dir(repo)
+        self.assertTrue(ident.ok, ident.evidence)
+        self.assertEqual(ident.tier, "official")
+
+    def test_fork_only_is_accepted_but_flagged_unofficial(self):
+        """只指向自己的 fork：认它是 DSH，但必须明说不是官方。"""
+        repo = self._dsh_repo("forkonly", remotes=(
+            ("origin", "git@github.com:Muigoochen/deepseek-harness.git"),))
+        ident = installer.verify_install_dir(repo)
+        self.assertTrue(ident.ok, ident.evidence)
+        self.assertEqual(ident.tier, "unofficial")
+        self.assertIn("非官方", ident.evidence)
+        self.assertIn("deepseek-ai/deepseek-harness", ident.evidence)
+
+    def test_fork_with_official_upstream_is_official(self):
+        """本机真实布局：origin 是自己的 fork，upstream 是官方 → 官方。"""
+        repo = self._dsh_repo("forkup", remotes=(
+            ("origin", "git@github.com:Muigoochen/deepseek-harness.git"),
+            ("upstream", "git@github.com:deepseek-ai/deepseek-harness.git")))
+        ident = installer.verify_install_dir(repo)
+        self.assertTrue(ident.ok, ident.evidence)
+        self.assertEqual(ident.tier, "official")
+        self.assertIn("deepseek-ai/deepseek-harness", ident.evidence)
+
+    def test_renamed_root_but_official_subpackage_is_accepted(self):
+        """根包名被改过，靠 packages/core 的官方子包名 + 官方远端认出来。"""
+        repo = self._dsh_repo("renamed", root_name="my-dsh-fork",
+                              with_subpackage=True, remotes=(
+                                  ("origin",
+                                   "git@github.com:alice/deepseek-harness.git"),))
+        ident = installer.verify_install_dir(repo)
+        self.assertTrue(ident.ok, ident.evidence)
+        self.assertEqual(ident.tier, "unofficial")
+
+    def test_same_name_repo_without_dsh_content_is_rejected(self):
+        """**关键安全用例**：碰巧也叫 deepseek-harness 的仓库，内容不像 DSH → 拒绝。"""
+        repo = self.tmp / "lookalike"
+        repo.mkdir()
+        (repo / "README.md").write_text("不是 DSH\n", encoding="utf-8")
+        git("init", "-q", cwd=repo)
+        git("add", "-A", cwd=repo)
+        git("commit", "-q", "-m", "init", cwd=repo)
+        add_remote(repo, "origin", "git@github.com:bob/deepseek-harness.git")
+        ident = installer.verify_install_dir(repo)
+        self.assertFalse(ident.ok)
+        self.assertIn("内容不像 DSH", ident.evidence)
+
+    def test_own_project_with_official_remote_is_rejected(self):
+        """**关键安全用例**：自己的单仓里只是加了官方远端 → 绝不能当 DSH 跑 pnpm。"""
+        repo = make_repo(self.tmp / "myapp", root_name="my-app")
+        add_remote(repo, "upstream",
+                   "https://github.com/deepseek-ai/deepseek-harness.git")
+        ident = installer.verify_install_dir(repo)
+        self.assertFalse(ident.ok)
+        self.assertIn("内容不像 DSH", ident.evidence)
+        self.assertFalse(installer.is_checkout(repo))
+
+    def test_plain_pnpm_repo_without_remote_is_rejected(self):
+        repo = make_repo(self.tmp / "plain", root_name="my-app")
+        ident = installer.verify_install_dir(repo)
+        self.assertFalse(ident.ok)
+
+    def test_offline_dir_without_git_uses_marker(self):
+        """离线装出来的目录没有 `.git`：靠安装标记判为 tier=file。"""
+        root = self.tmp / "offline"
+        (root).mkdir(parents=True)
+        (root / "package.json").write_text(
+            json.dumps({"name": "rebranded-dsh"}), encoding="utf-8")
+        (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
+        installer.write_install_marker(root, "offline")
+        ident = installer.verify_install_dir(root)
+        self.assertTrue(ident.ok, ident.evidence)
+        self.assertEqual(ident.tier, "file")
+        self.assertIn("安装标记", ident.evidence)
+
+    def test_missing_dir_is_rejected(self):
+        ident = installer.verify_install_dir(self.tmp / "nope")
+        self.assertFalse(ident.ok)
 
 
 class PrepareSourceTest(unittest.TestCase):

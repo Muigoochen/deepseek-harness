@@ -15,23 +15,19 @@
    - **安装位置**：打开时会**自动认出机器上已经装好的 DSH**（包括小助手自己就放在那份安装里的情况）。
      判定「这是不是一个 DSH 检出」要过两关：
      1. **结构**：同时有 `package.json` 与 `pnpm-workspace.yaml`
-     2. **身份**（任意一条成立即可，只增不减、不互相否决）：
+     2. **内容身份**（任意一条成立即可，只增不减、不互相否决）：
         - 有本助手写的安装标记 `.dsh-assistant.json`（**离线装的目录只有这一条**）
         - 根包名是 `@deepseek-ai/dsh-root`
         - 根包名是 `@deepseek-ai/dsh` 或以 `@deepseek-ai/dsh-` 开头
         - `packages/core/` 下存在 `@deepseek-ai/dsh-*` 子包（不依赖根包名）
-        - `.git/config` 里有含 `deepseek-harness` 的远端（fork 也认，链接里带着仓库名；
-          是不是**官方**由下面「真 git 复核」那一步分清）
 
      只看第 1 关会把**任意 pnpm 单仓**误认成 DSH，所以必须过第 2 关；只看「目录布局」也不够
-     （`packages/core`、`packages/api` 是极常见命名），所以要读到真的官方包名或官方链接。
+     （`packages/core`、`packages/api` 是极常见命名），所以要读到真的官方包名。
      已装好时提示「✓ 已检测到已安装的 DSH（根包名 @deepseek-ai/dsh-root），将直接使用」。
      - **安装标记**：安装结束时会在安装目录写下 `.dsh-assistant.json`，记录来源链接
        （`https://github.com/deepseek-ai/deepseek-harness.git`）、安装方式（offline/online）与时间。
        离线解压出来的目录**没有 `.git`**，这份标记就是它唯一的身份凭据，同时也把官方链接绑定下来
-     - **git 链接**：读取 `.git/config` 文件本身（**不启动 git 进程**，0.02 ms），
-       所以没装 git 的机器也能用；`.git` 是文件（worktree/submodule）时顺着 `gitdir:` 指针读
-     - **再用真 git 复核一遍**（最强的一份依据）：目录选定后（打开界面、点安装、`--selfcheck`）
+     - **再用真 git 复核一遍**（目录选定后：打开界面、点安装、`--selfcheck`）
        会跑 **git 命令**确认「这确实是 DSH 仓库根、且远端是 DSH」，并读出**版本号、提交、分支、
        工作区是否干净、领先/落后多少**。链接交给 git 自己解析，所以 `insteadOf` 重写、
        `includeIf` 条件包含、worktree 改道都不会看错——这是读文本猜做不到的。
@@ -41,6 +37,18 @@
          「非官方远端 …（仓库名对得上，但官方是 deepseek-ai/deepseek-harness）」，显示为橙色
        代价一次约 0.2 秒，所以只跑在**你选定的那一个目录**上，绝不参与扫盘（扫盘仍是 0.05 ms 的文件判定）。
        离线解压的目录没有 `.git`，会退回文件判定并如实说明依据
+     - **两条证据都要过**（故意的深度防御）：**内容身份**是门槛，**git 远端**是加固。
+       只有其中一条会被拒绝并说明原因，两种最容易出事的误判因此被挡住：
+       · 碰巧也叫 `deepseek-harness` 的别的仓库（内容不像 DSH）
+       · 自己的单仓里只是加了官方远端当 upstream（内容不像 DSH）
+     - **别人 fork 了怎么办**（都实测覆盖，见 `tests/test_catalog.py` 的 `VerifyInstallDirTest`）：
+       | 用户的布局 | 判定结果 |
+       |---|---|
+       | 用本助手装的（origin = 官方） | ✓ 官方仓库 |
+       | 自己 fork，origin 指向自己的 fork，没有官方远端 | ✓ 认（橙色）并写明「非官方远端…官方是 deepseek-ai/deepseek-harness」 |
+       | 自己 fork，origin = fork 且 upstream = 官方（本机就是这种） | ✓ 官方仓库 |
+       | 连根包名都改了（fork 改名），但 `packages/core/*` 仍是官方包名 | ✓ 认（靠子包名 + 远端） |
+       | 包名全改过、文件也被清过（无标记） | ✗ 拒绝，并说明「内容不像 DSH」 |
      - 优先级：**界面当前输入** → 配置里的真实安装 → 自动检测到的已安装 → 配置里的空位 → 方案 A 默认。
        自动检测的顺序：小助手自身所在检出 → 用户目录下常见命名 → 各盘根下的常见命名及其再一层。
        只在**固定盘**上扫（跳过可移动/网络/CD 盘以免卡住），单次探测有 3 秒预算，结果缓存一次。

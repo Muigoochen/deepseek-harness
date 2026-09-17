@@ -235,7 +235,7 @@ def _pkg_name(pkg_json: Path) -> str:
 
 
 def checkout_identity(path: Path) -> str:
-    """这个目录凭什么被认成 DSH 检出；返回判定依据，'' 表示不是。
+    """这个目录**凭内容**凭什么被认成 DSH 检出；返回判定依据，'' 表示不是。
 
     结构（`package.json` + `pnpm-workspace.yaml`）只是必要条件——任意 pnpm 单仓都满足，
     所以还要认身份，任意一条成立即可（都不会被用来**否决**别的依据）：
@@ -243,7 +243,10 @@ def checkout_identity(path: Path) -> str:
       ① 根包名 = `@deepseek-ai/dsh-root`（官方根包名，最硬）
       ② 根包名 = `@deepseek-ai/dsh` 或以 `@deepseek-ai/dsh-` 开头（官方改名后仍认）
       ③ `packages/core/` 下存在 `@deepseek-ai/dsh-*` 子包（不依赖**根**包名）
-      ④ `.git/config` 里有含 `deepseek-harness` 的远端（fork 也认，链接里带着仓库名）
+
+    这里**不看 git 远端**：远端交给真 git 去判（见 `verify_install_dir`）。读 `.git/config`
+    文本既读不准（`insteadOf` 重写、`includeIf` 条件包含、worktree 改道都会绕开它），
+    又会把「碰巧同名的别的仓库」误认成 DSH。**内容是门槛，远端是加固，两条都要过。**
     """
     try:
         if not all((path / m).is_file() for m in CHECKOUT_MARKERS):
@@ -261,9 +264,6 @@ def checkout_identity(path: Path) -> str:
     sub = _dsh_subpackage(path)
     if sub:
         return f"子包 {sub}"
-    for url in _git_remote_urls(path):
-        if SOURCE_DIR_NAME in url.lower():
-            return f"git 远端 {url}"
     return ""
 
 
@@ -299,24 +299,31 @@ def is_checkout(path: Path) -> bool:
 def verify_install_dir(path: Path, info=None) -> ginfo.DshIdentity:
     """确认「这个目录就是装好的 DSH」，返回判定结果（含依据强弱）。
 
-    先让**真 git 命令**拍板：远端就是官方仓库时依据最强；远端只是仓库名对得上
-    （你自己账户下的 fork、镜像、本地克隆）也会认，但结论里会**明说它不是官方**。
-    git 不可用、或该目录不是 git 仓库（离线解压出来的就是这种）时，退回文件判定
-    （tier = "file"）。
+    两条**互相独立**的证据都要过，缺一不可——这是故意的深度防御：
+    ① **内容**（`checkout_identity`）：结构 + 官方包名/本助手安装标记。这是底线，挡住
+       「碰巧也叫 deepseek-harness 的别的仓库」和「自己的项目里只是加了官方远端」；
+    ② **git**（能跑就跑）：该目录是仓库根，且远端是 DSH。**官方仓库**（owner 与仓库名
+       都对上）最强；仓库名对得上但不在官方名下的（你自己账户下的 fork、镜像、本地克隆）
+       也认，但结论里**明说它不是官方**。
+    git 认不出来时用文件判定收尾（tier="file"）：离线解压出来的目录没有 `.git`，
+    机器没装 git 时也是这样。
     注意：一次要跑若干条 git（约 0.2 秒），所以只用在「用户选定的那一个目录」上，
     不要放进扫盘或每次按键的路径里。
     """
     if info is None:
         info = ginfo.repo_info(path)
-    if info.ok:
-        ident = ginfo.verify_dsh_repo(path, info)
-        if ident.ok:
-            return ident
     why = checkout_identity(path)
+    ident = (ginfo.verify_dsh_repo(path, info) if info.ok
+             else ginfo.DshIdentity(False, "none", info.error))
+    if ident.ok:
+        if why:
+            return ident
+        return ginfo.DshIdentity(False, "none", (
+            f"{ident.evidence}；但目录内容不像 DSH"
+            "（既没有官方包名，也没有本助手的安装标记）"))
     if why:
         return ginfo.DshIdentity(True, "file", why)
-    return ginfo.DshIdentity(False, "none",
-                             info.error or "既不是 DSH 检出，也不是 DSH 的 git 仓库")
+    return ginfo.DshIdentity(False, "none", ident.evidence)
 
 
 # ------------------------------------------------- 安装标记（离线装的身份证）
@@ -352,32 +359,6 @@ def read_install_marker(path: Path) -> dict:
     if not isinstance(data, dict):
         return {}
     return data if str(data.get("tool", "")).startswith("DSH-孤辰小助手") else {}
-
-
-def _git_remote_urls(path: Path) -> list[str]:
-    """从 `.git/config` 读远端 URL——**不启动 git 进程**（0.02ms，比调 git 快千倍）。
-
-    `.git` 可能是文件（worktree/submodule，内容形如 `gitdir: <路径>`），顺着读；
-    没有 `.git`（离线解压出来的目录就是这样）或没配 remote 时返回空列表。
-    """
-    try:
-        dot = path / ".git"
-        if dot.is_file():
-            pointer = dot.read_text(encoding="utf-8", errors="replace").strip()
-            if ":" not in pointer:
-                return []
-            dot = (path / pointer.split(":", 1)[1].strip()).resolve()
-        config = dot / "config"
-        if not config.is_file():
-            return []
-        urls: list[str] = []
-        for line in config.read_text(encoding="utf-8", errors="replace").splitlines():
-            key, sep, value = line.partition("=")
-            if sep and key.strip().lower().startswith("url") and value.strip():
-                urls.append(value.strip())
-        return urls
-    except (OSError, ValueError):
-        return []
 
 
 def _drive_roots(*, fixed_only: bool = True) -> list[Path]:
