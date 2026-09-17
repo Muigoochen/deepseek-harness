@@ -13,14 +13,17 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
 
-#: 官方仓库名。fork 的远端链接里同样带着它，所以 fork 也认。
+#: 官方仓库：**owner 与仓库名都对得上**才算官方（已用 `git ls-remote` 确认该仓库存在）。
+OFFICIAL_OWNER = "deepseek-ai"
 REPO_SLUG = "deepseek-harness"
+OFFICIAL_REPO = f"{OFFICIAL_OWNER}/{REPO_SLUG}"
 GIT_MISSING = 127
 GIT_TIMEOUT = 124
 DEFAULT_TIMEOUT = 20
@@ -158,38 +161,92 @@ def _package_version(root: Path) -> str:
     return str(data.get("version", "")) if isinstance(data, dict) else ""
 
 
-def match_dsh_remote(remotes: dict[str, str]) -> str:
-    """远端里哪个是 DSH 仓库（按仓库名匹配）。返回命中的 URL，没有则 ''。
+def split_remote(url: str) -> tuple[str, str]:
+    """把远端 URL 拆成 `(owner, 仓库名)`；拆不出 owner（本地路径）时给空串。
 
-    `git@host:org/deepseek-harness.git`、`https://host/org/deepseek-harness`、
-    本地路径 `/srv/deepseek-harness.git` 都能识别；fork 因为仓库名不变，同样命中。
+    `git@github.com:org/repo.git`、`https://github.com/org/repo`、
+    `ssh://git@host/org/repo` 都能拆对；`E:/x/repo` 这类本地路径只给仓库名。
+    只认 git 报出来的 URL，所以 `insteadOf` 重写与 `includeIf` 都已经生效过了。
     """
+    text = url.strip().rstrip("/")
+    if text.lower().endswith(".git"):
+        text = text[:-4]
+    if "://" in text:
+        parts = [p for p in text.split("://", 1)[1].split("/") if p]
+        return (parts[-2] if len(parts) >= 3 else ""), (parts[-1] if parts else "")
+    if re.match(r"^[^/\\]+@[^/\\]+:", text):          # scp 风格 git@host:org/repo
+        parts = [p for p in text.split(":", 1)[1].split("/") if p]
+        return (parts[-2] if len(parts) >= 2 else ""), (parts[-1] if parts else "")
+    parts = [p for p in text.replace("\\", "/").split("/") if p]
+    return "", (parts[-1] if parts else "")
+
+
+def official_remote(remotes: dict[str, str]) -> str:
+    """远端里指向**官方仓库**的那个（owner 与仓库名都要对得上）。没有则 ''。"""
     for url in remotes.values():
-        name = url.rstrip("/").rsplit("/", 1)[-1].rstrip("/")
-        if name.lower().endswith(".git"):
-            name = name[:-4]
-        if name.lower() == REPO_SLUG.lower():
+        owner, repo = split_remote(url)
+        if owner.lower() == OFFICIAL_OWNER and repo.lower() == REPO_SLUG.lower():
             return url
     return ""
 
 
-def verify_dsh_repo(path: Path, info: Optional[RepoInfo] = None) -> tuple[bool, str]:
-    """用 git **确认**「这个目录就是 DSH 仓库根」。返回 `(是否确认, 说明)`。
+def unofficial_remote(remotes: dict[str, str]) -> str:
+    """仓库名对得上、但 owner 不是官方的远端（自己的 fork、镜像、本地克隆）。没有则 ''。"""
+    for url in remotes.values():
+        owner, repo = split_remote(url)
+        if repo.lower() == REPO_SLUG.lower() and owner.lower() != OFFICIAL_OWNER:
+            return url
+    return ""
 
-    三条都要过：① 是 git 仓库 ② 该目录本身是仓库根 ③ 远端里有一个是 DSH。
-    比读文件的判定强得多：链接怎么重写、条件包含、worktree 改道，git 都会解析正确。
+
+@dataclass(frozen=True)
+class DshIdentity:
+    """一次身份判定的结论。tier 表示依据的强弱，界面据此显示不同颜色。
+
+    official   远端就是**官方仓库**（最强依据）
+    unofficial 仓库名对得上，但不是官方（自己账户下的 fork / 镜像 / 本地克隆）
+    file       没有 `.git` 或 git 认不出来，靠文件判定（离线安装）
+    none       认不出来
+    """
+    ok: bool
+    tier: str = "none"
+    evidence: str = ""
+
+
+def verify_dsh_repo(path: Path, info: Optional[RepoInfo] = None) -> DshIdentity:
+    """用 git **确认**「这个目录就是 DSH 仓库根」。
+
+    三条都要过：① 是 git 仓库 ② 该目录本身是仓库根 ③ 远端里有 DSH。
+    远端分两档：**官方仓库**最强；仓库名对得上的非官方远端（你自己账户下的 fork、
+    镜像、本地克隆）也算 DSH，但会**明确说出它不在官方名下**，绝不冒名顶替。
     已经跑过 `repo_info` 的调用方可以把它传进来，省一次 git（每轮约 0.2 秒）。
     """
     info = info if info is not None else repo_info(path)
     if not info.ok:
-        return False, info.error
+        return DshIdentity(False, "none", info.error)
     if info.root is None or not _same_path(info.root, path):
-        return False, f"该目录不是 git 仓库根（仓库根是 {info.root}）"
-    hit = match_dsh_remote(info.remotes)
-    if not hit:
-        urls = "、".join(info.remotes.values()) or "（没有配置远端）"
-        return False, f"是 git 仓库根，但远端不是 DSH：{urls}"
-    return True, f"git 确认 → {hit}"
+        return DshIdentity(False, "none", f"该目录不是 git 仓库根（仓库根是 {info.root}）")
+    official = official_remote(info.remotes)
+    if official:
+        return DshIdentity(True, "official", f"官方仓库 {official}")
+    same_name = unofficial_remote(info.remotes)
+    if same_name:
+        return DshIdentity(True, "unofficial",
+                           f"非官方远端 {same_name}"
+                           f"（仓库名对得上，但官方是 {OFFICIAL_REPO}）")
+    urls = "、".join(info.remotes.values()) or "（没有配置远端）"
+    return DshIdentity(False, "none", f"是 git 仓库根，但远端不是 DSH：{urls}")
+
+
+def tracking_remote(info: RepoInfo) -> str:
+    """分支跟踪的远端名（`@{u}` 的第一段）；没有跟踪就回退 origin。
+
+    检查更新/更新默认跟着它走：小白装的 origin 通常就是官方；开发机上分支可能
+    跟踪自己的 fork，那就该跟自己的 fork 比——**不硬编码 origin**。
+    """
+    if info.upstream and "/" in info.upstream:
+        return info.upstream.split("/", 1)[0]
+    return "origin"
 
 
 @dataclass(frozen=True)
@@ -200,15 +257,19 @@ class UpdateStatus:
     ahead: int = 0
     branch: str = ""
     remote: str = ""
+    upstream: str = ""
+    remote_url: str = ""
+    official: bool = False
     latest: str = ""
     latest_subject: str = ""
     error: str = ""
 
 
-def check_update(path: Path, *, remote: str = "origin") -> UpdateStatus:
-    """`git fetch` 后比较本地 HEAD 与远端：behind>0 = 有更新。
+def check_update(path: Path, *, remote: str = "") -> UpdateStatus:
+    """`git fetch` 后比较本地 HEAD 与**该分支跟踪的远端**：behind>0 = 有更新。
 
-    需要联网（这也是唯一会联网的函数）；远端不可达时返回结构化失败，不抛异常。
+    remote 留空就跟 `@{u}` 走（小白的 origin 通常就是官方；开发机上分支可能跟踪
+    自己的 fork，那本来就该跟自己的 fork 比）。需要联网；失败返回结构化结果，不抛异常。
     """
     info = repo_info(path)
     if not info.ok:
@@ -216,14 +277,18 @@ def check_update(path: Path, *, remote: str = "origin") -> UpdateStatus:
     branch = info.branch
     if not branch or branch == "HEAD":
         return UpdateStatus(ok=False, error="处于分离头（detached HEAD）状态，无法判断更新")
+    remote = remote or tracking_remote(info)
     if remote not in info.remotes:
         return UpdateStatus(ok=False, branch=branch, remote=remote,
                             error=f"没有名为 {remote} 的远端")
+    url = info.remotes[remote]
+    official = official_remote({remote: url}) == url
 
     # 不带 --depth：带它会给本地仓库凭空加一个浅边界，把本来完整的祖先关系弄断
     code, _out, err = run_git(["fetch", remote, branch], path, timeout=FETCH_TIMEOUT)
     if code != 0:
-        return UpdateStatus(ok=False, branch=branch, remote=remote,
+        return UpdateStatus(ok=False, branch=branch, remote=remote, official=official,
+                            upstream=info.upstream, remote_url=url,
                             error=f"git fetch 失败：{_first_line(err)}")
 
     code, out, _ = run_git(["rev-parse", "--short", "FETCH_HEAD"], path)
@@ -237,15 +302,14 @@ def check_update(path: Path, *, remote: str = "origin") -> UpdateStatus:
     code, out, _ = run_git(["rev-list", "--count", "HEAD..FETCH_HEAD"], path)
     if code == 0 and out.strip():
         behind = int(out.strip().split()[0])
-    code, out, _ = run_git(["rev-parse", "--is-shallow-repository"], path)
-    shallow = code == 0 and _first_line(out) == "true"
-    if not shallow:
+    if not info.shallow:
         code, out, _ = run_git(["rev-list", "--count", "FETCH_HEAD..HEAD"], path)
         if code == 0 and out.strip():
             ahead = int(out.strip().split()[0])
 
     return UpdateStatus(ok=True, behind=behind, ahead=ahead, branch=branch,
-                        remote=remote, latest=latest, latest_subject=subject)
+                        remote=remote, upstream=info.upstream, remote_url=url,
+                        official=official, latest=latest, latest_subject=subject)
 
 
 @dataclass(frozen=True)
@@ -260,9 +324,10 @@ class UpdateResult:
     error: str = ""
 
 
-def update_repo(path: Path, *, remote: str = "origin") -> UpdateResult:
+def update_repo(path: Path, *, remote: str = "") -> UpdateResult:
     """把安装目录**快进**到远端最新。只走 fast-forward，绝不产生合并提交。
 
+    remote 留空就跟分支跟踪的远端走（同 `check_update`）。
     三道前置检查，任一不过就拒绝并说明原因，绝不硬来：
     ① 工作区必须干净——否则可能覆盖用户自己的改动；
     ② 必须在分支上、远端可达；
@@ -281,6 +346,7 @@ def update_repo(path: Path, *, remote: str = "origin") -> UpdateResult:
             "请先提交或撤销这些改动，再更新"))
     if not info.branch or info.branch == "HEAD":
         return UpdateResult(ok=False, error="处于分离头（detached HEAD）状态，无法更新")
+    remote = remote or tracking_remote(info)
     if remote not in info.remotes:
         return UpdateResult(ok=False, error=f"没有名为 {remote} 的远端")
 

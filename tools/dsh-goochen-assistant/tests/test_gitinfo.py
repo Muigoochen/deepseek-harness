@@ -103,33 +103,64 @@ class IdentityTest(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_match_dsh_remote_accepts_common_forms(self) -> None:
+    def test_official_remote_accepts_common_forms(self) -> None:
         for url in ("git@github.com:deepseek-ai/deepseek-harness.git",
                     "https://github.com/deepseek-ai/deepseek-harness",
-                    "https://github.com/Muigoochen/deepseek-harness.git",   # fork
-                    "ssh://git@host/org/deepseek-harness.git"):
-            self.assertEqual(gi.match_dsh_remote({"origin": url}), url)
+                    "https://github.com/deepseek-ai/deepseek-harness.git",
+                    "ssh://git@github.com/deepseek-ai/deepseek-harness.git"):
+            self.assertEqual(gi.official_remote({"origin": url}), url)
 
-    def test_match_dsh_remote_rejects_others(self) -> None:
-        for url in ("git@github.com:me/my-app.git",
-                    "https://github.com/me/deepseek-harness-fork.git",      # 名字不同就认
-                    "https://github.com/me/deepseek_harness.git"):          # 下划线变体
-            self.assertEqual(gi.match_dsh_remote({"origin": url}), "", url)
+    def test_official_remote_rejects_everything_else(self) -> None:
+        for url in ("git@github.com:Muigoochen/deepseek-harness.git",   # 别人账户下的 fork
+                    "git@github.com:deepseek-ai/dsh.git",               # 官方名下但仓库名不对
+                    "git@github.com:me/my-app.git",
+                    "https://github.com/me/deepseek-harness-fork.git",
+                    "https://github.com/me/deepseek_harness.git"):      # 下划线变体
+            self.assertEqual(gi.official_remote({"origin": url}), "", url)
 
-    def test_verify_confirms_dsh_remote(self) -> None:
+    def test_unofficial_remote_identified_but_not_official(self) -> None:
+        fork = "git@github.com:Muigoochen/deepseek-harness.git"
+        self.assertEqual(gi.unofficial_remote({"origin": fork}), fork)
+        self.assertEqual(gi.official_remote({"origin": fork}), "")
+
+    def test_verify_official_tier(self) -> None:
+        repo = make_repo(self.tmp / "repo")
+        git("remote", "add", "origin",
+            "git@github.com:deepseek-ai/deepseek-harness.git", cwd=repo)
+        ident = gi.verify_dsh_repo(repo)
+        self.assertTrue(ident.ok, ident.evidence)
+        self.assertEqual(ident.tier, "official")
+        self.assertIn("官方仓库", ident.evidence)
+
+    def test_verify_official_tier_when_upstream_is_official(self) -> None:
+        """本机真实布局：origin 是自己的 fork，upstream 是官方 → 仍判为官方，且给出官方链接。"""
         repo = make_repo(self.tmp / "repo")
         git("remote", "add", "origin",
             "git@github.com:Muigoochen/deepseek-harness.git", cwd=repo)
-        confirmed, evidence = gi.verify_dsh_repo(repo)
-        self.assertTrue(confirmed, evidence)
-        self.assertIn("deepseek-harness", evidence)
+        git("remote", "add", "upstream",
+            "git@github.com:deepseek-ai/deepseek-harness.git", cwd=repo)
+        ident = gi.verify_dsh_repo(repo)
+        self.assertTrue(ident.ok, ident.evidence)
+        self.assertEqual(ident.tier, "official")
+        self.assertIn("deepseek-ai/deepseek-harness", ident.evidence)
+
+    def test_verify_unofficial_tier_when_only_fork(self) -> None:
+        """只有自己的 fork（没有官方远端）→ 认，但必须**明说不是官方**。"""
+        repo = make_repo(self.tmp / "repo")
+        git("remote", "add", "origin",
+            "git@github.com:Muigoochen/deepseek-harness.git", cwd=repo)
+        ident = gi.verify_dsh_repo(repo)
+        self.assertTrue(ident.ok, ident.evidence)
+        self.assertEqual(ident.tier, "unofficial")
+        self.assertIn("非官方", ident.evidence)
+        self.assertIn("deepseek-ai/deepseek-harness", ident.evidence)   # 说出官方是谁
 
     def test_verify_rejects_other_remote(self) -> None:
         repo = make_repo(self.tmp / "repo")
         git("remote", "add", "origin", "git@github.com:me/my-app.git", cwd=repo)
-        confirmed, evidence = gi.verify_dsh_repo(repo)
-        self.assertFalse(confirmed)
-        self.assertIn("my-app", evidence)
+        ident = gi.verify_dsh_repo(repo)
+        self.assertFalse(ident.ok)
+        self.assertIn("my-app", ident.evidence)
 
     def test_verify_rejects_subdirectory_of_a_repo(self) -> None:
         """目录只是某个仓库里的子目录 → 不是仓库根，不确认。"""
@@ -138,9 +169,9 @@ class IdentityTest(unittest.TestCase):
             "git@github.com:deepseek-ai/deepseek-harness.git", cwd=repo)
         sub = repo / "packages"
         sub.mkdir()
-        confirmed, evidence = gi.verify_dsh_repo(sub)
-        self.assertFalse(confirmed)
-        self.assertIn("仓库根", evidence)
+        ident = gi.verify_dsh_repo(sub)
+        self.assertFalse(ident.ok)
+        self.assertIn("仓库根", ident.evidence)
 
     def test_verify_accepts_precomputed_info(self) -> None:
         """传进已算好的 info 时不再跑一次 git（省 0.2 秒）。"""
@@ -149,9 +180,15 @@ class IdentityTest(unittest.TestCase):
             "git@github.com:deepseek-ai/deepseek-harness.git", cwd=repo)
         info = gi.repo_info(repo)
         with mock.patch.object(gi, "repo_info") as spy:
-            confirmed, _ = gi.verify_dsh_repo(repo, info)
+            ident = gi.verify_dsh_repo(repo, info)
             spy.assert_not_called()
-        self.assertTrue(confirmed)
+        self.assertTrue(ident.ok)
+
+    def test_tracking_remote_falls_back_to_origin(self) -> None:
+        repo = make_repo(self.tmp / "repo")
+        info = gi.repo_info(repo)
+        self.assertEqual(info.upstream, "")
+        self.assertEqual(gi.tracking_remote(info), "origin")
 
 
 @unittest.skipIf(GIT is None, "未安装 git，跳过 git 层测试")
@@ -210,6 +247,16 @@ class CheckUpdateTest(OriginPairTest):
         status = gi.check_update(self.work, remote="broken")
         self.assertFalse(status.ok)
         self.assertIn("fetch 失败", status.error)
+
+    def test_follows_tracking_remote_without_being_told(self) -> None:
+        """不指定 remote 时跟 `@{u}` 走，并如实标出该远端是不是官方。"""
+        git("remote", "rename", "origin", "mine", cwd=self.work)
+        status = gi.check_update(self.work)
+        self.assertTrue(status.ok, status.error)
+        self.assertEqual(status.remote, "mine")
+        self.assertEqual(status.upstream, "mine/main")
+        self.assertFalse(status.official)          # 本地路径远端，当然不是官方
+        self.assertTrue(status.remote_url)
 
 
 @unittest.skipIf(GIT is None, "未安装 git，跳过 git 层测试")

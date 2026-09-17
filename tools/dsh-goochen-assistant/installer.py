@@ -296,24 +296,27 @@ def is_checkout(path: Path) -> bool:
     return bool(checkout_identity(path))
 
 
-def verify_install_dir(path: Path, info=None) -> tuple[bool, str]:
-    """确认「这个目录就是装好的 DSH」，返回 `(是否确认, 依据)`。
+def verify_install_dir(path: Path, info=None) -> ginfo.DshIdentity:
+    """确认「这个目录就是装好的 DSH」，返回判定结果（含依据强弱）。
 
-    先让**真 git 命令**拍板（仓库链接是最强辨识）；git 不可用、或该目录不是
-    git 仓库（离线解压出来的就是这种）时，退回廉价的文件判定。
+    先让**真 git 命令**拍板：远端就是官方仓库时依据最强；远端只是仓库名对得上
+    （你自己账户下的 fork、镜像、本地克隆）也会认，但结论里会**明说它不是官方**。
+    git 不可用、或该目录不是 git 仓库（离线解压出来的就是这种）时，退回文件判定
+    （tier = "file"）。
     注意：一次要跑若干条 git（约 0.2 秒），所以只用在「用户选定的那一个目录」上，
     不要放进扫盘或每次按键的路径里。
     """
     if info is None:
         info = ginfo.repo_info(path)
     if info.ok:
-        confirmed, evidence = ginfo.verify_dsh_repo(path, info)
-        if confirmed:
-            return True, evidence
+        ident = ginfo.verify_dsh_repo(path, info)
+        if ident.ok:
+            return ident
     why = checkout_identity(path)
     if why:
-        return True, why
-    return False, (info.error or "既不是 DSH 检出，也不是 DSH 的 git 仓库")
+        return ginfo.DshIdentity(True, "file", why)
+    return ginfo.DshIdentity(False, "none",
+                             info.error or "既不是 DSH 检出，也不是 DSH 的 git 仓库")
 
 
 # ------------------------------------------------- 安装标记（离线装的身份证）
@@ -746,10 +749,10 @@ class Engine:
 
     def prepare_source(self) -> Path:
         project = project_dir()
-        # 先让真 git 复核一次（链接是最强辨识），再退回文件判定
-        confirmed, evidence = verify_install_dir(project)
-        if confirmed:
-            self.log(f"④ 已确认现有 DSH：{project}（{evidence}）")
+        # 先让真 git 复核一次（官方链接是最强辨识），再退回文件判定
+        ident = verify_install_dir(project)
+        if ident.ok:
+            self.log(f"④ 已确认现有 DSH：{project}（{ident.evidence}）")
             return project
         # 有 package.json 却不是 DSH 检出 = 用户自己的项目。绝不能在这里跑
         # pnpm install/build（会改动/污染无关项目），必须让用户换目录。
@@ -1160,8 +1163,8 @@ class App(tk.Tk):
         set_project_dir(target)
         self._append(f"[安装位置] {target}")
         # 点安装时用真 git 复核一次（约 0.2 秒），确认到底是复用还是全新装
-        confirmed, evidence = verify_install_dir(target)
-        self._append(f"[安装位置] {'✓ ' + evidence if confirmed else '尚未安装，将全新装到这里'}")
+        ident = verify_install_dir(target)
+        self._append(f"[安装位置] {'✓ ' + ident.evidence if ident.ok else '尚未安装，将全新装到这里'}")
         self._set_busy(True)
         eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
                      log=self._append)
@@ -1267,22 +1270,22 @@ class App(tk.Tk):
     def _git_info_worker(self, target: Path) -> None:
         try:
             info = ginfo.repo_info(target)
-            confirmed, evidence = verify_install_dir(target, info)
+            ident = verify_install_dir(target, info)
         except Exception as exc:  # noqa: BLE001  git 层的任何意外都不该卡住界面
             self._post(self._git_error, str(exc))
             return
-        self._post(self._show_git_info, info, confirmed, evidence)
+        self._post(self._show_git_info, info, ident)
 
     def _git_error(self, message: str) -> None:
         self.git_busy = False
         self._set_git_buttons(True)
         self._set_label(self.git_info_lbl, f"读取失败：{message}", "#b00000")
 
-    def _show_git_info(self, info, confirmed: bool, evidence: str) -> None:
+    def _show_git_info(self, info, ident: ginfo.DshIdentity) -> None:
         self.git_busy = False
         self._set_git_buttons(True)
-        if not confirmed:
-            self._set_label(self.git_info_lbl, f"✗ 未确认是 DSH 安装：{evidence}",
+        if not ident.ok:
+            self._set_label(self.git_info_lbl, f"✗ 未确认是 DSH 安装：{ident.evidence}",
                             "#b00000")
             return
         bits: list[str] = []
@@ -1296,8 +1299,17 @@ class App(tk.Tk):
         bits.append("工作区干净" if info.dirty == 0 else f"工作区有 {info.dirty} 处本地改动")
         if info.upstream and not info.shallow:
             bits.append(f"相对 {info.upstream}：领先 {info.ahead} / 落后 {info.behind}")
-        self._set_label(self.git_info_lbl, " · ".join(bits) + f"\n依据：{evidence}",
-                        "#1a6b1a")
+        lines = [" · ".join(bits)]
+
+        # 分支跟踪的远端若不是官方，就说清「更新从哪来」，别让人以为在跟官方同步
+        if info.upstream:
+            tracked = ginfo.tracking_remote(info)
+            url = info.remotes.get(tracked, "")
+            if url and not ginfo.official_remote({tracked: url}):
+                lines.append(f"更新来源：{info.upstream}（{url}，非官方 —— 官方更新需自行合并）")
+        lines.append(f"依据：{ident.evidence}")
+        color = {"official": "#1a6b1a", "unofficial": "#a05a00"}.get(ident.tier, "#666")
+        self._set_label(self.git_info_lbl, "\n".join(lines), color)
 
     def _set_label(self, widget, text: str, color: str) -> None:
         try:
@@ -1345,6 +1357,11 @@ class App(tk.Tk):
             text, color = f"⚠ 落后 {status.behind} 个提交{extra}", "#a05a00"
         if status.ahead:
             text += f"；本地领先 {status.ahead} 个提交"
+        where = status.upstream or status.remote
+        if where:
+            text += f"　·　{where}"
+            if not status.official:
+                text += "（非官方远端）"
         self._set_label(self.git_note, text, color)
 
     def on_update_now(self) -> None:
@@ -1353,9 +1370,9 @@ class App(tk.Tk):
             return
         target = self._effective_dir()
         info = ginfo.repo_info(target)
-        confirmed, evidence = verify_install_dir(target, info)
-        if not confirmed:
-            messagebox.showerror("无法更新", f"{target}\n\n{evidence}", parent=self)
+        ident = verify_install_dir(target, info)
+        if not ident.ok:
+            messagebox.showerror("无法更新", f"{target}\n\n{ident.evidence}", parent=self)
             return
         if info.dirty:
             messagebox.showwarning(
@@ -2585,11 +2602,13 @@ def selfcheck() -> int:
         state = "尚未安装（安装时会克隆/解压到这里）"
     log_line(f"项目目录   : {target}  {state}")
 
-    # 用真实 git 命令复核一遍（链接是最强辨识：重写/条件包含/worktree 都交给 git 解析）
-    confirmed, evidence = verify_install_dir(target)
-    if confirmed:
+    # 用真实 git 命令复核一遍（官方链接是最强辨识：重写/条件包含/worktree 都交给 git 解析）
+    ident = verify_install_dir(target)
+    if ident.ok:
         info = ginfo.repo_info(target)
-        log_line(f"git 校验   : ✓ {evidence}")
+        mark = {"official": "✓ 官方仓库", "unofficial": "✓ 非官方远端",
+                "file": "✓ 由文件判定"}.get(ident.tier, "✓")
+        log_line(f"git 校验   : {mark} —— {ident.evidence}")
         if info.version:
             log_line(f"版本       : v{info.version}")
         if info.commit:
@@ -2603,11 +2622,13 @@ def selfcheck() -> int:
         log_line(f"克隆方式   : {'浅克隆（--depth 1，本地独有提交数算不准，更新交给 git 判断）' if info.shallow else '完整克隆'}")
         log_line(f"工作区     : {'干净' if info.dirty == 0 else f'有 {info.dirty} 处本地改动'}")
         for name, url in info.remotes.items():
-            log_line(f"远端 {name:<7}: {url}")
+            tag = "  ← 官方" if ginfo.official_remote({name: url}) == url else ""
+            log_line(f"远端 {name:<7}: {url}{tag}")
+        if ident.tier == "unofficial":
+            log_line("提示       : 远端不在官方名下（fork/镜像/本地克隆）；"
+                     "要与官方同步请自行 merge")
     else:
-        log_line(f"git 校验   : —（{evidence}）")
-    log_line("=== 自检结束 ===")
-    return 0
+        log_line(f"git 校验   : —（{ident.evidence}）")
     log_line("=== 自检结束 ===")
     return 0
 
