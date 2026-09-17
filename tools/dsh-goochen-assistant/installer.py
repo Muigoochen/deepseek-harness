@@ -57,7 +57,11 @@ CONFIG_DIR = INSTALL_BASE / ".dsh-assistant"             # 用户选择持久化
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 #: 「安装与启动」页左栏（操作区）宽度，以及左栏里长文字的换行宽度（左栏减去内边距）。
+#: 中间的竖线可以拖着调，拖完记住；这几个是默认值与上下限。
 LEFT_COL_WIDTH = 430
+LEFT_COL_MIN = 340
+LEFT_COL_MAX = 900
+LOG_COL_MIN = 320
 WRAP_LEFT = 396
 
 #: 安装方式的短名——折叠起来之后，标题上仍要看得出现在选的是哪个。
@@ -201,6 +205,14 @@ def save_config(updates: dict) -> None:
                                encoding="utf-8")
     except OSError as exc:
         log_line(f"[配置] 保存失败（本次运行仍生效）：{exc}")
+
+
+def saved_left_col_width() -> int:
+    """左栏宽度：用户拖动过中间的竖线就用他定下的，越界或文件损坏则回落默认值。"""
+    value = load_config().get("leftColWidth")
+    if isinstance(value, int) and not isinstance(value, bool) and LEFT_COL_MIN <= value <= LEFT_COL_MAX:
+        return value
+    return LEFT_COL_WIDTH
 
 
 def free_gb(path: Path) -> float:
@@ -946,11 +958,12 @@ class App(tk.Tk):
         # ---------------- Tab 1：安装与启动 ----------------
         # 两栏：左边操作区（窄、可滚轮），右边日志（宽、占满高度）。
         # 之前全竖着堆，固定块吃掉 546px，日志被挤到 3px——终端输出等于看不见。
-        cols = ttk.Frame(tab_run)
+        # 用 Panedwindow 装两栏，中间那条竖线可以拖着调宽窄，拖完记住（双击回到默认）。
+        self._wrap_labels = []
+        cols = ttk.Panedwindow(tab_run, orient="horizontal")
         cols.pack(fill="both", expand=True)
-        left_outer, left = self._scrollable(cols, width=LEFT_COL_WIDTH)
-        left_outer.pack(side="left", fill="y")
-        ttk.Separator(cols, orient="vertical").pack(side="left", fill="y", padx=8)
+        left_outer, left, canvas = self._scrollable(cols, width=saved_left_col_width())
+        cols.add(left_outer, weight=0)
 
         # 安装位置（可配置；默认方案 A：%USERPROFILE%\deepseek-harness）
         loc = ttk.LabelFrame(left, text="安装位置（产品会独立克隆到这里）", padding=8)
@@ -967,6 +980,7 @@ class App(tk.Tk):
         self.dir_hint = ttk.Label(loc, text="", foreground="#666", justify="left",
                                   wraplength=WRAP_LEFT)
         self.dir_hint.pack(anchor="w", pady=(4, 0))
+        self._wrap_labels.append(self.dir_hint)
         self.dir_var.trace_add("write", self._on_dir_changed)
         self._on_dir_changed()
 
@@ -990,6 +1004,7 @@ class App(tk.Tk):
                                       foreground="#666", justify="left",
                                       wraplength=WRAP_LEFT)
         self.git_info_lbl.pack(anchor="w")
+        self._wrap_labels.append(self.git_info_lbl)
         grow = ttk.Frame(gbox)
         grow.pack(fill="x", pady=(4, 0))
         self.btn_git_refresh = ttk.Button(grow, text="刷新信息", width=10,
@@ -1005,6 +1020,7 @@ class App(tk.Tk):
                                   font=("Microsoft YaHei UI", 8), justify="left",
                                   wraplength=WRAP_LEFT)
         self.git_note.pack(anchor="w", pady=(4, 0))
+        self._wrap_labels.append(self.git_note)
 
         # 安装方式（可折叠：装好之后基本不用动；标题上始终显示当前选择）
         # 已经装好时默认收起，把空间让给日志
@@ -1014,8 +1030,10 @@ class App(tk.Tk):
         hints = Engine.describe_assets()
         hint_txt = "已检测到离线数据：" if any(f for _, _, f in hints) else "未检测到离线数据（将走网络）："
         marks = "  ".join(f"{'✓' if ok else '—'}{name}" for name, _path, ok in hints)
-        ttk.Label(mbody, text=f"{hint_txt}\n{marks}", foreground="#666", justify="left",
-                  wraplength=WRAP_LEFT).pack(anchor="w")
+        asset_lbl = ttk.Label(mbody, text=f"{hint_txt}\n{marks}", foreground="#666",
+                              justify="left", wraplength=WRAP_LEFT)
+        asset_lbl.pack(anchor="w")
+        self._wrap_labels.append(asset_lbl)
         for value, text in (
                 ("auto", "自动选择（推荐）——有离线包走离线，缺的自动联网补"),
                 ("offline", "离线安装——完全不依赖网络（需随包离线数据）"),
@@ -1051,7 +1069,27 @@ class App(tk.Tk):
 
         # 日志（终端）——右栏，负责吃掉所有剩余空间
         lf = ttk.LabelFrame(cols, text="日志（终端输出实时显示在此）")
-        lf.pack(side="left", fill="both", expand=True)
+        cols.add(lf, weight=1)
+
+        # 中间的竖线：拖动即调宽窄；拖完夹回合理区间并记住，双击回到默认。
+        # 记的是「左栏内容宽度」（不含滚动条占位），下次启动直接用它建画布，
+        # 位置能原样还原，不会每开一次就涨一点。
+        def drag_done(_event=None) -> None:
+            try:
+                pos = cols.sashpos(0)
+            except tk.TclError:            # 拖动中或窗口销毁时的瞬时状态
+                return
+            if pos <= 1:                   # 布局未完成时 sashpos 会返回 0/1
+                return
+            limit = max(LEFT_COL_MIN, cols.winfo_width() - LOG_COL_MIN)
+            pos = min(max(pos, LEFT_COL_MIN), limit)
+            if pos != cols.sashpos(0):
+                cols.sashpos(0, pos)
+            cols.update_idletasks()        # 等重排完成，再读左栏的真实内容宽度
+            save_config({"leftColWidth": max(LEFT_COL_MIN, canvas.winfo_width())})
+
+        cols.bind("<ButtonRelease-1>", drag_done)
+        cols.bind("<Double-Button-1>", lambda _e: self._reset_left_col(cols, canvas))
         # height/width 只是「至少这么大」；width 用小值，别让文本宽度反过来撑大窗口
         self.txt = tk.Text(lf, height=20, width=20, wrap="word",
                            font=("Microsoft YaHei UI", 9))
@@ -1785,8 +1823,8 @@ class App(tk.Tk):
         "first_party-disabled": "#888", "downloaded": "#a06700",
     }
 
-    def _scrollable(self, parent, *, width: int) -> tuple[ttk.Frame, ttk.Frame]:
-        """把一块区域做成**可滚轮滚动**的，返回 `(外层, 装内容的框)`。
+    def _scrollable(self, parent, *, width: int) -> tuple[ttk.Frame, ttk.Frame, tk.Canvas]:
+        """把一块区域做成**可滚轮滚动**的，返回 `(外层, 装内容的框, 画布)`。
 
         ttk 没有现成的滚动容器，标准做法是 Canvas 里嵌一个 Frame。滚轮只在指针位于
         这块区域时生效（进入时挂全局绑定、离开时摘掉），不会抢走日志框自己的滚轮。
@@ -1798,11 +1836,17 @@ class App(tk.Tk):
         inner = ttk.Frame(canvas)
         window = canvas.create_window((0, 0), window=inner, anchor="nw")
         canvas.configure(yscrollcommand=bar.set)
-        canvas.pack(side="left", fill="both", expand=True)
+        # 滚动条先占位（pack 按顺序分配空间）：栏被拖窄时也不会把它挤没
         bar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
 
         inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+
+        def refit(event) -> None:
+            canvas.itemconfigure(window, width=event.width)
+            self._fit_wraps(event.width)          # 栏宽变了，长文字的换行宽度跟着变
+
+        canvas.bind("<Configure>", refit)
 
         def wheel(event) -> None:
             canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
@@ -1822,7 +1866,25 @@ class App(tk.Tk):
 
         outer.bind("<Enter>", enter)
         outer.bind("<Leave>", leave)
-        return outer, inner
+        return outer, inner, canvas
+
+    def _fit_wraps(self, width: int) -> None:
+        """左栏里的长文字按当前栏宽换行（拖动中间的竖线时也要跟着变）。"""
+        wrap = max(200, width - 34)
+        for label in getattr(self, "_wrap_labels", ()):
+            if label.winfo_exists():
+                label.configure(wraplength=wrap)
+
+    def _reset_left_col(self, cols: ttk.Panedwindow, canvas: tk.Canvas) -> None:
+        """双击中间的竖线：左栏宽度回到默认值，并记住这个默认值。
+
+        `sashpos(0)` 是**第一栏的宽度**（含滚动条占位），所以要补上那点占位
+        才能让内容宽度正好等于 `LEFT_COL_WIDTH`。这里**不要**顺手去改画布的
+        请求宽度：Panedwindow 会按子控件的请求反过来挪竖线，把滚动条挤没。
+        """
+        gap = max(0, cols.sashpos(0) - canvas.winfo_width())
+        cols.sashpos(0, LEFT_COL_WIDTH + gap)
+        save_config({"leftColWidth": LEFT_COL_WIDTH})
 
     def _collapsible(self, parent, title, *, expanded: bool = True) -> ttk.Frame:
         """可折叠区块：一行可点的标题 + 内容框；返回**内容框**。
