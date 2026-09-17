@@ -55,6 +55,17 @@ DEFAULT_PROJECT_DIR = INSTALL_BASE / SOURCE_DIR_NAME     # 方案 A：默认安�
 MIN_FREE_GB = 8.0                                        # 安装所需最小可用空间
 CONFIG_DIR = INSTALL_BASE / ".dsh-assistant"             # 用户选择持久化
 CONFIG_PATH = CONFIG_DIR / "config.json"
+
+#: 「安装与启动」页左栏（操作区）宽度，以及左栏里长文字的换行宽度（左栏减去内边距）。
+LEFT_COL_WIDTH = 430
+WRAP_LEFT = 396
+
+#: 安装方式的短名——折叠起来之后，标题上仍要看得出现在选的是哪个。
+MODE_CN = {
+    "auto": "自动选择（推荐）",
+    "offline": "离线安装",
+    "online": "在线安装",
+}
 LOG_PATH = HERE / "installer.log"
 
 ALL_STEPS = ("detect", "node", "pnpm", "source", "deps", "build", "start")
@@ -871,7 +882,7 @@ class Engine:
 
 # ---------------------------------------------------------------- GUI
 class App(tk.Tk):
-    WIDTH, HEIGHT = 860, 720
+    WIDTH, HEIGHT = 1000, 720
 
     def __init__(self) -> None:
         super().__init__()
@@ -933,27 +944,17 @@ class App(tk.Tk):
         nb.add(tab_mig, text="会话迁移")
 
         # ---------------- Tab 1：安装与启动 ----------------
-        # 安装方式
-        box = ttk.LabelFrame(tab_run, text="安装方式", padding=8)
-        box.pack(fill="x", pady=4)
-        hints = Engine.describe_assets()
-        hint_txt = "已检测到离线数据：" if any(f for _, _, f in hints) else "未检测到离线数据（将走网络）："
-        ttk.Label(box, text=hint_txt, foreground="#666").pack(anchor="w")
-        for name, path, ok in hints:
-            ttk.Label(box, text=f"  {'✓' if ok else '—'} {name}",
-                      foreground="#2a6b2a" if ok else "#999").pack(anchor="w")
-        ttk.Radiobutton(box, text="自动选择（推荐）——有离线包走离线，缺的自动联网补",
-                        variable=self.mode, value="auto").pack(anchor="w", pady=(6, 0))
-        ttk.Radiobutton(box, text="离线安装——完全不依赖网络（需随包离线数据）",
-                        variable=self.mode, value="offline").pack(anchor="w")
-        ttk.Radiobutton(box, text="在线安装——从网络源下载（较慢）",
-                        variable=self.mode, value="online").pack(anchor="w")
-        ttk.Checkbutton(box, text="在线安装时使用国内镜像 npmmirror 加速", variable=self.mirror
-                        ).pack(anchor="w")
+        # 两栏：左边操作区（窄、可滚轮），右边日志（宽、占满高度）。
+        # 之前全竖着堆，固定块吃掉 546px，日志被挤到 3px——终端输出等于看不见。
+        cols = ttk.Frame(tab_run)
+        cols.pack(fill="both", expand=True)
+        left_outer, left = self._scrollable(cols, width=LEFT_COL_WIDTH)
+        left_outer.pack(side="left", fill="y")
+        ttk.Separator(cols, orient="vertical").pack(side="left", fill="y", padx=8)
 
         # 安装位置（可配置；默认方案 A：%USERPROFILE%\deepseek-harness）
-        loc = ttk.LabelFrame(tab_run, text="安装位置（产品会独立克隆到这里）", padding=8)
-        loc.pack(fill="x", pady=4)
+        loc = ttk.LabelFrame(left, text="安装位置（产品会独立克隆到这里）", padding=8)
+        loc.pack(fill="x")
         lrow = ttk.Frame(loc)
         lrow.pack(fill="x")
         self.dir_var = tk.StringVar(value=str(project_dir()))
@@ -963,16 +964,31 @@ class App(tk.Tk):
         dir_ent.bind("<Return>", self._on_dir_committed)
         ttk.Button(lrow, text="浏览…", command=self._on_pick_dir).pack(side="left", padx=(6, 0))
         ttk.Button(lrow, text="恢复默认", command=self._on_reset_dir).pack(side="left", padx=(6, 0))
-        self.dir_hint = ttk.Label(loc, text="", foreground="#666")
+        self.dir_hint = ttk.Label(loc, text="", foreground="#666", justify="left",
+                                  wraplength=WRAP_LEFT)
         self.dir_hint.pack(anchor="w", pady=(4, 0))
         self.dir_var.trace_add("write", self._on_dir_changed)
         self._on_dir_changed()
 
+        # 大按钮（最常用；终端输出在右侧日志区）
+        btns = ttk.Frame(left)
+        btns.pack(fill="x", pady=(6, 0))
+        self.btn_full = ttk.Button(btns, text="一键完整安装", command=self.on_full)
+        self.btn_full.pack(fill="x", ipady=3)
+        brow = ttk.Frame(left)
+        brow.pack(fill="x", pady=(4, 0))
+        self.btn_term = ttk.Button(brow, text="运行", command=self.on_terminal)
+        self.btn_term.pack(side="left", fill="x", expand=True, ipady=3)
+        self.btn_stop = ttk.Button(brow, text="⏹ 停止服务", command=self.on_stop_terminal,
+                                   state="disabled")
+        self.btn_stop.pack(side="left", fill="x", expand=True, padx=(6, 0), ipady=3)
+
         # 版本与更新（结论全部来自真实 git 命令，不解析 .git 里的文本）
-        gbox = ttk.LabelFrame(tab_run, text="版本与更新（由 git 校验）", padding=8)
-        gbox.pack(fill="x", pady=4)
+        gbox = ttk.LabelFrame(left, text="版本与更新（由 git 校验）", padding=8)
+        gbox.pack(fill="x", pady=(6, 0))
         self.git_info_lbl = ttk.Label(gbox, text="（正在读取 git 信息…）",
-                                      foreground="#666", justify="left", wraplength=780)
+                                      foreground="#666", justify="left",
+                                      wraplength=WRAP_LEFT)
         self.git_info_lbl.pack(anchor="w")
         grow = ttk.Frame(gbox)
         grow.pack(fill="x", pady=(4, 0))
@@ -985,50 +1001,59 @@ class App(tk.Tk):
         self.btn_git_apply = ttk.Button(grow, text="更新到最新", width=11,
                                         command=self.on_update_now)
         self.btn_git_apply.pack(side="left", padx=(6, 0))
-        self.git_note = ttk.Label(grow, text="检查更新需要联网", foreground="#888",
-                                  font=("Microsoft YaHei UI", 8))
-        self.git_note.pack(side="left", padx=(8, 0))
+        self.git_note = ttk.Label(gbox, text="检查更新需要联网", foreground="#888",
+                                  font=("Microsoft YaHei UI", 8), justify="left",
+                                  wraplength=WRAP_LEFT)
+        self.git_note.pack(anchor="w", pady=(4, 0))
 
-        # 按钮
-        btns = ttk.Frame(tab_run)
-        btns.pack(fill="x", pady=6)
-        self.btn_full = ttk.Button(btns, text="一键完整安装", command=self.on_full)
-        self.btn_full.pack(side="left", ipadx=16, ipady=3)
-        self.btn_term = ttk.Button(btns, text="运行", command=self.on_terminal)
-        self.btn_term.pack(side="left", padx=8, ipadx=16, ipady=3)
-        self.btn_stop = ttk.Button(btns, text="⏹ 停止服务", command=self.on_stop_terminal,
-                                   state="disabled")
-        self.btn_stop.pack(side="left", padx=(0, 8), ipadx=16, ipady=3)
-        ttk.Label(btns, text="（终端输出在下方日志区实时显示）",
-                  foreground="#666").pack(side="left", padx=0)
+        # 安装方式（可折叠：装好之后基本不用动；标题上始终显示当前选择）
+        # 已经装好时默认收起，把空间让给日志
+        self.mode_title = tk.StringVar()
+        mbody = self._collapsible(left, self.mode_title,
+                                 expanded=not is_checkout(project_dir()))
+        hints = Engine.describe_assets()
+        hint_txt = "已检测到离线数据：" if any(f for _, _, f in hints) else "未检测到离线数据（将走网络）："
+        marks = "  ".join(f"{'✓' if ok else '—'}{name}" for name, _path, ok in hints)
+        ttk.Label(mbody, text=f"{hint_txt}\n{marks}", foreground="#666", justify="left",
+                  wraplength=WRAP_LEFT).pack(anchor="w")
+        for value, text in (
+                ("auto", "自动选择（推荐）——有离线包走离线，缺的自动联网补"),
+                ("offline", "离线安装——完全不依赖网络（需随包离线数据）"),
+                ("online", "在线安装——从网络源下载（较慢）")):
+            ttk.Radiobutton(mbody, text=text, variable=self.mode, value=value,
+                            command=self._refresh_mode_title).pack(anchor="w")
+        ttk.Checkbutton(mbody, text="在线安装时使用国内镜像 npmmirror 加速",
+                        variable=self.mirror).pack(anchor="w")
+        self._refresh_mode_title()
 
-        # 打开与复制
-        ops = ttk.LabelFrame(tab_run, text="打开与复制（选浏览器 → 打开登录页 / 复制）", padding=8)
-        ops.pack(fill="x", pady=4)
-        row = ttk.Frame(ops)
-        row.pack(fill="x")
-        ttk.Label(row, text="浏览器：").pack(side="left")
+        # 打开与复制（可折叠：日常偶尔用，收起来给日志让位）
+        obody = self._collapsible(left, "打开与复制（选浏览器 → 打开登录页 / 复制）",
+                                  expanded=True)
+        brow2 = ttk.Frame(obody)
+        brow2.pack(fill="x")
+        ttk.Label(brow2, text="浏览器：").pack(side="left")
         self.browser_var = tk.StringVar(value="默认浏览器")
-        self.browser_box = ttk.Combobox(row, textvariable=self.browser_var,
-                                        values=BROWSER_CHOICES, state="readonly", width=20)
+        self.browser_box = ttk.Combobox(brow2, textvariable=self.browser_var,
+                                        values=BROWSER_CHOICES, state="readonly", width=18)
         self.browser_box.pack(side="left", padx=(0, 4))
         self.browser_box.bind("<<ComboboxSelected>>", self._on_browser_pick)
-        self.custom_hint = ttk.Label(row, text="", foreground="#666")
-        self.custom_hint.pack(side="left", padx=(0, 8))
-        self.btn_open_page = ttk.Button(row, text="打开登录页", command=self.on_open_page)
-        self.btn_open_page.pack(side="left", ipadx=12, ipady=2)
-        self.btn_copy_url = ttk.Button(row, text="复制登录地址", command=self.on_copy_url,
+        self.custom_hint = ttk.Label(brow2, text="", foreground="#666")
+        self.custom_hint.pack(side="left")
+        orow = ttk.Frame(obody)
+        orow.pack(fill="x", pady=(4, 0))
+        self.btn_open_page = ttk.Button(orow, text="打开登录页", command=self.on_open_page)
+        self.btn_open_page.pack(side="left", fill="x", expand=True, ipady=2)
+        self.btn_copy_url = ttk.Button(orow, text="复制登录地址", command=self.on_copy_url,
                                        state="disabled")
-        self.btn_copy_url.pack(side="left", padx=8, ipadx=12, ipady=2)
-        self.btn_copy_path = ttk.Button(row, text="复制项目路径", command=self.on_copy_path)
-        self.btn_copy_path.pack(side="left", ipadx=12, ipady=2)
-        ttk.Label(ops, text="用「运行」启动后，可在此再次打开或复制带 token 的登录地址。",
-                  foreground="#666").pack(anchor="w", pady=(6, 0))
+        self.btn_copy_url.pack(side="left", fill="x", expand=True, padx=(6, 0), ipady=2)
+        self.btn_copy_path = ttk.Button(orow, text="复制项目路径", command=self.on_copy_path)
+        self.btn_copy_path.pack(side="left", fill="x", expand=True, padx=(6, 0), ipady=2)
 
-        # 日志（终端）
-        lf = ttk.LabelFrame(tab_run, text="日志（终端输出实时显示在此）")
-        lf.pack(fill="both", expand=True, pady=(4, 0))
-        self.txt = tk.Text(lf, height=12, wrap="word",
+        # 日志（终端）——右栏，负责吃掉所有剩余空间
+        lf = ttk.LabelFrame(cols, text="日志（终端输出实时显示在此）")
+        lf.pack(side="left", fill="both", expand=True)
+        # height/width 只是「至少这么大」；width 用小值，别让文本宽度反过来撑大窗口
+        self.txt = tk.Text(lf, height=20, width=20, wrap="word",
                            font=("Microsoft YaHei UI", 9))
         sb = ttk.Scrollbar(lf, command=self.txt.yview)
         self.txt.configure(yscrollcommand=sb.set)
@@ -1759,6 +1784,81 @@ class App(tk.Tk):
         "external-disabled": "#888", "first_party": "#666",
         "first_party-disabled": "#888", "downloaded": "#a06700",
     }
+
+    def _scrollable(self, parent, *, width: int) -> tuple[ttk.Frame, ttk.Frame]:
+        """把一块区域做成**可滚轮滚动**的，返回 `(外层, 装内容的框)`。
+
+        ttk 没有现成的滚动容器，标准做法是 Canvas 里嵌一个 Frame。滚轮只在指针位于
+        这块区域时生效（进入时挂全局绑定、离开时摘掉），不会抢走日志框自己的滚轮。
+        """
+        outer = ttk.Frame(parent)
+        bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        canvas = tk.Canvas(outer, width=width, highlightthickness=0, borderwidth=0, bg=bg)
+        bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+
+        def wheel(event) -> None:
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+        def enter(_event=None) -> None:
+            canvas.bind_all("<MouseWheel>", wheel)
+
+        def leave(event) -> None:
+            # 指针移进子控件时也会触发 <Leave>（Tcl 的 NotifyInferior，但 tkinter
+            # 的事件对象没有 detail 字段），所以用「指针底下还是不是这一块」来判断。
+            under = outer.winfo_containing(event.x_root, event.y_root)
+            while under is not None:
+                if under is outer:
+                    return
+                under = getattr(under, "master", None)
+            canvas.unbind_all("<MouseWheel>")
+
+        outer.bind("<Enter>", enter)
+        outer.bind("<Leave>", leave)
+        return outer, inner
+
+    def _collapsible(self, parent, title, *, expanded: bool = True) -> ttk.Frame:
+        """可折叠区块：一行可点的标题 + 内容框；返回**内容框**。
+
+        `title` 可以是字符串，也可以是 `tk.StringVar`（标题随状态变化时用，例如当前安装方式）。
+        """
+        state = {"open": expanded}
+        head = ttk.Frame(parent)
+        head.pack(fill="x", pady=(6, 0))
+        arrow = ttk.Label(head, text="▾" if expanded else "▸", foreground="#1a4a8a",
+                          cursor="hand2")
+        arrow.pack(side="left")
+        if isinstance(title, tk.StringVar):
+            name = ttk.Label(head, textvariable=title, foreground="#1a4a8a", cursor="hand2")
+        else:
+            name = ttk.Label(head, text=title, foreground="#1a4a8a", cursor="hand2")
+        name.pack(side="left", padx=(2, 0))
+        body = ttk.Frame(parent)
+
+        def toggle(_event=None) -> None:
+            state["open"] = not state["open"]
+            arrow.configure(text="▾" if state["open"] else "▸")
+            if state["open"]:
+                body.pack(fill="x", pady=(4, 0))
+            else:
+                body.pack_forget()
+
+        for widget in (arrow, name):
+            widget.bind("<Button-1>", toggle)
+        if expanded:
+            body.pack(fill="x", pady=(4, 0))
+        return body
+
+    def _refresh_mode_title(self) -> None:
+        """折叠标题上始终显示当前安装方式，收起后也知道选的是哪个。"""
+        self.mode_title.set(f"安装方式：{MODE_CN.get(self.mode.get(), self.mode.get())}")
 
     def _build_plugin_ui(self, root: ttk.Frame) -> None:
         box = ttk.LabelFrame(root, text="插件", padding=8)
