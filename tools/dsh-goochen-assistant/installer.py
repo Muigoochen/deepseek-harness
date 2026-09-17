@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import plugin_store as pstore  # 插件管理原语（同目录模块）
+import gitinfo as ginfo        # 真 git 命令层（识别/校验/版本/更新）
 
 __version__ = "0.1.0"
 
@@ -292,6 +294,26 @@ def _dsh_subpackage(path: Path, group: str = "core", limit: int = 40) -> str:
 def is_checkout(path: Path) -> bool:
     """该目录是否是一个 DSH 检出（= 已装好，可直接运行、无需重装）。"""
     return bool(checkout_identity(path))
+
+
+def verify_install_dir(path: Path, info=None) -> tuple[bool, str]:
+    """确认「这个目录就是装好的 DSH」，返回 `(是否确认, 依据)`。
+
+    先让**真 git 命令**拍板（仓库链接是最强辨识）；git 不可用、或该目录不是
+    git 仓库（离线解压出来的就是这种）时，退回廉价的文件判定。
+    注意：一次要跑若干条 git（约 0.2 秒），所以只用在「用户选定的那一个目录」上，
+    不要放进扫盘或每次按键的路径里。
+    """
+    if info is None:
+        info = ginfo.repo_info(path)
+    if info.ok:
+        confirmed, evidence = ginfo.verify_dsh_repo(path, info)
+        if confirmed:
+            return True, evidence
+    why = checkout_identity(path)
+    if why:
+        return True, why
+    return False, (info.error or "既不是 DSH 检出，也不是 DSH 的 git 仓库")
 
 
 # ------------------------------------------------- 安装标记（离线装的身份证）
@@ -724,8 +746,10 @@ class Engine:
 
     def prepare_source(self) -> Path:
         project = project_dir()
-        if is_checkout(project):
-            self.log(f"④ 已检测到现有 DSH：{project}（复用，不重新下载）")
+        # 先让真 git 复核一次（链接是最强辨识），再退回文件判定
+        confirmed, evidence = verify_install_dir(project)
+        if confirmed:
+            self.log(f"④ 已确认现有 DSH：{project}（{evidence}）")
             return project
         # 有 package.json 却不是 DSH 检出 = 用户自己的项目。绝不能在这里跑
         # pnpm install/build（会改动/污染无关项目），必须让用户换目录。
@@ -852,9 +876,17 @@ class App(tk.Tk):
         # --- 会话迁移（v0.1）状态 ---
         self.mig_busy = False
         self.mig_rows: list[dict[str, str]] = []
+        # --- 版本与更新（真 git 命令）状态 ---
+        self.git_busy = False
+        self._git_after: str | None = None
+        self._closing = False
+        # 工作线程 → 界面线程的唯一安全通道（见 _post）
+        self._ui_queue: queue.Queue = queue.Queue()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(400, self._refresh_plugins)
+        self.after(60, self._drain_ui_queue)
+        self._schedule_git_refresh(600)
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=10)
@@ -910,6 +942,24 @@ class App(tk.Tk):
         self.dir_hint.pack(anchor="w", pady=(4, 0))
         self.dir_var.trace_add("write", self._on_dir_changed)
         self._on_dir_changed()
+
+        # 版本与更新（结论全部来自真实 git 命令，不解析 .git 里的文本）
+        gbox = ttk.LabelFrame(tab_run, text="版本与更新（由 git 校验）", padding=8)
+        gbox.pack(fill="x", pady=4)
+        self.git_info_lbl = ttk.Label(gbox, text="（正在读取 git 信息…）",
+                                      foreground="#666", justify="left", wraplength=780)
+        self.git_info_lbl.pack(anchor="w")
+        grow = ttk.Frame(gbox)
+        grow.pack(fill="x", pady=(4, 0))
+        self.btn_git_refresh = ttk.Button(grow, text="刷新信息", width=10,
+                                          command=self.on_git_refresh)
+        self.btn_git_refresh.pack(side="left")
+        self.btn_git_update = ttk.Button(grow, text="检查更新", width=10,
+                                         command=self.on_check_update)
+        self.btn_git_update.pack(side="left", padx=(6, 0))
+        self.git_note = ttk.Label(grow, text="检查更新需要联网", foreground="#888",
+                                  font=("Microsoft YaHei UI", 8))
+        self.git_note.pack(side="left", padx=(8, 0))
 
         # 按钮
         btns = ttk.Frame(tab_run)
@@ -975,14 +1025,35 @@ class App(tk.Tk):
                      "会话迁移（换 preset）在「会话迁移」页。")
         self.log = self._append
 
+    def _post(self, fn, *args) -> None:
+        """把回调交给**界面线程**执行——工作线程更新界面必须走这里。
+
+        tkinter 的 `after()` 不是线程安全的：在子线程里调用会抛
+        「main thread is not in main loop」，并发时还可能破坏 Tcl 解释器；
+        而过去的写法把它包在 `except` 里，于是日志/状态更新被**静默丢掉**。
+        `queue.Queue` 是线程安全的，取出与执行都发生在界面线程。
+        """
+        self._ui_queue.put((fn, args))
+
+    def _drain_ui_queue(self) -> None:
+        """界面线程侧：取出并执行工作线程投递的回调（每轮限量，避免饿死界面）。"""
+        for _ in range(50):
+            try:
+                fn, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args)
+            except Exception as exc:  # noqa: BLE001  单个回调出错不该拖垮整个队列
+                log_line(f"[界面] 回调失败：{exc}")
+        if not self._closing:
+            self.after(60, self._drain_ui_queue)
+
     def _append(self, msg: str) -> None:
-        def write():
+        def write() -> None:
             self.txt.insert("end", str(msg) + "\n")
             self.txt.see("end")
-        try:
-            self.after(0, write)
-        except Exception:  # noqa: BLE001
-            pass
+        self._post(write)
 
     def _ro_key(self, e) -> str | None:
         """只读保护：拦截会改动文本的按键，保留方向键与 Ctrl 组合（复制/全选）。"""
@@ -1052,17 +1123,19 @@ class App(tk.Tk):
             except Exception:  # noqa: BLE001
                 pass
         try:
-            self.after(0, apply)
-        except Exception:  # noqa: BLE001
+            running = self.web_proc is not None and self.web_proc.poll() is None
+            self.btn_term.configure(
+                state="disabled" if (running or self.busy) else "normal")
+            self.btn_stop.configure(
+                state="normal" if (running and not self.busy) else "disabled")
+        except Exception:  # noqa: BLE001  窗口销毁后控件不可用，忽略即可
             pass
+        self._post(apply)
 
     def _status(self, text: str, color: str = "#1a6b1a") -> None:
-        def setit():
+        def setit() -> None:
             self.status.configure(text=text, foreground=color)
-        try:
-            self.after(0, setit)
-        except Exception:  # noqa: BLE001
-            pass
+        self._post(setit)
 
     def on_full(self) -> None:
         if self.busy:
@@ -1083,6 +1156,9 @@ class App(tk.Tk):
             return
         set_project_dir(target)
         self._append(f"[安装位置] {target}")
+        # 点安装时用真 git 复核一次（约 0.2 秒），确认到底是复用还是全新装
+        confirmed, evidence = verify_install_dir(target)
+        self._append(f"[安装位置] {'✓ ' + evidence if confirmed else '尚未安装，将全新装到这里'}")
         self._set_busy(True)
         eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
                      log=self._append)
@@ -1105,6 +1181,7 @@ class App(tk.Tk):
         """
         set_active_dir(self._current_dir() if self.dir_var.get().strip() else None)
         self._dir_hint()
+        self._schedule_git_refresh()
 
     def _on_dir_committed(self, _event=None) -> None:
         """失焦/回车 = 用户确认了这个位置，顺手记进配置（空值不动配置）。"""
@@ -1160,6 +1237,112 @@ class App(tk.Tk):
                     if free >= 0 else "✓ 可用 → 将安装到这里")
             color = "#1a6b1a"
         self.dir_hint.configure(text=text, foreground=color)
+
+    # ---------------- 版本与更新（结论全部来自真实 git 命令）----------------
+
+    def _schedule_git_refresh(self, delay: int = 400) -> None:
+        """输入变化后延迟跑一次 git 探测（一次约 0.2 秒，不能每敲一键就跑）。"""
+        if self._closing:
+            return
+        if self._git_after is not None:
+            try:
+                self.after_cancel(self._git_after)
+            except Exception:  # noqa: BLE001  窗口已销毁时 after_cancel 会报错
+                pass
+        self._git_after = self.after(delay, self.on_git_refresh)
+
+    def on_git_refresh(self) -> None:
+        self._git_after = None
+        if self.git_busy or self._closing:
+            return
+        target = self._effective_dir()
+        self.git_busy = True
+        self._set_git_buttons(False)
+        threading.Thread(target=self._git_info_worker, args=(target,),
+                         daemon=True).start()
+
+    def _git_info_worker(self, target: Path) -> None:
+        try:
+            info = ginfo.repo_info(target)
+            confirmed, evidence = verify_install_dir(target, info)
+        except Exception as exc:  # noqa: BLE001  git 层的任何意外都不该卡住界面
+            self._post(self._git_error, str(exc))
+            return
+        self._post(self._show_git_info, info, confirmed, evidence)
+
+    def _git_error(self, message: str) -> None:
+        self.git_busy = False
+        self._set_git_buttons(True)
+        self._set_label(self.git_info_lbl, f"读取失败：{message}", "#b00000")
+
+    def _show_git_info(self, info, confirmed: bool, evidence: str) -> None:
+        self.git_busy = False
+        self._set_git_buttons(True)
+        if not confirmed:
+            self._set_label(self.git_info_lbl, f"✗ 未确认是 DSH 安装：{evidence}",
+                            "#b00000")
+            return
+        bits: list[str] = []
+        if info.version:
+            bits.append(f"版本 v{info.version}")
+        if info.short:
+            day = info.committed_at[:10]
+            bits.append(f"提交 {info.short}" + (f"（{day}）" if day else ""))
+        if info.branch:
+            bits.append(f"分支 {info.branch}")
+        bits.append("工作区干净" if info.dirty == 0 else f"工作区有 {info.dirty} 处本地改动")
+        if info.upstream:
+            bits.append(f"相对 {info.upstream}：领先 {info.ahead} / 落后 {info.behind}")
+        self._set_label(self.git_info_lbl, " · ".join(bits) + f"\n依据：{evidence}",
+                        "#1a6b1a")
+
+    def _set_label(self, widget, text: str, color: str) -> None:
+        try:
+            widget.configure(text=text, foreground=color)
+        except Exception:  # noqa: BLE001  结果回来时窗口可能已被关闭
+            pass
+
+    def _set_git_buttons(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for btn in (self.btn_git_refresh, self.btn_git_update):
+            try:
+                btn.configure(state=state)
+            except Exception:  # noqa: BLE001  同上：窗口可能已销毁
+                pass
+
+    def on_check_update(self) -> None:
+        """联网 `git fetch` 后与远端比较——落后多少个提交是 git 算出来的。"""
+        if self.git_busy or self._closing:
+            return
+        target = self._effective_dir()
+        self.git_busy = True
+        self._set_git_buttons(False)
+        self._set_label(self.git_note, "正在联网检查更新…", "#a05a00")
+        threading.Thread(target=self._check_update_worker, args=(target,),
+                         daemon=True).start()
+
+    def _check_update_worker(self, target: Path) -> None:
+        try:
+            status = ginfo.check_update(target)
+        except Exception as exc:  # noqa: BLE001  git 层意外 → 如实显示失败原因
+            status = ginfo.UpdateStatus(ok=False, error=str(exc))
+        self._post(self._show_update_status, status)
+
+    def _show_update_status(self, status) -> None:
+        self.git_busy = False
+        self._set_git_buttons(True)
+        if not status.ok:
+            self._set_label(self.git_note, f"检查失败：{status.error}", "#b00000")
+            return
+        if status.behind == 0:
+            text, color = "✓ 已是最新", "#1a6b1a"
+        else:
+            extra = (f"（最新 {status.latest} {status.latest_subject}）"
+                     if status.latest else "")
+            text, color = f"⚠ 落后 {status.behind} 个提交{extra}", "#a05a00"
+        if status.ahead:
+            text += f"；本地领先 {status.ahead} 个提交"
+        self._set_label(self.git_note, text, color)
 
     def _job(self, eng: Engine) -> None:
         try:
@@ -1337,12 +1520,9 @@ class App(tk.Tk):
             try:
                 self.btn_copy_url.configure(
                     state="normal" if self.web_auth_url else "disabled")
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001  窗口销毁后控件不可用，忽略即可
                 pass
-        try:
-            self.after(0, apply)
-        except Exception:  # noqa: BLE001
-            pass
+        self._post(apply)
 
     def _pump_web(self, proc: subprocess.Popen) -> None:
         """后台读子进程 stdout，转 UI 日志；顺带捕获登录地址；退出后复位状态。"""
@@ -1521,7 +1701,7 @@ class App(tk.Tk):
         try:
             env = self._plugin_env()
             if env is None:
-                self.after(0, lambda: self.plugin_hint_lbl.configure(text="环境未就绪"))
+                self._post(lambda: self.plugin_hint_lbl.configure(text="环境未就绪"))
                 return
             home, project = env
             sources = self._plugin_sources(home, project)
@@ -1537,8 +1717,7 @@ class App(tk.Tk):
             cards = pstore.status_view(home, sources, dump)
             entries = pstore.market_entries(home, project, ASSETS)
             catalog = pstore.catalog_entries(home)
-            self.after(0, lambda: self._apply_plugins(cards, entries, home, project,
-                                                      catalog))
+            self._post(self._apply_plugins, cards, entries, home, project, catalog)
         except Exception as exc:  # noqa: BLE001
             self._append(f"[插件] 刷新失败：{exc}")
 
@@ -1680,11 +1859,12 @@ class App(tk.Tk):
                 self._status(f"已更新 {spec}")
         except (pstore.PluginError, pstore.GateError) as exc:
             self._plog(f"[市场] ✗ {value}：{exc}")
-            self._status(f"市场操作失败：{exc}", "#b00000")
-            messagebox.showerror("市场操作失败", str(exc))
+            self._status("市场操作失败：%s" % exc, "#b00000")
+            # 弹窗必须在界面线程（工作是子线程），参数先取值再投递
+            self._post(messagebox.showerror, "市场操作失败", str(exc))
         finally:
-            self.after(0, self._refresh_plugins)
-            self._set_plugin_busy(False)
+            self._post(self._refresh_plugins)
+            self._post(self._set_plugin_busy, False)
 
     def _market_local(self, value: str, project: Path):
         p = Path(value)
@@ -1874,8 +2054,8 @@ class App(tk.Tk):
             self._plog(f"[插件] ✗ 下载 {slug} 失败：{exc}")
             self._status("下载失败 ✗（详情见日志）", "#b00000")
         finally:
-            self.after(0, lambda: self._set_plugin_busy(False))
-            self.after(0, self._refresh_plugins)
+            self._post(self._set_plugin_busy, False)
+            self._post(self._refresh_plugins)
 
     def _plugin_act(self, slug: str, action: str) -> None:
         if self.plugin_busy or action == "none":
@@ -1955,8 +2135,7 @@ class App(tk.Tk):
             fail_msgs.append(str(exc))
             self._plog(f"[插件] ✗ 保存失败：{exc}")
         finally:
-            self.after(0, lambda: self._plugin_save_done(ok_all, was_running,
-                                                         fail_msgs))
+            self._post(self._plugin_save_done, ok_all, was_running, fail_msgs)
 
     def _plugin_save_done(self, ok_all: bool, was_running: bool,
                           fail_msgs: list[str]) -> None:
@@ -2127,8 +2306,8 @@ class App(tk.Tk):
 
     def _mig_fail(self, exc: BaseException) -> None:
         self._append(f"[会话迁移] 失败：{exc}")
-        self.after(0, lambda: self._mig_set_busy(False))
-        self.after(0, lambda: self.mig_status.configure(text=f"失败：{exc}", foreground="#a11"))
+        self._post(self._mig_set_busy, False)
+        self._post(lambda: self.mig_status.configure(text=f"失败：{exc}", foreground="#a11"))
 
     # ---- 扫描
     def _mig_scan(self) -> None:
@@ -2139,7 +2318,7 @@ class App(tk.Tk):
 
     def _mig_scan_worker(self) -> None:
         try:
-            self.after(0, lambda: self._mig_set_busy(True))
+            self._post(self._mig_set_busy, True)
             node = self._mig_node()
             script = self._mig_script()
             if not script.exists():
@@ -2161,9 +2340,9 @@ class App(tk.Tk):
                     "sub": bool(item.get("subagent")),
                     "error": item.get("error") or "",
                 })
-            self.after(0, lambda: self._mig_apply_rows(rows))
-        except Exception as exc:  # noqa: BLE001
-            self.after(0, lambda: self._mig_fail(exc))
+            self._post(self._mig_apply_rows, rows)
+        except Exception as exc:  # noqa: BLE001  扫描失败如实报到界面即可
+            self._post(self._mig_fail, exc)
 
     def _mig_apply_rows(self, rows: list[dict[str, str]]) -> None:
         rows.sort(key=lambda r: -(int(r.get("bytes") or 0)))
@@ -2256,7 +2435,7 @@ class App(tk.Tk):
 
     def _mig_run_worker(self, op: str, args: list[str]) -> None:
         try:
-            self.after(0, lambda: self._mig_set_busy(True))
+            self._post(self._mig_set_busy, True)
             node = self._mig_node()
             proc = run([node, str(self._mig_script()), op, *args])
             out = decode_proc(proc)
@@ -2270,11 +2449,11 @@ class App(tk.Tk):
                 "verify": "校验完成（结果见上方日志）。",
                 "restore": "恢复完成。",
             }[op]
-            self.after(0, lambda: self.mig_status.configure(text=tail, foreground="#1a6b1a"))
-        except Exception as exc:  # noqa: BLE001
-            self.after(0, lambda: self._mig_fail(exc))
+            self._post(lambda: self.mig_status.configure(text=tail, foreground="#1a6b1a"))
+        except Exception as exc:  # noqa: BLE001  迁移失败如实报到界面即可
+            self._post(self._mig_fail, exc)
         finally:
-            self.after(0, lambda: self._mig_set_busy(False))
+            self._post(self._mig_set_busy, False)
 
     def _mig_open_backups(self) -> None:
         backup_root = plugin_home() / "_session-preset-backup"
@@ -2286,10 +2465,11 @@ class App(tk.Tk):
 
     def _on_close(self) -> None:
         """关窗口前先停 dsh web，再销毁窗口。"""
+        self._closing = True
         self._stop_web_internal(quiet=False)
         try:
             self.destroy()
-        except Exception:
+        except Exception:  # noqa: BLE001  已经在销毁中时 destroy 会报错，无需处理
             pass
 
 
@@ -2327,6 +2507,28 @@ def selfcheck() -> int:
     else:
         state = "尚未安装（安装时会克隆/解压到这里）"
     log_line(f"项目目录   : {target}  {state}")
+
+    # 用真实 git 命令复核一遍（链接是最强辨识：重写/条件包含/worktree 都交给 git 解析）
+    confirmed, evidence = verify_install_dir(target)
+    if confirmed:
+        info = ginfo.repo_info(target)
+        log_line(f"git 校验   : ✓ {evidence}")
+        if info.version:
+            log_line(f"版本       : v{info.version}")
+        if info.commit:
+            log_line(f"提交       : {info.short}  {info.subject}")
+            log_line(f"提交时间   : {info.committed_at}")
+        if info.branch:
+            log_line(f"分支       : {info.branch}"
+                     f"（相对 {info.upstream}：领先 {info.ahead} / 落后 {info.behind}）"
+                     if info.upstream else f"分支       : {info.branch}")
+        log_line(f"工作区     : {'干净' if info.dirty == 0 else f'有 {info.dirty} 处本地改动'}")
+        for name, url in info.remotes.items():
+            log_line(f"远端 {name:<7}: {url}")
+    else:
+        log_line(f"git 校验   : —（{evidence}）")
+    log_line("=== 自检结束 ===")
+    return 0
     log_line("=== 自检结束 ===")
     return 0
 

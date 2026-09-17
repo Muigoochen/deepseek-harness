@@ -509,7 +509,9 @@ class PrepareSourceTest(unittest.TestCase):
         root = self._make_checkout(self.tmp / "deepseek_harness")
         installer.set_active_dir(root)
         self.assertEqual(self._engine().prepare_source(), root)
-        self.assertTrue(any("已检测到现有 DSH" in m for m in self.logs), self.logs)
+        # 日志要带上「凭什么确认」的依据（不是只说一句复用）
+        self.assertTrue(any("已确认现有 DSH" in m and "dsh-root" in m
+                            for m in self.logs), self.logs)
 
     def test_offline_install_writes_marker(self):
         """离线解压出来的目录没有 .git → 装完必须写下安装标记（绑定官方链接）。"""
