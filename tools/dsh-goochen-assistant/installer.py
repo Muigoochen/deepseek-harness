@@ -959,12 +959,17 @@ def bind_wheel_tree(root: tk.Misc, handler) -> None:
 
 
 class App(tk.Tk):
+    #: 默认窗口大小；大屏上按屏幕再放大一点（日志栏宽一点更好看），并居中显示。
     WIDTH, HEIGHT = 1000, 720
 
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
+        width = min(1180, max(self.WIDTH, self.winfo_screenwidth() - 640))
+        height = min(860, max(self.HEIGHT, self.winfo_screenheight() - 360))
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 3)
+        self.geometry(f"{width}x{height}+{x}+{y}")
         self.minsize(760, 600)
         self.mode = tk.StringVar(value="auto")
         self.mirror = tk.BooleanVar(value=True)
@@ -1030,7 +1035,7 @@ class App(tk.Tk):
         self._wrap_labels = []
         cols = ttk.Panedwindow(tab_run, orient="horizontal")
         cols.pack(fill="both", expand=True)
-        left_outer, left, canvas = self._scrollable(cols, width=saved_left_col_width())
+        left_outer, left, canvas, left_bar = self._scrollable(cols, width=saved_left_col_width())
         cols.add(left_outer, weight=0)
 
         # 安装位置（可配置；默认方案 A：%USERPROFILE%\deepseek-harness）
@@ -1142,8 +1147,10 @@ class App(tk.Tk):
         self.btn_copy_path = ttk.Button(orow, text="复制项目路径", command=self.on_copy_path)
         self.btn_copy_path.pack(side="left", fill="x", expand=True, padx=(6, 0), ipady=2)
 
-        # 日志（终端）——右栏，负责吃掉所有剩余空间
-        lf = ttk.LabelFrame(cols, text="日志（终端输出实时显示在此）")
+        # 日志（终端）——右栏，负责吃掉所有剩余空间。
+        # width=LOG_COL_MIN 是**硬下限**：ttk 8.6 的 pane 不支持 minsize，所以让日志框
+        # 自己请求这个宽度，初始布局就不会把它压成一条缝（剩下的余量按 weight 全给它）。
+        lf = ttk.LabelFrame(cols, text="日志（终端输出实时显示在此）", width=LOG_COL_MIN)
         cols.add(lf, weight=1)
 
         # 中间的竖线：拖动即调宽窄；拖完夹回合理区间并记住，双击回到默认。
@@ -1151,10 +1158,14 @@ class App(tk.Tk):
         # 位置能原样还原，不会每开一次就涨一点。
         # 窗口**每次改变大小**都要重夹一遍：限位是按窗口宽度算的，只夹拖动那一刻的话，
         # 把窗口缩小会让左栏不让位、把日志栏压到几十像素。
+        # `<Map>` 也要接：上屏那一刻的 `<Configure>` 才算数（之前的 winfo_width() 全是 1）。
         self._skip_sash_save = False
-        cols.bind("<Configure>", lambda _e: self._apply_left_width(cols, canvas))
-        cols.bind("<ButtonRelease-1>", lambda _e: self._release_sash(cols, canvas))
-        cols.bind("<Double-Button-1>", lambda _e: self._reset_left_col(cols, canvas))
+        clamp = lambda: self._apply_left_width(cols, canvas, left_bar)      # noqa: E731
+        cols.bind("<Configure>", lambda _e: clamp())
+        cols.bind("<Map>", lambda _e: clamp())
+        cols.bind("<ButtonRelease-1>", lambda _e: self._release_sash(cols, canvas, left_bar))
+        cols.bind("<Double-Button-1>",
+                  lambda _e: self._reset_left_col(cols, canvas, left_bar))
         # height/width 只是「至少这么大」；width 用小值，别让文本宽度反过来撑大窗口
         self.txt = tk.Text(lf, height=20, width=20, wrap="word",
                            font=("Microsoft YaHei UI", 9), state="disabled")
@@ -1917,11 +1928,12 @@ class App(tk.Tk):
         "first_party-disabled": "#888", "downloaded": "#a06700",
     }
 
-    def _scrollable(self, parent, *, width: int) -> tuple[ttk.Frame, ttk.Frame, tk.Canvas]:
-        """把一块区域做成**可滚轮滚动**的，返回 `(外层, 装内容的框, 画布)`。
+    def _scrollable(self, parent, *,
+                    width: int) -> tuple[ttk.Frame, ttk.Frame, tk.Canvas, ttk.Scrollbar]:
+        """把一块区域做成**可滚轮滚动**的，返回 `(外层, 装内容的框, 画布, 滚动条)`。
 
-        ttk 没有现成的滚动容器，标准做法是 Canvas 里嵌一个 Frame。滚轮只在指针位于
-        这块区域时生效（进入时挂全局绑定、离开时摘掉），不会抢走日志框自己的滚轮。
+        ttk 没有现成的滚动容器，标准做法是 Canvas 里嵌一个 Frame。滚轮逐个控件绑定
+        （不用全局 `bind_all`，那是整个解释器共用的一个槽，插件列表也在用）。
         """
         outer = ttk.Frame(parent)
         bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
@@ -1946,7 +1958,7 @@ class App(tk.Tk):
             bind_wheel_tree(inner, wheel)         # 新出现的子控件也挂上滚轮
 
         canvas.bind("<Configure>", refit)
-        return outer, inner, canvas
+        return outer, inner, canvas, bar
 
     def _fit_wraps(self, width: int) -> None:
         """左栏里的长文字按当前栏宽换行（拖动中间的竖线时也要跟着变）。"""
@@ -1955,27 +1967,39 @@ class App(tk.Tk):
             if label.winfo_exists():
                 label.configure(wraplength=wrap)
 
-    def _sash_gap(self, cols: ttk.Panedwindow, canvas: tk.Canvas) -> int:
-        """滚动条占位：`sashpos(0)`（第一栏宽度）减去画布实际宽度。"""
+    def _sash_gap(self, bar: ttk.Scrollbar) -> int:
+        """第一栏里滚动条占掉的宽度（`sashpos(0)` 比画布多出来的那点）。
+
+        **不能**用「sashpos 减画布宽度」去算：窗口还没上屏时任何 `winfo_width()`
+        都是 1，那样算出来的占位是「整栏宽 - 1」，夹取会把竖线写到离谱的位置。
+        滚动条自己的宽度与上屏无关，问它最稳。
+        """
         try:
-            return max(0, cols.sashpos(0) - canvas.winfo_width())
-        except tk.TclError:          # 还没布局完 / 正在销毁
-            return 0
+            width = bar.winfo_width()
+            return width if width > 1 else max(1, bar.winfo_reqwidth())
+        except tk.TclError:          # 正在销毁
+            return 17
 
     def _max_content_width(self, cols: ttk.Panedwindow, gap: int) -> int:
         """当前窗口宽度下左栏内容最多能有多宽（日志栏要留得住）。"""
         room = cols.winfo_width() - gap - SASH_PX - LOG_COL_MIN
         return min(LEFT_COL_MAX, max(LEFT_COL_MIN, room))
 
-    def _apply_left_width(self, cols: ttk.Panedwindow, canvas: tk.Canvas, *,
+    def _apply_left_width(self, cols: ttk.Panedwindow, canvas: tk.Canvas,
+                          bar: ttk.Scrollbar, *,
                           want: int | None = None, save: bool = False) -> None:
         """把左栏宽度夹回合理区间（给了 want 就先设成它），必要时记进配置。
 
         夹的是「内容宽度」：`sashpos(0)` 是第一栏宽度（含滚动条占位），换算时补上
         `gap` 才对得上配置里的值。
+
+        **没上屏就什么都不做**：那一刻所有 `winfo_width()` 都是 1，`sashpos` 也是
+        布局前的初值，怎么写都是垃圾——必须等 `<Map>` 之后的那次 `<Configure>`。
         """
         try:
-            gap = self._sash_gap(cols, canvas)
+            if not cols.winfo_ismapped() or cols.winfo_width() <= 1 or canvas.winfo_width() <= 1:
+                return
+            gap = self._sash_gap(bar)
             content = (cols.sashpos(0) - gap) if want is None else want
             content = min(max(content, LEFT_COL_MIN), self._max_content_width(cols, gap))
             if cols.sashpos(0) != content + gap:
@@ -1985,14 +2009,16 @@ class App(tk.Tk):
         except tk.TclError:          # 布局还没完成 / 窗口正在销毁
             return
 
-    def _release_sash(self, cols: ttk.Panedwindow, canvas: tk.Canvas) -> None:
+    def _release_sash(self, cols: ttk.Panedwindow, canvas: tk.Canvas,
+                      bar: ttk.Scrollbar) -> None:
         """拖动结束：夹回区间并记住（刚复位过则跳过，别覆盖复位写的值）。"""
         if self._skip_sash_save:
             self._skip_sash_save = False
             return
-        self._apply_left_width(cols, canvas, save=True)
+        self._apply_left_width(cols, canvas, bar, save=True)
 
-    def _reset_left_col(self, cols: ttk.Panedwindow, canvas: tk.Canvas) -> None:
+    def _reset_left_col(self, cols: ttk.Panedwindow, canvas: tk.Canvas,
+                        bar: ttk.Scrollbar) -> None:
         """双击中间的竖线：左栏宽度回到默认值，并记住这个默认值。
 
         双击在 Tk 里是 press/release/press/double-release——复位之后还会再来一个
@@ -2000,7 +2026,7 @@ class App(tk.Tk):
         存的是**默认值本身**（而不是夹后的值），这样窗口放大后还是回到 430。
         """
         self._skip_sash_save = True
-        self._apply_left_width(cols, canvas, want=LEFT_COL_WIDTH, save=False)
+        self._apply_left_width(cols, canvas, bar, want=LEFT_COL_WIDTH, save=False)
         save_config({"leftColWidth": LEFT_COL_WIDTH})
 
     def _collapsible(self, parent, title, *, expanded: bool = True) -> ttk.Frame:
