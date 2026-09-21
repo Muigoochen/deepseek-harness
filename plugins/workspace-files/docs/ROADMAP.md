@@ -21,7 +21,7 @@
 
 ## 2. 装载通道与数据通道（均已实证）
 
-- **装载**：`C:\Users\kelei\.dsh\profiles\web\cordis.patch.yml` 追加 `dsh.client` 行（`- insert: {id: workspace-files, name: '@dsh-user/workspace-files'}`）；包本体放 `C:\Users\kelei\.dsh\profiles\node_modules\@dsh-user\workspace-files\`（注意：用户包统一在 **profiles\node_modules\@dsh-user\**，不是 profiles\web\node_modules）。profile `patchReload: live`，但新装 client 模块需重启 `dsh web`（或至少重载页面）生效。
+- **装载**：本包作为 bundle 贡献 `cordis.patch.yml` 行（`- insert: {id: workspace-files, name: '@dsh-user/workspace-files'}`）；包本体经 `dsh plugin --profile web add` 链在 `C:\Users\kelei\.dsh\profiles\web\node_modules\@dsh-user\workspace-files\`（该路径是指回本仓库的 junction，不是副本）。`profiles\node_modules\@dsh-user\` 下那份是早期"复制包"脚本的遗留物，安装器不再使用。profile `patchReload: live`，但新装 client 模块需重启 `dsh web`（或至少重载页面）生效。
 - **数据通道（§4.1/4.2 结论：自建同源 HTTP 路由）**：
   - 产品 Host→页面推送话题是**编译期白名单**（`API_REMOTE_FORWARDED_EVENTS`），运行期无注册口 → 不可用。
   - 社区范式（toast/conversation-summary 实证）：节点半 `ctx.webServer.register({kind:'exact', path, handler})` + 浏览器半同源 `fetch`。路径避让 `/api`、`/plugins`。
@@ -34,7 +34,7 @@
 ## 3. 实施步骤（每步含验收）
 
 ### Step 0（已完成）确认目标 profile 身份
-- `DSH_HOME=C:\Users\kelei\.dsh`；正在跑 GUI = `profiles\web`（bundle dsh-base + dsh-web-app，patch 行含 time-context/lsp-echo/toast/conversation-summary，与本会话运行插件一致）；用户包解析自 `profiles\node_modules\@dsh-user\`；`patchReload: live`。
+- `DSH_HOME=C:\Users\kelei\.dsh`；正在跑 GUI = `profiles\web`（bundle dsh-base + dsh-web-app，patch 行含 time-context/lsp-echo/toast/conversation-summary，与本会话运行插件一致）；用户包经 `dsh plugin` 链在 `profiles\web\node_modules\@dsh-user\`（junction 指回各插件仓库）；`patchReload: live`。
 - 重启窗口：安装后需用户重启 `dsh web`（会打断当前会话进程，会话持久可续），与用户对时。
 
 ### Step 1 包源码（本目录内，零构建）
@@ -54,11 +54,11 @@
 - 浏览器半关键约束：`ctx.slots.inject(seat, () => slots.register({name: seat, id, order}, Comp))`；组件纯 props（静态 ctx 同产品 ctx 纪律：数据经 props/框架 hooks 到达）；样式内联 `<style>`，卸载移除；文案内联中文（用户插件不自注册产品 locale）。
 
 ### Step 2 安装
-- 执行 `install\install.ps1`（幂等：复制包 + 追加 patch 行）。
+- 执行 `install\install.ps1`（幂等：`dsh plugin --profile web add` 链入 profile + 自检）。
 
 ### Step 3 重启验证
 - 与用户对时后重启 `dsh web` → 验收：长期自动出现、开关/树/拖拽可用、刷新+重启均生效。
-- 卸载方式写进 README（`uninstall.ps1`：删 patch 行 + 删目录）。
+- 卸载方式写进 README（`uninstall.ps1`：`dsh plugin remove` + 删 profile patch 行；**不对 node_modules 做递归删除**，那是指回仓库的 junction）。
 
 ### Step 4 文档与清理
 - 完成 README（安装/使用/卸载/配置）；

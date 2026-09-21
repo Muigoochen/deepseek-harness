@@ -16,7 +16,7 @@
    - `package.json`：`name`（如 `@dsh-user/workspace-files`）、`dsh: { client: { platform: 'web' } }`、`exports['./client']`；
    - node 半 `lib/index.js`：空 `apply`（宿主 loader 行必须可导入激活）；
    - 浏览器半 `lib/client.js`：工厂形 CJS（`window.__ModuleLoader__.load({ id, factory })`），外部化 8 个种子词 + cordis。
-2. 装入用户 profile：`$DSH_HOME/profiles/web/node_modules/@dsh-user/workspace-files/`（复制或 pnpm 安装）。
+2. 装入用户 profile：`$DSH_HOME/profiles/web/node_modules/@dsh-user/workspace-files/`（当时是复制；**现已改为 `dsh plugin --profile web add` 链成 junction**，见 README 的安装节）。
 3. `$DSH_HOME/profiles/web/cordis.patch.yml` 追加：
    ```yaml
    - insert:

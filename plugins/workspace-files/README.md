@@ -38,10 +38,13 @@ powershell -ExecutionPolicy Bypass -File plugins\workspace-files\install\install
 # 然后刷新页面或重启 dsh web 生效(host 半经 patchReload:live 热载;client 半需页面重载)
 ```
 
-install.ps1 做两件事（幂等）：① 复制包到 `$DSH_HOME\profiles\node_modules\@dsh-user\workspace-files\`；
-② 在 `$DSH_HOME\profiles\web\cordis.patch.yml` 幂等追加
-`- insert: { id: workspace-files, name: '@dsh-user/workspace-files' }`（一行同时带来 Host 半与
-client 模块，`dsh.client` 扫描同一行）。
+install.ps1 用 DSH 官方方式安装本包（幂等）：① `dsh plugin --profile web add <本包路径>`，由它把包链入
+profile 并登记为依赖与 bundle；**不再复制文件**，安装后 profile 通过 `link:` 指向本目录，改完源码直接生效；
+② 自检：导入宿主半，并按浏览器半的规则解析 `lib/client.js`（浏览器半只能是脚本，`node --check` 直接检查
+`.js` 会被 `"type": "module"` 放过）。
+
+本包贡献的配置层在包根的 `cordis.patch.yml`（一行同时带来 Host 半与 client 模块，`dsh.client` 扫描同一行）；
+profile 自己那份 `$DSH_HOME\profiles\web\cordis.patch.yml` 在同 id 上后应用、会覆盖它，机器本地设置写在那里。
 
 ## 使用
 

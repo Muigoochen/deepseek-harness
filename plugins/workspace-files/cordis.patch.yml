@@ -1,0 +1,12 @@
+# The layer this bundle contributes: a single plugin row.
+#
+# No config here on purpose: the plugin's Config schema already supplies the
+# defaults. Machine-local or per-user settings belong in the profile layer
+# ($DSH_HOME/profiles/<name>/cordis.patch.yml) as a `- id: workspace-files`
+# entry, which patches this row.
+#
+# Do NOT write a second `- insert:` for this id there: two inserts of the same id
+# are a fatal `duplicate loader entry id` at boot.
+- insert:
+    - id: workspace-files
+      name: '@dsh-user/workspace-files'
