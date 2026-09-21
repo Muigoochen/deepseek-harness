@@ -16,7 +16,18 @@ extends EditorPlugin
 ##
 ## Protocol (one line per request, UTF-8):
 ##   ping   -> pong
+##   whoami -> project:<absolute project path>
+##     Which project this instance serves. The caller probes the port range this
+##     addon scans when the published file is missing or stale (the file holds a
+##     single slot, so a second engine's record replaces it), and must not latch
+##     onto another project's addon found in the same range.
 ##   rescan -> ok   (after the filesystem scan was triggered)
+##   unsaved:<res path> -> yes | no
+##     Whether that script has unsaved changes in the script editor. The caller
+##     checks this before asking the language server to reload the script: a
+##     reload rewrites the editor buffer from disk and would silently discard
+##     those changes, which is exactly what the editor itself refuses to do
+##     without asking (see ScriptEditor::_test_script_times_on_disk).
 ##
 ## The listening port starts at DSH_ECHO_BRIDGE_PORT (default 6089) and walks
 ## upward until it binds, so two open projects — or an editor plus its headless
@@ -30,6 +41,8 @@ const DEFAULT_CONTROL_PORT: int = 6089
 const PORT_SCAN_COUNT: int = 16
 const STATE_FILE_NAME: String = "dsh_echo_bridge.json"
 const MAXIMUM_REQUEST_LENGTH: int = 256
+const UNSAVED_PREFIX: String = "unsaved:"
+const PROJECT_PREFIX: String = "project:"
 
 #endregion
 
@@ -69,17 +82,11 @@ func _exit_tree() -> void:
 	if _control_server != null:
 		_control_server.stop()
 		_control_server = null
-	# Remove the published port only when it is ours: another engine instance may
-	# have replaced the file while this one was shutting down.
-	if _state_file_path == "" or not FileAccess.file_exists(_state_file_path):
-		return
-	var state_file: FileAccess = FileAccess.open(_state_file_path, FileAccess.READ)
-	if state_file == null:
-		return
-	var parsed_state: Variant = JSON.parse_string(state_file.get_as_text())
-	state_file.close()
-	if parsed_state is Dictionary and int(parsed_state.get(&"pid", -1)) == OS.get_process_id():
-		DirAccess.remove_absolute(_state_file_path)
+	# The published file is deliberately left behind. It holds one instance's
+	# record, and another engine opening this project overwrites it: removing it
+	# here would take that other instance's only record with it, which is how a
+	# still-listening editor becomes undiscoverable. Readers ignore a record
+	# whose pid is gone.
 
 
 ## 每帧轮询控制 socket;EditorPlugin 在主循环里自动调用本方法。
@@ -114,12 +121,21 @@ func _process(_delta: float) -> void:
 
 
 ## 处理一行控制请求。
-## @param request_line: 已去除首尾空白的请求行(ping / rescan)
+## @param request_line: 已去除首尾空白的请求行(ping / rescan / unsaved:<path>)
 ## @return: void
 func _handle_request(request_line: String) -> void:
+	# 带参数的命令先按前缀分派,再走下面的整行匹配。
+	if request_line.begins_with(UNSAVED_PREFIX):
+		var script_path: String = request_line.substr(UNSAVED_PREFIX.length())
+		var answer: String = "yes\n" if _is_unsaved(script_path) else "no\n"
+		_peer_connection.put_data(answer.to_utf8_buffer())
+		return
 	match request_line:
 		"ping":
 			_peer_connection.put_data("pong\n".to_utf8_buffer())
+		"whoami":
+			var project_root: String = ProjectSettings.globalize_path("res://")
+			_peer_connection.put_data((PROJECT_PREFIX + project_root + "\n").to_utf8_buffer())
 		"rescan":
 			# The editor's own focus scan: registers newly created class_name scripts.
 			EditorInterface.get_resource_filesystem().scan_sources()
@@ -127,6 +143,23 @@ func _handle_request(request_line: String) -> void:
 			_peer_connection.put_data("ok\n".to_utf8_buffer())
 		_:
 			_peer_connection.put_data("err unknown command\n".to_utf8_buffer())
+
+
+## 查询某个脚本是否带着未保存的编辑器改动。
+##
+## 判定条件与引擎自己的"文件已在磁盘上改变"弹窗同源(ScriptEditorBase::is_unsaved):
+## 调用方据此跳过对它的重载,因为重载会用磁盘内容覆盖编辑器缓冲,静默丢掉用户
+## 正在编辑的内容。引擎在它自己的重载路径上会先弹窗询问,本插件补上同一道判断。
+## @param resource_path: res:// 形式的脚本路径
+## @return: bool 该脚本有未保存改动时为 true;编辑器不可用时保守返回 false
+func _is_unsaved(resource_path: String) -> bool:
+	if resource_path.is_empty():
+		return false
+	var script_editor: Object = EditorInterface.get_script_editor()
+	if script_editor == null:
+		return false
+	return script_editor.get_unsaved_files().has(resource_path)
+
 
 
 ## 从起始端口起向上寻找可用端口并监听本机回环地址。

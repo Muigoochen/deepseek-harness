@@ -1,176 +1,246 @@
 # Godot 脚本刷新的三层数据与"改完不生效"的成因(2026-09-21 实测定稿)
 
 本文回答一个具体问题:**外部程序(本插件/AI)改了 `.gd` 之后,Godot 引擎什么时候才认得这次改动**;
-以及为什么本插件现有的「重扫文件系统」在用户的真实编辑器里**经常救不回来**。
+以及为什么本插件的「重扫文件系统」在用户的真实编辑器里**救不回来**。
 
-结论先给出:
+结论:
 
-> 引擎里与脚本有关的数据分成**三层**。本插件的 `rescan` 只可靠地刷新第一层;
-> 第三层(语义诊断真正读取的那一层)**只在三种情况下被清掉**,而其中最常见的两种在用户的
-> 日常编辑器状态下都会被跳过。因此**语义级陈旧只能由 `textDocument/didSave` 可靠消除**。
+> 引擎里与脚本有关的数据分成**三层**。重扫只可靠地刷新第一层;语义诊断真正读取的第三层,
+> 在重扫路径上**要过一道唯一的闸门**`_should_reload_script()`,而用户日常的编辑器状态恰好让这道闸门
+> 恒为假。引擎自己把这个问题的出路写在代码注释里:`Script::editor_can_reload_from_file()` 说明脚本
+> 只有三条重载途径——脚本编辑器内编辑、**外部编辑器经 LSP 服务器编辑**、以及磁盘直接更新时的
+> `EditorFileSystem::_update_script_documentation`。本插件走的是重扫(第三条),而有效的入口是第二条。
 
 ## 1. 现象与复现条件
 
-用户侧现象:AI 改完某个脚本后,检查报出的错误是**上一次**的状态——
-新增的成员说"找不到",已删的成员仍然"存在"。重启 Godot 编辑器可暂时消除,改几次之后复发。
+用户侧现象:AI 改完某个脚本后,检查报出的错误是**上一次**的状态——新增的成员说"找不到"。重启 Godot
+编辑器可暂时消除,改几次之后复发。
 
-复现需要**同时**满足两个条件(§7 有对照实验,三者缺一即不复现):
+复现**同时**需要两个条件(§7.2 有对照):
 
-1. **被改的脚本在脚本编辑器的脚本列表里**——即用户打开过、且没有手动关闭它。
-   Godot 会把它记在 `<project>/.godot/editor/script_editor_cache.cfg` 里,重启编辑器后自动恢复,
-   因此这个条件**一旦满足就长期成立**。实测用户工程该文件有 **347 个条目,其中 331 个 `.gd`**。
-2. **存在一个常驻的"引用方"**——另一个脚本引用了被改脚本的类/常量/成员,并且它**仍然活着**
-   (编辑器里开着,或作为 LSP 文档处于 didOpen 状态)。它在内存里的解析树会**钉住**被引用脚本的
-   **旧**解析树(§3)。
+1. **被改的脚本在脚本编辑器的脚本列表里**——用户打开过且没手动关掉。Godot 把它记在
+   `<project>/.godot/editor/script_editor_cache.cfg`,重启编辑器后自动恢复,因此**一旦满足就长期成立**。
+   它对结果的作用是让 §5.2 的闸门 `_should_reload_script()` 恒为假——**不是**"钉住解析树"(§3)。
+   实测用户工程该文件 347 个条目,其中 331 个 `.gd`,报错涉及的脚本几乎全在其中。
+2. **存在一个活着的解析树持有者**(§3),通常是编辑器内置 LSP 客户端对某个引用方文档的 didOpen。
+   它把被引用脚本的**旧**解析树钉在内存里。
 
-二者同时成立时:引用方解析时用到的被引用脚本成员表是**旧**的,于是诊断报出陈旧结论;
-而 §5 的 `rescan` 恰好会跳过这样的被改脚本。
+补充说明:§1 的条件 1 目前的操作化是"`script_editor_cache.cfg` 里有条目"。该文件由编辑器在保存布局/
+退出时写入(`script_editor_plugin.cpp:3657` 的 `save(...get_project_settings_dir()...)`),严格说
+**不等于**"运行中的实例此刻正开着它"。本次实验中该条件由用户当场确认("现在它就是打开的"),cfg
+条目作为佐证,不是唯一依据。
 
 ## 2. 三层数据
 
 | 层 | 内容 | 位置 | `rescan` 是否刷新 |
 |---|---|---|---|
-| A 文件树 + 全局类表 | 文件条目、mtime、`class_name` 注册表(字符串) | `EditorFileSystem`、`ScriptServer` | ✅ 刷新 |
-| B 已加载资源 | `Resource` 对象(含 `GDScript` 实例) | `ResourceCache` | ⚠ **有条件**刷新(§5.2) |
-| C 解析树 | `GDScriptParser` 语法/语义树 | `GDScriptCache` | ❌ 基本不刷新(§3、§4) |
+| A 文件树 + 全局类表 | 文件条目、mtime、`class_name` 注册表(纯字符串) | `EditorFileSystem`、`ScriptServer` | ✅ 刷新 |
+| B 已加载资源 | `Resource` 对象(含 `GDScript`) | `ResourceCache` | ⚠ 有条件(§5.2) |
+| C 解析树 | `GDScriptParser` 语法/语义树 | `GDScriptCache` | ❌ 重扫路径上不刷新 |
 
-**语义诊断读的是 C,不是 B、也不是 `GDScript::member_indices`。**证据:
+**语义诊断读 C 层,不读 `GDScript::member_indices`。**证据:
 
-- 全局类的元类型解析:`gdscript_analyzer.cpp` 的 `make_global_class_meta_type`
-  → 取被依赖脚本的 **parser**(`parser->get_depended_parser_for(...)`,`gdscript_parser.cpp`),
-  → `GDScriptCache::get_parser`(`gdscript_cache.cpp`)。
-- 成员存在性判定落在 parser 树的 **`ClassNode::members_indices`**(`gdscript_parser.h`)及其
-  `has_member` 上;`grep -n member_indices modules/gdscript/gdscript_analyzer.cpp` 为 **0 命中**
-  (该文件里出现的是 `members_indices`),即分析器**从不**查 `GDScript` 对象的成员表。
-- 用户看到的 `Cannot find member "X" in base "Y".` 来自 `reduce_subscript` 分支
-  (`gdscript_analyzer.cpp`);带 `Did you mean "%s"?` 的是内建基类那组分支,不是本条。
+- `GDScriptAnalyzer::make_global_class_meta_type`(`gdscript_analyzer.cpp:3968-3994`):
+  `ScriptServer::get_global_class_path`(3971)→ `parser->get_depended_parser_for(path)`(3974)
+  → `ref->get_parser()->head->self_type`(3990)。
+- `GDScriptParser::get_depended_parser_for` 调 `GDScriptCache::get_parser` 并存入
+  `depended_parsers`:`gdscript_parser.cpp:872-885`;缓存条目构造在 `gdscript_cache.cpp:213-239`。
+- 成员判定落在 `ClassNode::members_indices` 与 `has_member`(`gdscript_parser.h:765`、`805-807`),
+  分析器使用点 `gdscript_analyzer.cpp:237`、`874`、`978`。实测
+  `grep -n member_indices modules/gdscript/gdscript_analyzer.cpp` 为 **0 命中**(该文件出现的是
+  `members_indices`,共 3 处);`GDScript::member_indices` 的读取者只有 `gdscript.cpp`、
+  `gdscript_compiler.cpp`、`gdscript_utility_functions.cpp` 与 `gdscript_editor.cpp:412`。
+- 用户看到的 `Cannot find member "X" in base "Y".` 来自 `reduce_subscript`
+  (`gdscript_analyzer.cpp:4983`,函数始于 4867);带 `Did you mean "%s"?` 的两组分属**内建基类**分支
+  (`4190`/`4192`、`4234`/`4236`,在 `SUGGEST_GODOT4_RENAMES` 下),不是本条。
 
-A 层的全局类表本身**只存字符串**:`GlobalScriptClass { language, path, base, is_abstract, is_tool }`
-(`modules/gdscript/script_language.h`),不含任何成员信息。所以"类还在"不代表"成员是新的"。
+A 层的全局类表只存字符串——`GlobalScriptClass { language, path, base, is_abstract, is_tool }`,
+定义在 **`core/object/script_language.h:64-70`**(不在 `modules/gdscript/` 下)。所以"类还在"不代表
+"成员是新的"。
 
-## 3. C 层的生命周期:不是"永不失效",而是"被活着的引用方钉住"
+## 3. C 层的生命周期:寿命 = 活着持有者的寿命
 
-**这一点容易判错**:`GDScriptCache::parser_map` 存的是**裸指针**(`gdscript_cache.h`),
-条目由**引用计数**决定生死——最后一个持有者释放时,`~GDScriptParserRef` 会把条目从 map 里擦除
-(`gdscript_cache.cpp`)。所以正确的表述是:
+`GDScriptCache::parser_map` 存**裸指针**(`gdscript_cache.h:87`),条目由引用计数决定生死:
+`~GDScriptParserRef` 在未被 `abandoned` 时把条目从 map 擦除(`gdscript_cache.cpp:137-144`)。
+所以正确的表述是:
 
-> 解析树条目**没有一个自主的失效机制**,但它的寿命 = **活着的 `Ref` 持有者的寿命**。
-> 一旦引用归零,它立刻消失,下次分析会**重新从磁盘解析**——这恰恰是"改完就好了"的来源。
+> 解析树条目**没有自主失效机制**(`raise_status` 单向推进,已 `FULLY_SOLVED` 就直接返回结果、
+> 不再读盘:`gdscript_cache.cpp:69-114`),但它的寿命 = **活着的 `Ref` 持有者的寿命**。
+> 引用归零后它立刻消失,下次分析**重新从磁盘解析**——这正是"没人引用时改完立刻就好"的来源。
 
-由此得到真正的成因:**陈旧不是"缓存不失效",而是"有一个仍然活着的引用方把旧树钉住了"**。
+**持有者有两个,不止一个**:
 
-- 引用方解析树在自己的 `depended_parsers` 里持有被引用脚本的 parser ref
-  (`gdscript_parser.cpp`)。只要引用方这棵树活着,被引用脚本的**旧**条目就不会被擦除。
-- 唯一的长期持有者就是**活着的解析树本身**——编辑器里开着的脚本、以及处于 didOpen 的 LSP 文档。
-  一旦引用方被关闭/重新解析,钉子消失,后续分析就会看到新内容(§7 的 ② / ③ 对照)。
+1. `GDScriptParser::depended_parsers`(`gdscript_parser.h:1393`;写入 `gdscript_parser.cpp:872-885`)。
+2. `GDScriptAnalyzer::external_class_parser_cache`(`gdscript_analyzer.h:56`;插入
+   `gdscript_analyzer.cpp:4050`)——它在 `depended_parsers` 之外**独立**持有外部 parser ref,
+   注释(`gdscript_analyzer.cpp:3997-4001`)明确说这是"有意不走 GDScript cache"的另一条路径。
+   analyzer 本身由 `GDScriptParserRef` 拥有(`gdscript_cache.cpp:133-134`)。
 
-这条修正也**放大了可行方案的范围**:除了让引擎强制重载,让"引用方释放旧持有者"在机制上同样成立
-(§8 的方案 C 系列正是基于这一点)。
+**哪些东西不是持有者**(这一点容易判错):
+
+- **`GDScript`/`Script` 实例不持有任何 parser ref。**全仓库 `GDScriptParserRef` 只出现在
+  `gdscript_parser.*`、`gdscript_cache.*`、`gdscript_analyzer.*`、`gdscript_editor.cpp` 的函数内局部
+  (1784/2377/2590 等),以及 `gdscript.cpp:791`(`reload()` 内局部)。
+- **因此"编辑器里开着的脚本"本身不是钉子。**编辑器打开的是 `Ref<GDScript>`;它自己的校验走
+  **栈上**临时 parser(`gdscript_editor.cpp:172-179`:`GDScriptParser parser; GDScriptAnalyzer
+  analyzer(&parser);`),函数返回即释放。`editor/` 目录下 `GDScriptCache::` 与 `GDScriptParserRef`
+  各 **0 处**,也没有 LSP 客户端代码。
+- **真正的钉子来自 LSP 的 `parse_results`**:`gdscript_language_protocol.cpp:387-421` 把
+  `ExtendGDScriptParser*` 存进 `parse_results`,`439-447 get_parse_result` 复用;该 parser 会跑完整
+  分析器(`gdscript_extend_parser.cpp:964-982`),其 `depended_parsers` 因此长期存活。
+  `lsp_did_close` → `remove_cached_parser`(`gdscript_language_protocol.cpp:516`)释放钉子。
+
+于是两个条件在机制上**各司其职**,又**同源**:编辑器打开脚本 → 它内置的 LSP 客户端对该文档
+didOpen → 既提供了钉子(条件 2),又让 §5.2 的闸门为假(条件 1)。
 
 ## 4. 清除 C 层的全部站点
 
 | 站点 | 位置 | 效果 | 生产调用者 |
 |---|---|---|---|
-| `remove_parser` | `gdscript_cache.cpp` | 移除该脚本条目,**并递归移除其反向依赖条目** | `GDScript::reload()`、`move_script` |
-| `move_script` | `gdscript_cache.cpp` | 换路径时调用 `remove_parser(p_from)` | `GDScript::set_path`(`gdscript.cpp`)——仅此一处 |
-| `remove_script` | `gdscript_cache.cpp` | 移除脚本相关条目 | **无生产调用者**,仅 `tests/gdscript_test_runner.cpp` |
-| `clear` | `gdscript_cache.cpp` | 整池清空 | 仅 `GDScriptLanguage::finish()`(`gdscript.cpp`),即**引擎退出**时 |
+| `remove_parser` | `gdscript_cache.cpp:246-264` | 把 ref 标记 `abandoned = true` 并记入 `abandoned_parser_map`(246-253),再移除该条目**并递归移除其反向依赖**(259-263) | `GDScript::reload()`(`gdscript.cpp:789-801`)、`move_script`(`:167`)、`remove_script` 内部(`:206`) |
+| `move_script` | `gdscript_cache.cpp:156-178` | 换路径时调用 `remove_parser(p_from)` | `GDScript::set_path`(`gdscript.cpp:1123-1125`,在 `is_root_script()` 内)——全仓库仅此一处 |
+| `remove_script` | `gdscript_cache.cpp:180-211` | 移除脚本相关条目,并 `clear()` `abandoned_parser_map` 里的孤儿 ref | **无生产调用者**,仅 `modules/gdscript/tests/gdscript_test_runner.cpp:718` |
+| `clear` | `gdscript_cache.cpp:455-497` | 整池清空 | `GDScriptLanguage::finish()`(`gdscript.cpp:2225`)与 `~GDScriptCache()`(`gdscript_cache.cpp:503-506`,对象在 `register_types.cpp:152`/`184` 创建销毁) |
 
-**运行时唯一会清 C 层的生产路径是 `GDScript::reload()`**:
+`abandoned_parser_map` 的记账是理解"条目已移除、旧树仍被现有持有者使用"的关键:`~GDScriptParserRef`
+正是靠 `if (!abandoned)` 决定是否擦除 map 条目(`:137-144`)。
 
-- `reload()` 先比对 `source_hash`(`get_parser` → `has_parser` → 计算 hash),不一致才
-  `remove_parser`;随后仍会**全量重新 parse**。
-- `reload()` 开头有一处保护:`if (!p_keep_state && has_instances) return ERR_ALREADY_IN_USE;`
-  ——脚本有活实例且未要求保状态时**直接拒绝**。`reload(true)` 绕过它,编辑器与
-  `GDScriptCache::get_full_script` 走的都是 `reload(true)`。
+**内容变化引发的唯一自动清除路径是 `GDScript::reload()`**(`gdscript.cpp:742-822`):
+
+- 早退:`if (reloading) return OK;`(742-745)、TOOLS_ENABLED 下脚本模板目录(772-777)、
+  `if (!p_keep_state && has_instances) return ERR_ALREADY_IN_USE;`(755-759)。
+- 比对顺序是 `has_parser`(789)→ `get_parser`(791)→ 与**内存中** `source.hash()` 比较(793-799),
+  不一致才 `remove_parser`(800)。**`reload()` 自己不读盘**,必须由调用方先
+  `load_source_code` 刷新 `source`。
+- `reload(true)` 绕过 `has_instances` 保护,编辑器与 `GDScriptCache::get_full_script`
+  (`gdscript_cache.cpp:388`)走的都是 `reload(true)`。
 
 ## 5. `rescan` 到底做了什么
 
 本插件的 `rescan` → 编辑器 addon → `EditorFileSystem::scan_changes`
-(`editor_file_system.cpp`)。它**不直接碰 C 层**:`grep -rn "GDScriptCache::" editor/` 为 **0 命中**。
+(`editor_file_system.cpp:3706` 把 `scan_sources` 绑定到它)。它**不直接碰 C 层**:
+实测 `grep -rn "GDScriptCache::" editor/` 为 **0 命中**。
 
 ### 5.1 A 层:每次都刷新
 
-扫描动作里与脚本有关的两条:
+- **全局类表**:`_update_script_classes()`(`:2146-2192`)。唯一前置是队列非空(2147-2153 早退),
+  随后 `2183 emit_signal("script_classes_updated")` **无条件**发出——不是"仅在真正变化时"。
+  它**从不**加载资源、也不碰解析树:`_register_global_class_script`(2557-2578)只做
+  `ScriptServer` 登记与加载器注册表重建(2188-2191);类名来自扫描期**栈上** `GDScriptParser`
+  (`gdscript.cpp:2714-2722`),不经 `GDScriptCache`。
+- **脚本文档**:`_process_update_pending()`(2297-2305)→ `_update_script_documentation()`(2194+),
+  其中 `2249 ResourceLoader::load(path)`,并在 `2253-2256` 于 `_should_reload_script(path)` 为真时
+  调 `scr->reload_from_file()`。★ 这一步有两个后果,都要记住:它把脚本**放进 `ResourceCache`**,
+  并且它是重扫路径上**唯一**真正重载脚本脚本的地方。
+- 信号:`sources_changed` 在两条扫描路径末尾都发(1728、1792/1810),但其 bool 参数恒为 false——
+  该信号量是 `List<String>`(`editor/file_system/editor_file_system.h:269`)且**全仓库从未被写入**,
+  三处 emit 都写 `size() > 0`,所以它是**死字段**,不是"设计上恒假"。纯内容改动不触发
+  `filesystem_changed`:`scan_changes` 只在 `_update_scan_actions()` 返回 true 时发(1722-1724),
+  而 `ACTION_FILE_RELOAD` **不置 `fs_changed`**(1010-1018,对照 1008 的其它动作与 1073 的 return)。
 
-- **全局类表**:`_update_script_classes()`——只重新登记 `path` 字符串,并发出
-  `script_classes_updated`(仅在真正变化时)。它**从不**加载资源、也不碰解析树。
-- **脚本文档**:`_process_update_pending()` → `_update_script_documentation()`,其中会
-  `ResourceLoader::load(path)`。★ 这一步有个**副作用值得记住**:它把脚本**放进 `ResourceCache`**,
-  从而让**下一次** `rescan` 有可能重载它(见 5.2)。
-- 信号方面:`sources_changed` 在两条扫描路径末尾都会发,但其 bool 参数**恒为 false**;
-  纯内容改动不会触发 `filesystem_changed`(`ACTION_FILE_RELOAD` 不置 `fs_changed`)。
+### 5.2 B/C 层:过一道唯一的闸门
 
-### 5.2 B/C 层:取决于三道闸门,因此**不是"每次都刷新"**
+内容变化产生 `ACTION_FILE_RELOAD`,但它**只对已在 `ResourceCache` 里的资源**生效
+(`ResourceCache::has`,1010-1018);这些文件进入 `reloads` → `update_files(reloads)`(1052-1055)
+→ `_queue_update_script_class()`(2505-2507)→ 进入 `update_script_paths_documentation` →
+`_process_update_pending()`(1066)→ `_update_script_documentation()`(2302/2194)→
+**`_should_reload_script()` 为真时才 `scr->reload_from_file()`(2253-2256)** →
+`GDScriptLanguage::reload_scripts` → `load_source_code` + **`reload(true)`**
+(`core/object/script_language.cpp:200-211`、`gdscript.cpp:2550-2552`)——到这里 C 层才真的被清。
 
-内容变化的文件会产生 `ACTION_FILE_RELOAD`,但它**只对已经在 `ResourceCache` 里的资源**生效
-(`ResourceCache::has` 判定);随后 `resources_reload` → `EditorNode::_resources_changed()` →
-`Script::reload_from_file()` → `GDScriptLanguage::reload_scripts(scripts)` →
-`load_source_code` + **`reload(true)`**(`gdscript.cpp`)——到这里 C 层才真的被清。
+★ **注意这条链的另一半**:`_update_scan_actions()` 随后发出的 `resources_reload`(1068-1070)
+**到不了脚本**。`Script` 覆写 `editor_can_reload_from_file()` **恒返回 false**
+(`core/object/script_language.h:117-125`),而 `EditorNode::_resources_changed()` 的第一道过滤就是
+`if (!res->editor_can_reload_from_file()) continue;`(`editor_node.cpp:1330-1340`);全仓库只有
+TextFile/PackedScene/Script/GDExtension 覆写为 false,**GDScript 没有覆写**。所以 `resources_reload`
+只服务非脚本资源,脚本的重载**只**走 `_update_script_documentation` 这一条,而它由
+`_should_reload_script()` 把关——这道闸门因此是重扫路径上的**唯一**开关,不是"更前面的一道"。
 
-`reload_scripts` **本身不看"是否在编辑器里打开"**(它只要求脚本在 `script_list` 里且是根脚本),
-所以**能不能重载,取决于更前面的一道闸门** `_should_reload_script()`
-(`editor_file_system.cpp`),它在三种情况下返回 false:
+`_should_reload_script()`(`editor_file_system.cpp:2278-2295`,全仓库唯一调用点是 2248)三种情况
+返回 false,**没有第四种**:
 
-1. **首次扫描**(`first_scan`);
-2. **目标脚本不在 `ResourceCache` 里**;
-3. ★ **目标脚本正开在脚本编辑器里**(`ScriptEditor::get_singleton()->get_open_scripts().has(scr)`)
+1. 首次扫描(`first_scan`,2279);
+2. 目标脚本不在 `ResourceCache` 里(2283-2287);
+3. ★ **目标脚本正开在脚本编辑器里**
+   (`ScriptEditor::get_singleton()->get_open_scripts().has(scr)`,2290-2292)
    ——意思是"交给脚本编辑器自己处理"。
 
-第 3 条是用户场景的命门:脚本编辑器只在窗口获得焦点、`Ctrl+S` 之类的时机才检查磁盘,
-所以在用户一直开着那些脚本的情况下,`rescan` **永远不会**重载它们。
+`GDScriptLanguage::reload_scripts` **本身不看**是否在编辑器打开(它只筛
+`is_root_script() && !get_path().is_empty()`,`gdscript.cpp:2508-2515`;以及
+`p_scripts.has(scr) || to_reload.has(scr->get_base())`,2527)。所以能不能重载,完全取决于上面那道闸门。
 
-**`rescan` 有效的两种情形**(都在 §7 的对照里出现过):
+第 3 条是用户场景的命门:脚本编辑器只在窗口获得焦点、`Ctrl+S` 之类的时机检查磁盘,所以在用户一直
+开着那些脚本的情况下,`rescan` **永远不会**重载它们。
 
-- 目标脚本**没开在编辑器里**(第 3 条不触发),并且**已经在 `ResourceCache` 里**
-  (第 2 条不触发)——而 5.1 的 `ResourceLoader::load` 副作用使这一条**很容易满足**:
-  **只要重扫过一次,目标脚本就进了 `ResourceCache`**,之后的重扫就能真的重载它。
-- 目标脚本没有任何活着的引用方——此时它本来就不是陈旧的(§3)。
+**`rescan` 生效的两种情形**(§7.2 的对照组里都出现过):
+
+- 目标脚本**没开在编辑器里**(第 3 条不触发),且**已在 `ResourceCache` 里**(第 2 条不触发)。
+- 目标脚本没有活着的解析树持有者——此时它本来就不陈旧(§3)。
+
+★ 关于第 2 条要**收紧一个说法**:§5.1 的 `ResourceLoader::load` 副作用**不普遍成立**。它只对已经
+排进 `update_script_paths_documentation` 的路径执行(2212),而该集合的写入者是
+`_queue_update_script_class`(2311),调用点仅:新增脚本(945)、删除/改名(959/974/2413)、
+`update_files()` 内(2505-2507/2523,而 `update_files` 只被 `reloads` 调用:1052-1055)、以及
+`_process_removed_files`(1409-1421)。而 `reloads` 的先决条件又是 `ResourceCache::has`(1015)。
+所以对一个**既有的、从未被加载过的** `.gd`,仅内容变化**不会**因重扫进入 `ResourceCache`;
+"重扫一次就进缓存"只在新增/改名脚本、或编辑器已经加载过它(用户实际场景)时成立。
 
 ## 6. LSP 侧的刷新入口
 
-**唯一入口是 `didSave`**(`gdscript_text_document.cpp`):
+**LSP 侧唯一入口是 `didSave`**(`gdscript_text_document.cpp:92-114`):
+`ResourceLoader::load`(98)→ `load_source_code`(99)→ `is_tool()` 时 `reload_tool_script`,
+否则 **`reload(true)`**(101-104)→ `update_exports()`(106)→ `reload_script()`(116-120):
+`ScriptEditor::reload_scripts(true)`、`update_docs_from_script(...)`、`trigger_live_script_reload(...)`。
+该处理函数**没有 didOpen 前置检查**,且**不读 `text` 字段**(只读 `dict["textDocument"]`,94-95),
+所以对未 didOpen 的文件发 `didSave` 在引擎侧可行,也不必携带文本。
 
-`ResourceLoader.load` → `load_source_code` → **`reload(true)`** → `reload_script()`,
-后者还会调 `ScriptEditor::reload_scripts(true)`、`update_docs_from_script` 与
-`trigger_live_script_reload`。LSP 侧**没有** `workspace/didChangeWatchedFiles`
-(该文件的 `initialize` 能力声明里没有它),所以外部文件变化不会自动触发这条路径。
+与之对照,`lsp_did_open`/`lsp_did_change`/`lsp_did_close`(`gdscript_language_protocol.cpp:455-522`)
+只操作 LSP 自己的 parser(`parse_script` / `remove_cached_parser`),**不触碰引擎的脚本与缓存**。
+LSP 侧也没有 `workspace/didChangeWatchedFiles`(全仓库 0 命中),所以外部文件变化不会自动触发。
 
 两个容易误解的对照:
 
-- **签名是新的,成员是旧的**:**签名文本**来自 LSP 自己的 `parse_script`
-  (`gdscript_language_protocol.cpp`,直接 `FileAccess::get_file_as_string`),与被钉住的缓存无关;
-  非受管解析结果会被标记为 `stale_parsers` 丢弃。所以补全/签名看起来"跟得上",
-  而成员判定仍可能陈旧。另:`grep -rn "GDScriptCache::" modules/gdscript/language_server` 为 **0 命中**
-  ——LSP 不直接操作缓存池,它通过分析器的 `depended_parsers` 间接读到被钉住的旧树。
-- **`CACHE_MODE_REPLACE` 不是重载**:`resource_loader.cpp` 在 REPLACE 下走
-  `old_res->copy_from(new)` 并**返回旧对象**,不会重建解析树。真正重建的是
-  `CACHE_MODE_IGNORE`(`gdscript_resource_format.cpp` → `gdscript_cache.cpp`
-  的 `get_full_script(..., update_from_disk=true)`:重读源码、`reload(true)`、写回 full cache)。
-  编辑器自身也用它重载开着的脚本(`script_editor_plugin.cpp`)。
+- **签名新、成员旧**:签名文本来自 LSP 自己的 `parse_script`,直接
+  `FileAccess::get_file_as_string`(`gdscript_language_protocol.cpp:397`);非受管结果被标记
+  `stale_parsers`(413-418,`clear_stale_parsers` 423-427)。实测
+  `grep -rn "GDScriptCache::" modules/gdscript/language_server` 为 **0 命中**——LSP 不直接操作缓存池,
+  它是经 `ExtendGDScriptParser::parse`(`gdscript_extend_parser.cpp:964-982`)内的分析器通过
+  `depended_parsers` **间接**读到被钉住的旧树。
+- **`CACHE_MODE_REPLACE` 不是重载**:对 GDScript,REPLACE 下 `ignoring=false`
+  (`gdscript_resource_format.cpp:45-46`)→ `get_full_script(..., update_from_disk=false)`
+  直接**返回缓存中的同一个对象**(`gdscript_cache.cpp:351-356`),因此 `resource_loader.cpp:583`
+  的 `old_res != load_task.resource` 为假,**连 `copy_from`(591)都不会执行**。真正重建的是
+  `CACHE_MODE_IGNORE`(`gdscript_resource_format.cpp:45-46` → `gdscript_cache.cpp:368-382` 重读源码、
+  `388 reload(true)`、`393-400` 写回 full cache)。编辑器自身也用它重载打开着的脚本
+  (`script_editor_plugin.cpp:2896-2899`)。
 
 ## 7. 实验证据
 
-工具:临时脚本经 LSP 客户端连**用户正在运行的编辑器**(端口 6005),以及 addon 的重扫入口(6090)。
+工具:临时脚本经 LSP 客户端连**用户正在运行的编辑器**(LSP 端口 6005),以及 addon 的重扫入口
+(观察到 addon 实例绑定 **6090**;该端口是 6089 被占后向上走位得到的,不是第二个默认值)。
 每轮实验的文件、`.uid`、日志在结束后删除,用户工程源文件不留改动。
 
 ### 7.1 结构
 
 ```
-a      = 被改的脚本(含 class_name)
-b1     = 常驻引用方(引用 a 的成员,一直 didOpen 不关闭)
+a      = 被改的脚本(含 class_name),两种状态:在编辑器脚本列表中 / 不在
+b1     = 常驻引用方(引用 a 的成员,一直 didOpen 不关闭)—— 它提供的钉子
 b2     = 新开引用方(引用 a 的新成员,每次关掉再打开,以取全新诊断)
 ```
 
-### 7.2 三组对照(决定性的因果证据)
+两组实验**都以一次 rescan 开场**(用于注册类名),因此两次实验的 `ResourceCache` 前态相同;
+唯一的变量是 **a 是否开在编辑器里**。
 
-| # | a 开在编辑器里 | 有常驻引用方 | 改 a 后新开 b2 | 发 rescan 后 | 结论 |
-|---|---|---|---|---|---|
-| 1 | ❌ 否 | ✅ 是 | 2 错误(复现) | **0 错误** | rescan **有效** |
-| 2 | ✅ 是 | ❌ 否 | **0 错误**(无从复现) | 0 错误 | 没有钉子就没有陈旧 |
-| 3 | ✅ **是** | ✅ **是** | 2 错误(复现) | **2 错误** | ★ rescan **无效** = 用户场景 |
+### 7.2 对照
 
-三行合起来证明:**两个条件都是必要的**,缺任何一个 `rescan` 都不再是问题所在。
+| # | a 开在编辑器里 | 有常驻引用方 | 改 a 后新开 b2 | 发 rescan 后 |
+|---|---|---|---|---|
+| 1 | ❌ 否 | ✅ 是 | 2 错误(复现) | **0 错误** |
+| 2 | ✅ 是 | ❌ 否 | **0 错误**(无从复现) | 0 错误 |
+| 3 | ✅ **是** | ✅ **是** | 2 错误(复现) | **2 错误** ← 用户场景 |
+
+三行合起来**支持**(不是"证明")两个条件都是必要的。第 3 组与第 1 组的唯一差别是 a 是否开在编辑器里,
+故 rescan 失效可归因于 §5.2 的第 3 条闸门。
 
 ### 7.3 完整复现(第 3 组,逐步骤)
 
@@ -185,73 +255,127 @@ b2     = 新开引用方(引用 a 的新成员,每次关掉再打开,以取全�
 ⑥ 对 a 发 didSave,再新开 b2                      → 0 错误  ← ✅ 救回来了
 ```
 
-### 7.4 由此确认的两个事实
+### 7.4 didSave 为什么有效
 
-- **`didSave` 是完整解**:它经 `reload(true)` 强制重建解析树,而 `remove_parser` 会**递归移除反向
-  依赖条目**,所以"钉住者"也一并被清;它连锁触发的 `ScriptEditor::reload_scripts(true)` 还会把
-  编辑器里开着的引用方一起重载。这正是"重启编辑器能治好"的日常等价操作。
-- **本插件自己的常规检查从不复现此问题**,原因很具体:它每次检查都会 `didClose` 所有文件
-  (`godot-lsp.mjs`),钉子随之脱落,于是引擎下次从磁盘重新解析——**检查行为本身把问题掩盖了**。
-  这也解释了为什么"用户看得到、插件测不出"。
+它**绕过 §5.2 的闸门**:`reload(true)` → `remove_parser` **递归移除反向依赖条目**
+(`gdscript_cache.cpp:259-263`),所以持有旧树的引用方在下次分析时会重新取到新树。这正是
+`Script::editor_can_reload_from_file()` 注释所列三条路径中的第二条("the LSP server when edited in a
+connected external editor")。
 
-### 7.5 记录口径
+★ 但**不要**把 `ScriptEditor::reload_scripts(true)` 也算作它的覆盖面:`p_refresh_only = true`
+**不重载任何资源**——`script_editor_plugin.cpp:2882-2884` 只更新 `last_modified_time`,真正的
+`CACHE_MODE_IGNORE` + `reload(true)` 在 `else` 分支(2896-2899),只有传 `false` 才走
+(如磁盘变更对话框 `4408 ...bind(false)`)。`reload_script()` 里 `true` 的实际效果是后面
+`2934-2938` 那句**无条件**的 `teb->reload_text()`。
 
-本节结论的可得性依赖以下事实,复核时应一并采集:编辑器进程身份(pid 与启动时间)、
-addon 实际监听的端口、LSP 端口、`script_editor_cache.cfg` 的条目数与被改脚本是否在其中、
-以及每次 `publishDiagnostics` 的原始快照。缺其中任一项,实验结论无法与"编辑器自动重载"等
-其它解释区分开(§7.2 的第 1、2 组正是为此而设)。
+### 7.5 本插件自己的检查为什么不复现
+
+它每次检查都会 `didClose` 全部文件(`godot-lsp.mjs:892-894`),`lsp_did_close` →
+`remove_cached_parser`(`gdscript_language_protocol.cpp:516`)随之释放钉子,于是引擎下次从磁盘重新
+解析——**检查行为本身把问题掩盖了**。这解释了"用户看得到、插件测不出"。
+
+### 7.6 证据强度与已知混杂
+
+- 三组对照**每格 n=1**,且人在同一台机器上操作(Godot 窗口焦点事件可能发生),因此 §7.2 的结论
+  是"支持"而非"证明"。
+- **rescan 打到了哪个实例未能自证**:端口公布文件是单槽的,且插件路径上显式端口优先级最高
+  (`lib/index.js:418` → `lib/manager.js:350-353` → `godot-lsp.mjs:1245`),桥内部的
+  `discoveredBridgePort`(`godot-lsp.mjs:226-240`)在该路径上是死代码;editor 模式的 host state
+  记 `pid: 0`(`godot-lsp.mjs:502-506`、`567-571`),LSP 对端不告知 pid。本次实验是**手工指定
+  6090** 完成的,故"rescan 到达了产生诊断的那个实例"由人工保证,**不是工具链保证的**。
+- 若要事后复核,需要采集:运行实例中**实时**的 `get_open_scripts()`/`get_unsaved_scripts()` 与自身 pid、
+  每步 a 的内容哈希与 mtime、窗口焦点时间线、每次 `publishDiagnostics` 的原始快照,以及一个
+  **负对照**(只 touch mtime 不改内容)。现有清单缺这些量,其中"addon 实际端口"目前也不可持久采集
+  (`plugin.gd:64` 只 `print_debug`,唯一落盘物是会被覆盖/删除的单槽文件)。
 
 ## 8. 方案评估
 
 | 方案 | 做法 | 结论 |
 |---|---|---|
-| **A(推荐)** | 桥在重扫**之前**,对**磁盘内容确实变化**的 `.gd` 发 `textDocument/didSave` | ✅ 采用。实测消除陈旧;只覆盖变化文件,不碰未保存缓冲 |
-| B | 扩展 addon 协议,让 Godot 侧直接 `reload` | ❌ 放弃。会覆盖用户**未保存**的编辑器缓冲;且与 §9.1 的 `check_error` 假绿叠加放大风险 |
-| C+ | 让引用方释放旧持有者(例如重开引用方文档) | ⚠ 机制上成立(§3),但需要插件能枚举"哪些引用方活着",成本高于 A |
+| **A** | 在重扫**之前**,对**磁盘内容确实变化**的 `.gd` 发 `textDocument/didSave` | ✅ 采用;引擎注释把这条列为脚本的正式重载途径之一 |
+| B | 扩展 addon 协议,让 Godot 侧直接 `reload` | ❌ 放弃;与 A 有**同一类**风险(见下),而 A 复用引擎既有入口 |
+| C+ | 让引用方释放旧持有者(例如重开引用方文档) | ⚠ 机制上成立(§3),但需要插件能枚举"哪些引用方活着" |
 
-方案 A 的注意点:
+★ **A 与 B 的真实差异不是"安全 vs 不安全"。**两者都会让磁盘内容覆盖编辑器缓冲:
 
-- 只发**内容真的变了**的文件(不是反向依赖),与既有 `rescannedThisRound` 去重共用;
-- **超时与失败策略要和 rescan 分开**:rescan 有 120s 失败冷却,D 的 `didSave` 不该被它拖住;
-- 它等价于编辑器自身对打开脚本的处理方式,不引入编辑器不会做的副作用。
+- `didSave` 的 `reload_script()` 会调 `update_docs_from_script(...)`
+  (`gdscript_text_document.cpp:118`),把脚本文本写回**打开的编辑器缓冲**;
+- `ScriptEditor::_reload_scripts` 里 `2934-2938` 的 `teb->reload_text()` **无条件**执行,即使
+  `p_refresh_only = true` 也会对**所有打开的标签页**重新取文本。
+
+也就是说:**如果用户正在 Godot 里编辑、且尚未保存的那个文件,恰好是 AI 这轮改的那一个,`didSave`
+会静默用磁盘内容覆盖其缓冲**,而且它**绕过**了编辑器自己的"文件已在磁盘上更新,要重新加载吗?"
+确认弹窗(`script_editor_plugin.h` 的 `_test_script_times_on_disk` / `disk_changed` /
+`pending_auto_reload`)。A 优于 B 的地方在于它复用引擎已有的入口、行为可预期,而不在于它不动缓冲。
+
+因此 A 必须配一个前置守卫:
+
+1. 发 `didSave` 前,先经 addon 查 `get_unsaved_scripts()`;命中的文件**跳过** didSave,改为**提示用户**
+   ("X 有未保存改动,请 Ctrl+S");
+2. 只对**内容真的变了**的文件发(§10 注 1);
+3. 超时与失败策略独立于 rescan 的 120 秒失败冷却,不互相拖累;
+4. `didSave` 的收益取决于 clientd 挂在谁身上:只有 `attachPolicy` 让会话落在用户编辑器上时,它才
+   清得掉**用户的**钉子;走 headless 或命中 `badEditor` 黑名单时只影响 headless 自己的缓存。
 
 ## 9. 顺带发现的两处缺陷
 
-### 9.1 `check_error` 会被当成"检查过,0 错误"
+### 9.1 `check_error` 被当成"检查过,0 错误"(四处)
 
-引擎未在超时内推送诊断时,桥会写出 `check_error` 且 `errors: 0`;而插件侧把"没有诊断"
-与"诊断为空"合并计数,于是**一次失败被记成一次干净通过**。同一轮里还可能同时出现
-"编译通过,0 错误…无需再次检查"的硬编码结论行——目前**没有任何通道**能把这种降级说明
-传达给模型。两者都要修。
+引擎未在超时内推送诊断时,桥写 `check_error` 且 `errors: 0`(`godot-lsp.mjs:870-879`);而插件侧
+把"没有诊断"与"诊断为空"合并计数。会因它产生假绿的**四处**:
 
-### 9.2 桥端口公布文件是单槽的,且协议没有实例身份
+1. `lib/index.js:1420` 的硬编码结论行(`- 结果：编译通过，0 错误` / `- 本结论来自引擎实时检查，
+   无需为这些文件再次运行 LSP/编译检查。`),由 `:1393-1407` 的 `checked` 计数在零错误分支触发的
+   `:1413-1427`;
+2. `lib/index.js:1449-1453` `baselineDoneText`:只要 `summary.errors === 0` 就回"扫描 N 个文件,
+   0 个编译错误";
+3. `lib/tool.js:7-22` `renderDiagnostics`:面模型的输出只打印 `checked N file(s): 0 error(s)`;
+4. `lib/client.js:414`:GUI 逐文件展示**跳过** `errs === 0 && warns === 0 && !engine_note` 的记录。
 
-`<project>/.godot/dsh_echo_bridge.json` 只有一份,**任何**退出的引擎实例都会按 pid 匹配删除它,
-于是"用户编辑器正在监听 6090"可能被一个已经退出的 headless 实例清掉,插件随后回退到默认端口。
-这是**结构性缺陷**:单槽文件 + 协议里没有实例身份。修这个缺陷时以下三处必须同步:
+四处都要改,否则真实错误仍会被静默吞掉。
 
-- `checkers/godot-lsp/addon/dsh_echo_bridge/plugin.gd`(公布/删除、`MAXIMUM_REQUEST_LENGTH`
-  的行缓冲上限、整行匹配协议);
-- `checkers/godot-lsp/godot-lsp.mjs`(读公布文件、默认端口回退);
-- `lib/addon.js`(probe 时的端口发现——**这是第二份独立实现**,与上一处必须同时改);
-- `checkers/godot-lsp/addon/dsh_echo_bridge/plugin.cfg` 的说明文本(它目前只列 `ping`/`rescan`)。
+### 9.2 桥端口公布文件是单槽的,协议没有实例身份
 
-协议侧的具体约束:客户端只接受整行的 `ok`,其它一律判为"未确认";addon 有 256 字节的整行上限,
-超长行会被清空并回 `err line too long`;若把应答改成 `ok <done> <total>` 这种带参数形式,
-需要**三处匹配逻辑一起改**。因此候选方案的正确顺序是:
+`<project>/.godot/dsh_echo_bridge.json` 只有一份,**任何**退出的实例按 pid 匹配就会删它
+(`plugin.gd:67-82`),于是"编辑器正在监听 6090"可能被一个已退出的 headless 实例抹掉。根因是
+**单槽文件 + 协议无实例身份**。相关实现分布:
 
-1. **先给协议加实例身份**(公布文件里带 pid/启动时间/项目路径,读方据此校验),让"发现端口"
-   这件事本身可验证;
-2. 只有在身份不可得时,才退回到"探测端口"这类猜测式回退——在没有身份的前提下探测,
-   有把 `rescan` 发给**别的项目**的 addon 的实际风险。
+- 读取该文件的**两处**:`checkers/godot-lsp/godot-lsp.mjs:226-240` 与 `lib/addon.js:34-48`
+  (没有第三处);
+- 端口**优先级**另有**三处**编码:`godot-lsp.mjs:1245`(flag/config/env > 公布文件 > 6089)、
+  `lib/index.js:418` 与 `:938-939`(公布文件 > `engine.json` 的 6089,且总是以显式值下传,使桥内的
+  发现逻辑在该路径失效)、`plugin.gd:48-63`(`DSH_ECHO_BRIDGE_PORT` > 6089 > 向上走位 16 个);
+- 写入/删除方:`plugin.gd:148-154` / `plugin.gd:67-82`;协议说明文本在 `plugin.cfg:4`;
+- `docs/design.md:199-200,212,242-244` 也描述了这个协议。
+
+协议侧约束:客户端只接受整行的 `ok`,其它一律判为"未确认";addon 有 256 字节整行上限
+(`plugin.gd:32`),超长行被清空并回 `err line too long`(111-113);若应答改成 `ok <done> <total>`
+这类带参数形式,需要**三处匹配逻辑一起改**。正确的候选顺序是:先给协议加**实例身份**(公布文件带
+pid/启动时间/项目路径,读方据此校验),只有身份不可得时才退回"探测端口"——在无身份的前提下探测,
+有把 `rescan` 发给**别的项目**的 addon 的实际风险。
+
+### 9.3 部署闭环(容易漏)
+
+改 `plugin.gd` 或桥之后要生效,需要四步:`install/install.ps1`(`:42-62` 删目录重拷)→ 重启
+`dsh web`(`:110`)→ 对每个项目重跑"安装引擎桥"(`lib/addon.js:130-145` 把 addon 拷进工程)→
+重启 Godot 编辑器(`lib/addon.js:9-11` 说明运行中的编辑器要等插件重载或重启)。`docs/` 不随安装复制。
 
 ## 10. 变更清单(实现方案 A 时)
 
 | 文件 | 改动 |
 |---|---|
-| `lib/index.js` | 重扫前对内容变化的 `.gd` 发 `didSave`;修正 `check_error` 的计数口径与结论行 |
-| `checkers/godot-lsp/godot-lsp.mjs` | `didSave` 客户端、超时/失败策略、端口发现与身份校验 |
-| `checkers/godot-lsp/addon/dsh_echo_bridge/plugin.gd` | 公布文件带实例身份 |
+| `lib/index.js` | 在 `contentStale` 重扫**之前**发起 didSave;把守卫的输入集合限定为"内容变化且无未保存改动"的 `.gd`;修正 §9.1 的四处假绿 |
+| `lib/manager.js` | **必需**:`lib/index.js` 不持有 LSP socket,唯一的通道是 clientd 请求体 `{id, files, sweep}`(`:292-306`),必须新增字段把 didSave 集合带下去 |
+| `checkers/godot-lsp/godot-lsp.mjs` | 在请求处理(`:1101-1137` `drain()`)里于 `collectDiagnostics` 之前发 `didSave`;并加 §8 守卫所需的 addon 查询;修正 `check_error` |
+| `checkers/godot-lsp/addon/dsh_echo_bridge/plugin.gd` | 暴露 `get_unsaved_scripts()` 供守卫使用;公布文件带实例身份 |
 | `checkers/godot-lsp/addon/dsh_echo_bridge/plugin.cfg` | 协议说明文本 |
-| `lib/addon.js` | 端口发现(与上一处保持一致) |
-| `docs/design.md`、`checkers/godot-lsp/README.md` | 同步"重扫能刷新什么"的表述与实测数据 |
+| `lib/addon.js` | 端口发现与身份校验(与 `godot-lsp.mjs` 保持一致) |
+| `lib/tool.js`、`lib/client.js` | §9.1 的另外两处假绿 |
+| `docs/design.md`、`checkers/godot-lsp/README.md` | 同步"重扫能刷新什么"的表述、端口协议段落与实测数据 |
+
+注 1:"磁盘内容确实变化"目前只有 **mtime** 作为输入(`lib/watcher.js:59-76` 的 `tick()` 只比
+`mtimeMs`,`drain()` 还包含 `.gdshader`),因此既可能误开(touch 或重写同内容),也可能漏开
+(内容变了而 mtime 未变/精度不足)。实现时应改用内容哈希,或明确接受该近似。
+
+注 2:baseline 路径(`lib/index.js:1482-1608` `startBaselineFor`)不看 watcher diff、直接全树 sweep,
+因此"改完的第一轮恰好是 baseline 轮"时 didSave 没有输入集合,需要另行定义或接受该轮缺省。

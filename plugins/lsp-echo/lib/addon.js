@@ -10,6 +10,11 @@
 // project.godot; a running editor picks that up after a plugin reload or editor
 // restart, while the next headless engine start reads the setting directly.
 import fs from 'node:fs'
+// Error text travels to the GUI as JSON and is shown verbatim, so it is translated
+// here rather than in the client: the active language is reported by the browser
+// and kept in this module's sibling, and a Chinese sentence would otherwise appear
+// inside an English page.
+import { tLine } from './i18n.js'
 import net from 'node:net'
 import path from 'node:path'
 
@@ -52,6 +57,79 @@ export function addonSourceOf(eng) {
   return eng && eng.addon ? path.join(path.dirname(eng.bridge), eng.addon, ADDON_ID) : undefined
 }
 
+/** How many ports above the base an addon instance may occupy (mirrors PORT_SCAN_COUNT). */
+const PORT_SCAN_COUNT = 16
+
+/** Absolute-path comparison for "is this port's addon serving the project I asked about?". */
+function samePath(a, b) {
+  const norm = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase()
+  return norm(a) === norm(b)
+}
+
+/**
+ * Ask a control port which project its addon serves.
+ *
+ * The published port file holds one slot, so a port found by probing must be
+ * confirmed to belong to the project being checked — another project's addon
+ * sits in the same scan range. An addon older than the `whoami` command answers
+ * `err unknown command`, which still proves something is listening there; that
+ * is reported as an empty path.
+ * @param {number} port control port
+ * @param {number} [timeoutMs] reply timeout
+ * @returns {Promise<string|undefined>} absolute project path, '' when the addon
+ *   predates `whoami` but answered, undefined when nothing answered
+ */
+export function askBridgeProject(port, timeoutMs = 700) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: '127.0.0.1', port })
+    let out = ''
+    let settled = false
+    const done = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { sock.destroy() } catch { /* already closed */ }
+      resolve(value)
+    }
+    const timer = setTimeout(() => done(undefined), timeoutMs)
+    sock.once('connect', () => { try { sock.write('whoami\n') } catch { done(undefined) } })
+    sock.on('data', (d) => {
+      out += d
+      const lines = out.split(/\r?\n/).map((line) => line.trim())
+      const who = lines.find((line) => line.startsWith('project:'))
+      if (who) done(who.slice('project:'.length))
+      else if (lines.includes('err unknown command') || lines.includes('pong')) done('')
+    })
+    sock.once('error', () => done(undefined))
+    sock.once('close', () => done(undefined))
+  })
+}
+
+/**
+ * Port of the addon serving this project, found without configuration.
+ *
+ * `discoverBridgePort` reads the published file, which holds a single instance's
+ * record: a second engine opening the project overwrites it, and the first
+ * instance's record is gone even though that engine is still listening. Probing
+ * the range an addon scans (base .. base+15) recovers that case; `whoami` keeps
+ * the probe from latching onto another project's addon in the same range.
+ * @param {string} project project root
+ * @param {{ rescanPort?: number }} [eng] engine record supplying the scan base
+ * @returns {Promise<number|undefined>} the port, or undefined when no addon is running
+ */
+export async function discoverBridgePortAsync(project, eng) {
+  const published = discoverBridgePort(project)
+  if (published !== undefined) return published
+  const base = rescanPortOf(eng)
+  for (let offset = 0; offset < PORT_SCAN_COUNT; offset++) {
+    const port = base + offset
+    const who = await askBridgeProject(port)
+    if (who === undefined) continue
+    if (who === '' || samePath(who, project)) return port
+  }
+  return undefined
+}
+
 /**
  * Register an editor plugin in project.godot, so Godot loads it on startup.
  * @param {string} project project root
@@ -61,7 +139,7 @@ export function addonSourceOf(eng) {
 export function ensureEditorPluginEnabled(project, resPath) {
   const cfg = path.join(project, 'project.godot')
   let text
-  try { text = fs.readFileSync(cfg, 'utf8') } catch { return { ok: false, error: 'project.godot 不存在' } }
+  try { text = fs.readFileSync(cfg, 'utf8') } catch { return { ok: false, error: tLine('addon.err.noProject') } }
   const quoted = `"${resPath}"`
   // A commented-out entry (`;enabled=PackedStringArray(...)`) must not count as
   // already enabled, or the addon would never actually be registered.
@@ -91,7 +169,7 @@ export function ensureEditorPluginEnabled(project, resPath) {
         else if (character === ')' && !is_in_quote) break
         cursor++
       }
-      if (cursor >= body.length) return { ok: false, error: 'project.godot 的 [editor_plugins] 段无法解析(enabled 列表缺少右括号)' }
+      if (cursor >= body.length) return { ok: false, error: tLine('addon.err.badPluginSection') }
       // Append to the existing list; the trailing comma of a hand-written list
       // is dropped so the result stays a valid PackedStringArray literal.
       const inner = body.slice(innerStart, cursor).trim().replace(/,$/, '')
@@ -116,7 +194,7 @@ export function ensureEditorPluginEnabled(project, resPath) {
     fs.renameSync(tmp, cfg)
   } catch (e) {
     try { fs.unlinkSync(tmp) } catch { /* nothing to clean up */ }
-    return { ok: false, error: `写入 project.godot 失败: ${(e && e.message) || e}` }
+    return { ok: false, error: tLine('addon.err.writeFailed', { message: (e && e.message) || e }) }
   }
   return { ok: true, changed: true }
 }
@@ -129,14 +207,14 @@ export function ensureEditorPluginEnabled(project, resPath) {
  */
 export function installAddonInto(project, eng) {
   const src = addonSourceOf(eng)
-  if (!src || !fs.existsSync(src)) return { ok: false, error: `引擎 ${eng ? eng.id : '?'} 未附带引擎桥 addon` }
+  if (!src || !fs.existsSync(src)) return { ok: false, error: tLine('addon.err.noAddon', { engine: eng ? eng.id : '?' }) }
   const dst = path.join(project, 'addons', ADDON_ID)
   try {
     fs.mkdirSync(dst, { recursive: true })
     // Recursive copy: the addon may ship subdirectories (icons, translations).
     fs.cpSync(src, dst, { recursive: true, force: true })
   } catch (e) {
-    return { ok: false, error: `复制 addon 失败: ${(e && e.message) || e}` }
+    return { ok: false, error: tLine('addon.err.copyFailed', { message: (e && e.message) || e }) }
   }
   const en = ensureEditorPluginEnabled(project, `res://addons/${ADDON_ID}/plugin.cfg`)
   return en.ok

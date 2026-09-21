@@ -289,7 +289,7 @@ function ensureClientd(bridge, project, role = 'main', editorPort) {
   return state
 }
 
-function clientdRequest(bridge, project, files, timeoutMs, role = 'main', editorPort) {
+function clientdRequest(bridge, project, files, timeoutMs, role = 'main', editorPort, reloadFiles) {
   return new Promise((resolve, reject) => {
     let state
     try { state = ensureClientd(bridge, project, role, editorPort) } catch (e) { reject(e); return }
@@ -301,7 +301,11 @@ function clientdRequest(bridge, project, files, timeoutMs, role = 'main', editor
     // Full-project baselines (role 'baseline') use the bridge's bulk sweep
     // path: one didOpen for every file, no per-chunk settle tax.
     const sweep = role === 'baseline'
-    try { state.child.stdin.write(JSON.stringify({ id, files, sweep }) + '\n') } catch (e) { reject(e) }
+    // `didsave` asks clientd to reload these scripts through the language server
+    // before it reads diagnostics; omit the field entirely when there is none.
+    const request = { id, files, sweep }
+    if (Array.isArray(reloadFiles) && reloadFiles.length) request.didsave = reloadFiles
+    try { state.child.stdin.write(JSON.stringify(request) + '\n') } catch (e) { reject(e) }
   })
 }
 
@@ -365,10 +369,13 @@ export function rescanEngine(bridge, project, port) {
  * @param {string[]} [ownedExts] extensions owned by the calling engine
  * @param {string[]} [keepExts] extensions still bound to the project in the
  *        current config; stale keys outside it are evicted on write (RFC §8)
+ * @param {string[]} [reloadFiles] scripts whose disk content changed; the
+ *        persistent clientd path reloads them before reading diagnostics. The
+ *        legacy one-shot fallback does not carry them.
  */
-export async function checkFiles(bridge, project, files, timeoutMs = 120_000, role = 'main', ownedExts, keepExts, editorPort) {
+export async function checkFiles(bridge, project, files, timeoutMs = 120_000, role = 'main', ownedExts, keepExts, editorPort, reloadFiles) {
   try {
-    const reply = await clientdRequest(bridge, project, files, timeoutMs, role, editorPort)
+    const reply = await clientdRequest(bridge, project, files, timeoutMs, role, editorPort, reloadFiles)
     if (reply && reply.ok && reply.payload) {
       return writeSnapshot(project, reply.payload, ownedExts, keepExts)
     }

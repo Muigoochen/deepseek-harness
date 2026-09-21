@@ -20,11 +20,12 @@ import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { engines, markers, matchExtension } from './checkers.js'
 import { ensureHost, stopHost, status, checkFiles, runtimeRoot, stopClientd, diagnosticsPath, pruneSnapshot, rescanEngine } from './manager.js'
-import { ADDON_ID, discoverBridgePort, installAddonInto, probeEngineBridge, rescanPortOf } from './addon.js'
+import { ADDON_ID, discoverBridgePortAsync, installAddonInto, probeEngineBridge, rescanPortOf } from './addon.js'
 import { dependentsOf } from './dependents.js'
 import { ProjectWatcher, scanFiles } from './watcher.js'
 import { registerTool } from './tool.js'
 import { scanProjectRoots } from './registry.js'
+import { allDictionaries, getActiveLocale, localeIds, setActiveLocale, tLine } from './i18n.js'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'lsp-echo'
@@ -62,13 +63,35 @@ const REGISTRY_SCHEMA = z.object({
   // Global auto-inject switch (RFC §7): persisted here so the settings GUI can
   // toggle it at runtime; absent = fall back to Config.autoInject (default true).
   autoInjectGlobal: z.boolean(),
-  // Engine-level editor-attach port overrides: engineId -> editor LSP port the
-  // bridge probes when attaching to a user's running Godot editor. Absent =
-  // engine default (Godot editor LSP default 6005). Stored as an array to keep
-  // the schemastery schema portable. GUI: 设置页「引擎(LSP)」卡.
+  // Auto-install the engine bridge addon into projects that lack it; absent =
+  // default on. The addon is what lets a running engine be asked to rescan (so a
+  // newly created `class_name` script registers instead of reporting an unknown
+  // type) and what the didSave path consults for "has unsaved changes?" before
+  // reloading a script. Copying it over an existing install is an update.
+  autoInstallAddon: z.boolean(),
+  // Editor-attach port overrides: which editor LSP port the bridge probes when
+  // attaching to a user's running Godot editor. Absent = engine default (Godot
+  // editor LSP default 6005). Stored as an array to keep the schemastery schema
+  // portable. GUI: 设置页「引擎(LSP)」卡.
+  //
+  // An entry with `project` applies to that project only and outranks an
+  // engine-wide entry; without it the entry covers every project using that
+  // engine. Two Godot projects served by two editors need one scoped entry each,
+  // because they share one engine id and would otherwise both probe one port —
+  // the second editor's LSP would then be refused as serving another project.
+  //
+  // Project identity is the resolved root path, compared lowercased: the same
+  // key the registry, the clientd pool, the baseline state and the rescan
+  // cooldowns already use, so a project cannot count as one project in one place
+  // and two in another. A moved project simply stops matching, falling back to
+  // the engine-wide entry and then to the default.
   enginePorts: z.array(z.object({
     engine: z.string(),
     port: z.number(),
+    // Optional by omission: this schemastery fork has no .optional(), fields are
+    // optional unless .required(). An entry without `project` is the engine-wide
+    // fallback; one with it applies to that project only.
+    project: z.string(),
   })).default([]),
 })
 
@@ -321,10 +344,10 @@ export function apply(ctx, config) {
     if (engineWarnShown.size > 64) engineWarnShown.clear() // bounded: never grows unbounded across sessions
     showToast(
       'warning',
-      `${eng.name} 编辑器 LSP 端口异常`,
+      tLine('toast.enginePort.title', { name: eng.name }),
       warn.reason === 'wrong-project'
-        ? `端口 ${warn.ports.join(', ')} 上的语言服务器服务的是别的项目(不是你当前检查的项目),不能用来诊断本项目——否则它返回的空诊断会伪装成"0 错误"。已自动改用独立引擎;把编辑器切回本项目后,该端口会在 5 分钟黑名单到期后重新尝试。`
-        : `端口 ${warn.ports.join(', ')} 可连接但不响应 LSP 请求(占用它的进程不是该语言的编辑器 LSP,或编辑器 LSP 已卡死)。已自动改用独立引擎,请检查该端口。`,
+        ? tLine('toast.enginePort.wrongProject', { ports: warn.ports.join(', ') })
+        : tLine('toast.enginePort.noReply', { ports: warn.ports.join(', ') }),
       `lsp-echo-engwarn:${key}`,
       8000,
     )
@@ -353,6 +376,7 @@ export function apply(ctx, config) {
       discovered: [...rawD],
       manual,
       autoInjectGlobal: v && typeof v.autoInjectGlobal === 'boolean' ? v.autoInjectGlobal : undefined,
+      autoInstallAddon: v && typeof v.autoInstallAddon === 'boolean' ? v.autoInstallAddon : undefined,
       enginePorts: v && Array.isArray(v.enginePorts) ? v.enginePorts : [],
     }
   }
@@ -361,23 +385,108 @@ export function apply(ctx, config) {
     if (!scope) return
     const out = { discovered: store.discovered, manual: store.manual, enginePorts: store.enginePorts }
     if (typeof store.autoInjectGlobal === 'boolean') out.autoInjectGlobal = store.autoInjectGlobal
+    if (typeof store.autoInstallAddon === 'boolean') out.autoInstallAddon = store.autoInstallAddon
     await scope.replace(out)
     store = readStore() // refresh local snapshot after the durable commit
   }
-  /** Editor-attach port configured for an engine id (undefined = engine default). */
-  const enginePortOf = (engineId) => {
-    const list = store.enginePorts || []
-    for (const e of list) {
-      const p = e && e.port
-      if (e && e.engine === engineId && typeof p === 'number' && Number.isInteger(p) && p >= 1 && p <= 65535) return p
+  /** Auto-install the engine bridge addon: settings toggle when set, else on. */
+  const globalAutoAddon = () => (typeof store.autoInstallAddon === 'boolean' ? store.autoInstallAddon : true)
+  /**
+   * Install the engine bridge addon into a project that lacks it.
+   *
+   * Without the addon a running engine cannot be asked to rescan, so the first
+   * check of a newly created `class_name` script reports an unknown type, and
+   * the didSave path loses the "has unsaved changes?" guard that keeps it from
+   * overwriting an editor buffer. Installing is idempotent — the directory is
+   * copied over — so a manual install doubles as an update.
+   *
+   * The check is one existsSync per round on a project bound to an engine that
+   * ships an addon, so calling it before every check stays cheap.
+   * @param {{ path: string, lsp?: Array<{ engine: string }> }} rec project record
+   * @returns {Promise<boolean>} true when the addon was installed this call
+   */
+  const ensureEngineBridge = async (rec) => {
+    if (!globalAutoAddon()) return false
+    const eng = (rec.lsp || []).map((x) => engine(x.engine)).find((e) => e && e.rescan && e.addon)
+    if (!eng) return false
+    if (fs.existsSync(path.join(rec.path, 'addons', ADDON_ID, 'plugin.gd'))) return false
+    try {
+      const r = installAddonInto(rec.path, eng)
+      if (!r.ok) {
+        trace('addon', `${rec.path}: auto install failed: ${r.error || 'unknown'}`)
+        return false
+      }
+      trace('addon', `${rec.path}: engine bridge installed (enabled=${r.enabled})`)
+      showToast('success', tLine('toast.addon.title'), tLine('toast.addon.body', { path: rec.path }), 'lsp-echo-addon', 9000)
+      // A headless engine already running predates the addon; stop it so the
+      // next check starts one that loads the addon. The user's editor is never
+      // touched — its addon loads when the editor restarts.
+      await stopHost(eng.bridge, rec.path).catch(() => {})
+      stopClientd(eng.bridge, rec.path)
+      return true
+    } catch (error) {
+      trace('addon', `${rec.path}: auto install threw: ${(error && error.message) || error}`)
+      return false
     }
-    return undefined
+  }
+  /**
+   * Editor-attach port configured for an engine, scoped to a project when given.
+   * A project-scoped entry wins over an engine-wide one; neither present means
+   * "use the engine default" (undefined).
+   * @param {string} engineId engine id, e.g. 'godot-lsp'
+   * @param {string} [project] project root; omitted = engine-wide lookup only
+   * @returns {number|undefined} configured port
+   */
+  const enginePortOf = (engineId, project) => {
+    const list = store.enginePorts || []
+    const wanted = project ? path.resolve(project).toLowerCase() : undefined
+    let engineWide
+    for (const e of list) {
+      if (!e || e.engine !== engineId) continue
+      const p = e.port
+      if (typeof p !== 'number' || !Number.isInteger(p) || p < 1 || p > 65535) continue
+      if (!e.project) {
+        if (engineWide === undefined) engineWide = p
+        continue
+      }
+      if (wanted && path.resolve(e.project).toLowerCase() === wanted) return p
+    }
+    return engineWide
   }
   /** Editor-attach port for a bridge path (resolve its owning engine id). */
-  const portForBridge = (bridge) => {
+  const portForBridge = (bridge, project) => {
     const eng = engineByBridge(bridge)
-    return eng ? enginePortOf(eng.id) : undefined
+    return eng ? enginePortOf(eng.id, project) : undefined
   }
+  /**
+   * Normalized identity of one project's port row, shared with the browser's
+   * `portRowKey`. Forward slashes and lower case keep the same project spelled
+   * one way on Windows and Linux; a trailing separator must not create a second
+   * identity for the same directory.
+   * @param {string} project project root
+   * @returns {string} normalized absolute path
+   */
+  const portKeyOf = (project) => String(path.resolve(project)).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  /**
+   * Response form of the port overrides, one entry per stored row.
+   *
+   * `key` is the scoped identity the settings board keys its inputs by. It is
+   * computed here rather than in the browser because only this side can resolve
+   * and normalize a project path the same way the lookup does; two normalized
+   * spellings of one project would make a saved value appear under two inputs.
+   *
+   * The browser builds the same string when it saves, so the two must agree
+   * exactly. Resolving a Windows path keeps backslashes, and emitting them
+   * verbatim made a saved value land under a key the board never asked for: the
+   * port looked like it had reverted on reopening. Slashes are normalized to the
+   * browser's spelling, and trailing separators are dropped.
+   */
+  const portEntries = () => (store.enginePorts || []).map((e) => ({
+    engine: e.engine,
+    port: e.port,
+    ...(e.project ? { project: e.project } : {}),
+    key: e.project ? `${e.engine}::${portKeyOf(e.project)}` : e.engine,
+  }))
   /** Global auto-inject: settings toggle when set, else the Config seed (default true). */
   const globalAutoInject = () => (typeof store.autoInjectGlobal === 'boolean' ? store.autoInjectGlobal : config.autoInject !== false)
 
@@ -393,6 +502,29 @@ export function apply(ctx, config) {
   const RESCAN_WARN_INTERVAL_MS = 600_000
   const RESCAN_OK_INTERVAL_MS = 3_000
   const RESCAN_STATE_CAP = 64
+  // Finding an addon's port may require probing its whole scan range, and the
+  // pre-step rescan runs on every step, so an answer is reused for a short
+  // window. Only a found port is cached: a miss must be retried, or an engine
+  // that starts later would never be picked up.
+  const BRIDGE_PORT_TTL_MS = 30_000
+  const bridgePortCache = new Map() // projectLower -> { port, at }
+  /**
+   * Control port of the project's engine addon, cached briefly.
+   * @param {string} project project root
+   * @param {{ rescanPort?: number }} eng engine record supplying the probe base
+   * @returns {Promise<number|undefined>} the port, or undefined when none answers
+   */
+  const bridgePortOf = async (project, eng) => {
+    const key = path.resolve(project).toLowerCase()
+    const hit = bridgePortCache.get(key)
+    if (hit && Date.now() - hit.at < BRIDGE_PORT_TTL_MS) return hit.port
+    const port = await discoverBridgePortAsync(project, eng)
+    if (port !== undefined) {
+      bridgePortCache.set(key, { port, at: Date.now() })
+      capState(bridgePortCache, RESCAN_STATE_CAP)
+    }
+    return port
+  }
   /** Writing this header is the user's browser asking, not a cross-site page. */
   const TRUST_HEADER = 'x-dsh-lsp-echo'
   const rescanFailedAt = new Map() // `${engineId}:${projectLower}` -> last failure
@@ -413,9 +545,10 @@ export function apply(ctx, config) {
     const key = `${eng.id}:${project.toLowerCase()}`
     if (Date.now() - (rescanFailedAt.get(key) || 0) < RESCAN_FAIL_COOLDOWN_MS) return false
     if (!opts.fresh && Date.now() - (rescanOkAt.get(key) || 0) < RESCAN_OK_INTERVAL_MS) return false
-    // A running engine publishes the port it actually bound; the declared
-    // engine default is only the fallback when nothing published one.
-    const port = discoverBridgePort(project) ?? rescanPortOf(eng)
+    // A running engine publishes the port it actually bound; when that record is
+    // gone (another instance overwrote or removed it) the range is probed, and
+    // the declared engine default is the last resort.
+    const port = (await bridgePortOf(project, eng)) ?? rescanPortOf(eng)
     try {
       // runBridge resolves for every exit code, so the receipt must be checked:
       // otherwise a failed rescan looks successful and the warning path below
@@ -438,8 +571,8 @@ export function apply(ctx, config) {
         capState(rescanWarnedAt, RESCAN_STATE_CAP)
         showToast(
           'warning',
-          `${eng.name} 引擎未刷新`,
-          `${path.basename(project)}:运行中的引擎不会发现新建脚本的 class_name。在设置页点「安装引擎桥」并在 Godot 里启用后,插件即可自动让引擎重扫。`,
+          tLine('toast.rescan.title', { engine: eng.name }),
+          tLine('toast.rescan.body', { project: path.basename(project) }),
           `lsp-echo-rescan:${key}`,
           9000,
         )
@@ -532,11 +665,13 @@ export function apply(ctx, config) {
    * @param {string} role check role ('main' | 'baseline')
    * @param {string[]|undefined} ownExts extensions this engine owns in the snapshot
    * @param {string[]|undefined} keepExts extensions the snapshot must keep
+   * @param {string[]} [reloadFiles] scripts whose disk content changed, for the
+   *   engine to reload through the language server before it answers
    * @returns {Promise<object>} diagnostics payload
    */
-  const checkWithHeal = async (eng, project, files, timeoutMs, role, ownExts, keepExts) => {
-    const port = enginePortOf(eng.id)
-    const payload = await checkFiles(eng.bridge, project, files, timeoutMs, role, ownExts, keepExts, port)
+  const checkWithHeal = async (eng, project, files, timeoutMs, role, ownExts, keepExts, reloadFiles) => {
+    const port = enginePortOf(eng.id, project)
+    const payload = await checkFiles(eng.bridge, project, files, timeoutMs, role, ownExts, keepExts, port, reloadFiles)
     if (!eng.rescan) return payload
     const missing = missingTypeNames(payload, project, files)
     if (!missing.length) return payload
@@ -553,7 +688,7 @@ export function apply(ctx, config) {
       // leave the first result in place instead of reporting "no diagnostics".
       // The smaller budget keeps the doubled cost off the pre-step path.
       const retryBudgetMs = Math.min(timeoutMs, 45_000)
-      const healed = await checkFiles(eng.bridge, project, files, retryBudgetMs, role, ownExts, keepExts, port)
+      const healed = await checkFiles(eng.bridge, project, files, retryBudgetMs, role, ownExts, keepExts, port, reloadFiles)
       if (missingTypeNames(healed, project, files).length) {
         trace('rescan', eng.id, 're-check still reports unknown types; the engine may not have re-published diagnostics yet')
       }
@@ -619,7 +754,7 @@ export function apply(ctx, config) {
   }
   seedKnown()
   if (known.size) {
-    showToast('info', 'lsp-echo 已就绪', `已登记 ${known.size} 个 Godot 项目(引擎:${enginesList().join(', ')})`, 'lsp-echo-ready', 4000)
+    showToast('info', tLine('toast.ready.title'), tLine('toast.ready.body', { count: known.size, engines: enginesList().join(', ') }), 'lsp-echo-ready', 4000)
   }
 
   // lazy watchers over the effective set. Mode B: no background polling; the
@@ -708,7 +843,7 @@ export function apply(ctx, config) {
         seedKnown()
         const newly = nextDiscovered.filter((d) => !beforeKeys.has(d.key) && d.projects.length)
         if (newly.length) {
-          showToast('success', 'lsp-echo 自动发现', `新增 Godot 项目:\n${newly.map((d) => d.title || d.path).join('\n')}`, 'lsp-echo-discover', 6000)
+          showToast('success', tLine('toast.discovered.title'), `${tLine('toast.discovered.body')}\n${newly.map((d) => d.title || d.path).join('\n')}`, 'lsp-echo-discover', 6000)
         }
       }
     } finally {
@@ -786,7 +921,7 @@ export function apply(ctx, config) {
       return { project: root, engineId, bridge: eng.bridge }
     },
     abs: absPath,
-    ensure: (bridge, project) => ensureHost(bridge, project, portForBridge(bridge)),
+    ensure: (bridge, project) => ensureHost(bridge, project, portForBridge(bridge, project)),
     stop: stopHost,
     stopClient: stopClientd,
     status,
@@ -796,12 +931,12 @@ export function apply(ctx, config) {
     // ownedExts/keepExts); unknown projects fall back to bare checkFiles.
     check: async (bridge, project, files, timeoutMs) => {
       const rec = known.get(path.resolve(project).toLowerCase())
-      if (!rec) return checkFiles(bridge, project, files, timeoutMs, 'main', undefined, undefined, portForBridge(bridge))
+      if (!rec) return checkFiles(bridge, project, files, timeoutMs, 'main', undefined, undefined, portForBridge(bridge, project))
       const keepExts = boundExtensions(rec)
       const ownExts = engineByBridge(bridge) ? engineByBridge(bridge).extensions : boundExtensions(rec)
       const eng = engineByBridge(bridge)
       if (eng) return checkWithHeal(eng, project, files, timeoutMs || 120_000, 'main', ownExts, keepExts)
-      return checkFiles(bridge, project, files, timeoutMs || 120_000, 'main', ownExts, keepExts, portForBridge(bridge))
+      return checkFiles(bridge, project, files, timeoutMs || 120_000, 'main', ownExts, keepExts, portForBridge(bridge, project))
     },
     projectsList: () => [...known.values()].map((r) => `${r.source}\t${primaryEngine(r) || '?'}\t${r.path}`),
     scanWorkspace: async (root) => {
@@ -844,7 +979,7 @@ export function apply(ctx, config) {
       let all = []
       try { all = [...scanFiles(project, config.watchSkip || DEFAULT_SKIP).keys()] } catch { /* ignore */ }
       if (!all.length) return '[lsp-echo] 项目里没有可检查的文件'
-      const payload = await checkFiles(bridge, project, all, 200_000, 'baseline', ownExts, undefined, portForBridge(bridge))
+      const payload = await checkFiles(bridge, project, all, 200_000, 'baseline', ownExts, undefined, portForBridge(bridge, project))
       const scanned = payload && payload.summary ? payload.summary.files_checked : all.length
       return baselineDoneText(payload, scanned)
     },
@@ -870,7 +1005,8 @@ export function apply(ctx, config) {
     }
     // A cross-site page can reach a plain GET, so every action with a side
     // effect asks for the header only our own bundle sends. Read-only actions
-    // (projects/engines/diagnostics/status/addCandidates/bridgeStatus) stay open.
+    // (projects/engines/diagnostics/status/addCandidates/bridgeStatus/locales)
+    // stay open.
     const MUTATING_ACTIONS = new Set(['installAddon', 'smart', 'setProject', 'addLsp', 'delLsp', 'resetProject', 'delProject', 'baseline', 'host', 'stop'])
     const apiHandler = async (req, res) => {
       try {
@@ -878,9 +1014,12 @@ export function apply(ctx, config) {
         const url = new URL(req.url || '/', 'http://lsp-echo.local')
         const action = url.searchParams.get('action')
         const project = url.searchParams.get('project')
-        // config/enginePort are read-only without their parameter and writes with it.
+        // config/enginePort are read-only without their parameter and writes with
+        // it; setLocale records the browser's language as a write for the same
+        // reason — it changes the language Host-side text is rendered in.
         const mutatingQuery = (action === 'config' && url.searchParams.has('autoInject'))
           || (action === 'enginePort' && url.searchParams.has('port'))
+          || (action === 'setLocale' && url.searchParams.has('locale'))
         if ((MUTATING_ACTIONS.has(action) || mutatingQuery) && !requireTrust(req, res)) return
         if (action === 'projects') {
           return json(res, 200, {
@@ -907,7 +1046,7 @@ export function apply(ctx, config) {
           if (!abs) return json(res, 400, { ok: false, error: 'installAddon requires project=<abs>' })
           const rec = known.get(abs.toLowerCase())
           const eng = rec ? (rec.lsp || []).map((x) => engine(x.engine)).find((e) => e && e.rescan && e.addon) : undefined
-          if (!eng) return json(res, 400, { ok: false, error: '该项目的引擎不支持引擎桥(engine.json 未声明 rescan/addon)' })
+          if (!eng) return json(res, 400, { ok: false, error: tLine('settings.bridge.err.unsupported') })
           const r = installAddonInto(abs, eng)
           // Our own headless engine loads editor plugins only at startup, so stop
           // it: the next check starts a fresh engine that loads the addon. A
@@ -933,25 +1072,41 @@ export function apply(ctx, config) {
           const abs = project ? path.resolve(project) : undefined
           const rec = abs ? known.get(abs.toLowerCase()) : undefined
           const eng = rec ? (rec.lsp || []).map((x) => engine(x.engine)).find((e) => e && e.rescan) : undefined
-          // A running addon publishes the port it actually bound; fall back to
-          // the engine default only when nothing is running yet.
-          const published = abs ? discoverBridgePort(abs) : undefined
+          // A running addon publishes the port it actually bound; when that
+          // record is missing the range is probed, and the engine default is the
+          // last resort.
+          const published = abs ? await bridgePortOf(abs, eng) : undefined
           const port = published ?? (eng ? rescanPortOf(eng) : undefined)
           const installed = abs ? fs.existsSync(path.join(abs, 'addons', ADDON_ID, 'plugin.gd')) : false
-          const probe = eng ? await probeEngineBridge(port) : { online: false, error: '该项目没有声明 rescan 能力的引擎' }
+          const probe = eng ? await probeEngineBridge(port) : { online: false, error: tLine('settings.bridge.err.noRescan') }
           return json(res, 200, { ok: true, project: abs || null, port: port ?? 0, declared: !!eng, installed, online: !!probe.online, error: probe.error })
         }
-        // Global auto-inject switch (RFC §7): GET returns effective value,
-        // GET with autoInject=0|1 persists the toggle to the settings store.
+        // The plugin's own text, one dictionary per language. The browser half is
+        // a zero-build module that cannot import JSON, so it fetches them here and
+        // registers them with the Client's `locale` service.
+        if (action === 'locales') {
+          return json(res, 200, { ok: true, locales: allDictionaries(), active: getActiveLocale(), ids: localeIds() })
+        }
+        // Only the browser knows which language the user picked, and Host-side
+        // text (toasts) has to match the GUI the user is reading.
+        if (action === 'setLocale') {
+          return json(res, 200, { ok: true, active: setActiveLocale(url.searchParams.get('locale') || '') })
+        }
+        // Global switches (RFC §7): GET returns the effective values; GET with
+        // autoInject=0|1 or autoAddon=0|1 persists that toggle to the settings
+        // store. autoAddon is the engine-bridge auto-install switch.
         if (action === 'config') {
           const ai = url.searchParams.get('autoInject')
-          if (ai === '0' || ai === '1') {
-            store.autoInjectGlobal = ai === '1'
+          const aa = url.searchParams.get('autoAddon')
+          const writesInject = ai === '0' || ai === '1'
+          const writesAddon = aa === '0' || aa === '1'
+          if (writesInject) store.autoInjectGlobal = ai === '1'
+          if (writesAddon) store.autoInstallAddon = aa === '1'
+          if (writesInject || writesAddon) {
             await persist()
             seedKnown()
-            return json(res, 200, { ok: true, autoInject: store.autoInjectGlobal, enginePorts: store.enginePorts })
           }
-          return json(res, 200, { ok: true, autoInject: globalAutoInject(), enginePorts: store.enginePorts })
+          return json(res, 200, { ok: true, autoInject: globalAutoInject(), autoAddon: globalAutoAddon(), enginePorts: portEntries() })
         }
         // Engine editor-attach port override (编辑器 LSP 端口). GET engine=<id>
         // with port=<n> persists; an empty/missing port clears the override.
@@ -959,6 +1114,10 @@ export function apply(ctx, config) {
         if (action === 'enginePort') {
           const eng = url.searchParams.get('engine')
           if (!eng || !engine(eng)) return json(res, 400, { ok: false, error: `enginePort requires engine=<id>; available: ${enginesList().join(', ')}` })
+          // Omitting `project` writes the engine-wide entry; passing it scopes the
+          // override to that project, which is what two editors need.
+          const projectRaw = url.searchParams.get('project')
+          const project = projectRaw ? path.resolve(projectRaw) : undefined
           let port = 0
           if (url.searchParams.has('port')) {
             const raw = url.searchParams.get('port')
@@ -969,11 +1128,11 @@ export function apply(ctx, config) {
               }
             }
           }
-          const list = (store.enginePorts || []).filter((x) => x.engine !== eng)
-          if (port > 0) list.push({ engine: eng, port })
+          const list = (store.enginePorts || []).filter((x) => x.engine !== eng || (x.project ? path.resolve(x.project).toLowerCase() !== (project ? project.toLowerCase() : '') : Boolean(project)))
+          if (port > 0) list.push(project ? { engine: eng, project, port } : { engine: eng, port })
           store.enginePorts = list
           await persist()
-          return json(res, 200, { ok: true, engine: eng, port, enginePorts: store.enginePorts })
+          return json(res, 200, { ok: true, engine: eng, port, project: project || null, enginePorts: portEntries() })
         }
         // DSH workspace projects the settings board can still register. Every
         // workspace root is a candidate (a project outside a workspace cannot
@@ -1195,7 +1354,7 @@ export function apply(ctx, config) {
         if (!found) return json(res, 400, { ok: false, error: `no project resolved for action=${action}; pass project or register projects first` })
         const { project: proj, bridge } = found
         let r
-        if (action === 'host') r = await ensureHost(bridge, proj, enginePortOf(found.engineId))
+        if (action === 'host') r = await ensureHost(bridge, proj, enginePortOf(found.engineId, proj))
         else if (action === 'stop') r = await stopHost(bridge, proj)
         else if (action === 'status') {
           r = await status(bridge, proj)
@@ -1224,7 +1383,7 @@ export function apply(ctx, config) {
           const ownExts = engineByBridge(bridge) ? engineByBridge(bridge).extensions : undefined
           let all = []
           try { all = [...scanFiles(proj, config.watchSkip || DEFAULT_SKIP).keys()] } catch { /* ignore */ }
-          const payload = await checkFiles(bridge, proj, all, 200_000, 'baseline', ownExts, undefined, enginePortOf(found.engineId))
+          const payload = await checkFiles(bridge, proj, all, 200_000, 'baseline', ownExts, undefined, enginePortOf(found.engineId, proj))
           return json(res, 200, {
             ok: true,
             project: proj,
@@ -1291,6 +1450,9 @@ export function apply(ctx, config) {
     // session-start trigger may be missed. Start the one-time full baseline on
     // this project's first real step instead.
     if (typeof baselineStarter === 'function') baselineStarter(agent)
+    // Before any watcher work: a project missing the engine bridge addon cannot
+    // be asked to rescan, and its didSave path has no unsaved-changes guard.
+    await ensureEngineBridge(rec)
     const watcher = ensureWatcher(rec)
     watcher.tick() // full-tree diff at the step boundary (mode B)
     const structural = watcher.drainStructural()
@@ -1361,6 +1523,12 @@ export function apply(ctx, config) {
     // script edited elsewhere only when its window regains focus. Rescan before
     // checking, or diagnostics describe the pre-edit file: a parent signature
     // edited here keeps surfacing as callers reporting the old signature.
+    // Scripts whose disk content changed this round, handed to the engine so it
+    // reloads them through the language server before it answers. A filesystem
+    // rescan deliberately skips a script that is open in the script editor
+    // (EditorFileSystem::_should_reload_script), which leaves the parse tree its
+    // dependents read with the pre-edit members; didSave rebuilds that tree.
+    const changedScripts = dirty.filter((f) => f.toLowerCase().endsWith('.gd'))
     const contentStale = boundEngines.filter(
       (e) => e.rescan && !rescannedThisRound.has(e.id) && touched.some((f) => matchExtension(e, f)),
     )
@@ -1373,7 +1541,8 @@ export function apply(ctx, config) {
       const files = byEngine.get(eng.id) || []
       if (!files.length) continue
       tasks.push(
-        checkWithHeal(eng, rec.path, files, 120_000, 'main', eng.extensions, keepExts)
+        checkWithHeal(eng, rec.path, files, 120_000, 'main', eng.extensions, keepExts,
+          changedScripts.filter((f) => matchExtension(eng, f)))
           .then((payload) => ({ engineId: eng.id, eng, payload }))
           .catch((error) => {
             console.error(`[lsp-echo] check failed (${eng.id}): ${(error && error.message) || error}`)
@@ -1515,7 +1684,7 @@ export function apply(ctx, config) {
     const state = { status: 'running', startedAnnounced: false, doneAnnounced: false, doneText: undefined, scanned: 0 }
     baseline.set(key, state)
     trace('baseline', 'start', agent && agent.id, hdr.cwd, `full sweep for ${rec.path}`)
-    showToast('info', '首次全量编译诊断进行中', `${rec.path} — 首次全量扫描中，完成后我会汇报`, `lsp-echo-baseline:${key}`, 0)
+    showToast('info', tLine('toast.baseline.running.title'), tLine('toast.baseline.running.body', { path: rec.path }), `lsp-echo-baseline:${key}`, 0)
     const scanAll = (eng) => {
       let out = []
       try { out = [...scanFiles(rec.path, config.watchSkip || DEFAULT_SKIP, eng.extensions).keys()] } catch (e) { trace('baseline', 'scan failed', (e && e.message) || e) }
@@ -1528,7 +1697,7 @@ export function apply(ctx, config) {
       state.doneText = ''
       trace('baseline', 'done', 'no engine files — auto baseline skipped, nothing injected')
       dismissToast(`lsp-echo-baseline:${key}`)
-      showToast('info', '首次全量诊断完成', '项目中没有可检查的文件(无引擎文件,自动诊断已跳过)', `lsp-echo-baseline-done:${key}`, 4000)
+      showToast('info', tLine('toast.baseline.empty.title'), tLine('toast.baseline.empty.body'), `lsp-echo-baseline-done:${key}`, 4000)
     }
     // Single engine: unchanged fast path (one sweep, original report text).
     if (boundEngines.length === 1) {
@@ -1544,9 +1713,9 @@ export function apply(ctx, config) {
           const errs = payload && payload.summary ? payload.summary.errors : 0
           dismissToast(`lsp-echo-baseline:${key}`)
           if (errs > 0) {
-            showToast('warning', '首次全量诊断：发现编译错误', `${errs} 个错误，详见对话注入`, `lsp-echo-baseline-done:${key}`, 6000)
+            showToast('warning', tLine('toast.baseline.errors.title'), tLine('toast.baseline.errors.body', { count: errs }), `lsp-echo-baseline-done:${key}`, 6000)
           } else {
-            showToast('success', '首次全量诊断完成', `扫描 ${state.scanned} 个文件，0 个编译错误`, `lsp-echo-baseline-done:${key}`, 4000)
+            showToast('success', tLine('toast.baseline.done.title'), tLine('toast.baseline.done.body', { scanned: state.scanned }), `lsp-echo-baseline-done:${key}`, 4000)
           }
         })
         .catch((e) => {
@@ -1554,7 +1723,7 @@ export function apply(ctx, config) {
           state.doneText = `[lsp-echo] 首次全量诊断失败: ${(e && e.message) || e}`
           trace('baseline', 'failed', (e && e.message) || e)
           dismissToast(`lsp-echo-baseline:${key}`)
-          showToast('error', '首次全量诊断失败', (e && e.message) || String(e), `lsp-echo-baseline-done:${key}`, 6000)
+          showToast('error', tLine('toast.baseline.failed.title'), (e && e.message) || String(e), `lsp-echo-baseline-done:${key}`, 6000)
         })
       return
     }
@@ -1594,16 +1763,16 @@ export function apply(ctx, config) {
       trace('baseline', 'done', `scanned=${scanned} errs=${errs}`)
       dismissToast(`lsp-echo-baseline:${key}`)
       if (errs > 0) {
-        showToast('warning', '首次全量诊断：发现编译错误', `${errs} 个错误，详见对话注入`, `lsp-echo-baseline-done:${key}`, 6000)
+        showToast('warning', tLine('toast.baseline.errors.title'), tLine('toast.baseline.errors.body', { count: errs }), `lsp-echo-baseline-done:${key}`, 6000)
       } else {
-        showToast('success', '首次全量诊断完成', `扫描 ${scanned} 个文件，0 个编译错误`, `lsp-echo-baseline-done:${key}`, 4000)
+        showToast('success', tLine('toast.baseline.done.title'), tLine('toast.baseline.done.body', { scanned }), `lsp-echo-baseline-done:${key}`, 4000)
       }
     }).catch((e) => {
       state.status = 'done'
       state.doneText = `[lsp-echo] 首次全量诊断失败: ${(e && e.message) || e}`
       trace('baseline', 'failed', (e && e.message) || e)
       dismissToast(`lsp-echo-baseline:${key}`)
-      showToast('error', '首次全量诊断失败', (e && e.message) || String(e), `lsp-echo-baseline-done:${key}`, 6000)
+      showToast('error', tLine('toast.baseline.failed.title'), (e && e.message) || String(e), `lsp-echo-baseline-done:${key}`, 6000)
     })
   }
   ctx.on('agent/session-start', ({ agent, source }) => {

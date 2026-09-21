@@ -121,6 +121,16 @@ node "$env:DSH_HOME\profiles\node_modules\@dsh-user\lsp-echo\checkers\godot-lsp\
 
 **智能连接语义**:attach 模式下引擎是你编辑器的客人(`stop`/卸载只 detach,**绝不杀你的编辑器进程**);编辑器关掉后下次检查自动 fallback headless;实测 attach 就绪 0.1s、全量 501 文件 ≈4.7s。
 
+**多项目并存**:每项目独立状态文件(`host-<项目目录名>.json`)、独立 clientd、独立基线与重扫冷却键,
+所以两个项目同时开发互不干扰;addon 控制端口从 6089 起向上走位,且每个实例只把端口公布在自己项目的
+`.godot/` 下,因此不互抢。**唯一的例外是编辑器 attach 端口**:两个 Godot 项目共用一个引擎 id,
+而「编辑器 LSP 端口」可以按项目分别配置(见设置页引擎卡),**必须分别填写**,否则两个项目都去探同一个
+端口,第二个项目的编辑器会因"服务的是别的项目"被拒 → 回退 headless(仍可用,但不是 attach)。
+
+**项目身份**:一律用项目根的**绝对路径**(比对时小写归一化),与登记表、clientd 池、基线状态、
+重扫冷却键完全一致——这样一个项目不会在某处算一个、在另一处算两个。项目被移动或改名后,
+它的端口配置条目自然失配,回落到兜底设置,不会出错。Godot 项目本身没有唯一 ID,目录即身份。
+
 **编辑器后开怎么办(attachPolicy)**:引擎决策在**每次检查前**重做,不是"启动时定终身"。
 `prefer-editor`(默认)= 若发现"我们自己的 headless 在跑、而你的编辑器现在也可连",就**迁回 attach 并停掉我们自己那个 headless**,一个项目只留一个引擎;
 `cold-start` = 谁先起就用谁(适合你同时用 VSCode 的 Godot 插件连编辑器 LSP 的机器——迁回会挤掉它一次,它会自己重连)。
@@ -150,21 +160,67 @@ node "$env:DSH_HOME\profiles\node_modules\@dsh-user\lsp-echo\checkers\godot-lsp\
 
 **设置页**(设置面板 → "LSP 诊断"):项目为主的卡片列表 ——
 - 顶部**自动注入(全局)**开关:新项目第一次加入 DSH 时自动智能配置并在编辑后反馈;
+- 顶部**自动安装 Godot 引擎桥**开关(**默认开**):发现项目缺 `addons/dsh_echo_bridge` 时自动装上(新增该目录,
+  并写 `project.godot` 的 `[editor_plugins]` 启用)。引擎桥是 **Godot 专属**的**进阶能力**——不装也能正常诊断(检查、注入、
+  多项目路由都不依赖它),但缺了它会退化三处:新建 `class_name` 脚本首轮误报未知类型、改动后的自愈重检不触发、
+  且「改动后刷新」失去「该脚本有无未保存改动」的守卫(会覆盖你正在编辑的内容)。关掉后仍可用项目卡的
+  「安装 Godot 引擎桥」按钮手动安装——**重复安装即覆盖更新/修复**;
 - 每张项目卡 = 项目目录名 + 已绑定引擎 chips(✕ 移除)+ 常驻**手动添加引擎**下拉/按钮 +
-  **安装引擎桥 / 检测引擎桥**(见「引擎桥」)+ **智能配置**(扫描项目补缺失引擎,只补充不覆盖)+ 还原种子/移除手动配置;
+  **安装 Godot 引擎桥 / 检测 Godot 引擎桥**(见「引擎桥」)+ **智能配置**(扫描项目补缺失引擎,只补充不覆盖)+ 还原种子/移除手动配置;
 - **登记行**:从 **DSH 工作区项目下拉**选择登记(已登记的选项禁用,含无 GDScript 的
   工作区根——登记仅占位,不会产生诊断;无需手输绝对路径);
-- 引擎(LSP)卡:每引擎一行(名称+扩展名)+「编辑器 LSP 端口」输入(留空保存 = 恢复默认自动);
+- 引擎(LSP)卡:每引擎一块 —— 名称+扩展名,下挂「编辑器 LSP 端口」输入,分**全部项目(兜底)**与**每个项目**两档;
+  项目级优先于兜底,再回落到引擎默认(6005)。留空保存 = 清除该行覆盖;
 - 操作结果提示显示在设置页顶部;无引擎文件的项目首次全量只提示一次。
 
 实现:静态 client 半(`lib/client.js`),挂 `conversation.session.header.actions` + `shell.overlay`
 + `settings.section`;数据/控制走 host 路由 `GET /lsp-echo/api`
-(action:`projects|engines|config|enginePort|addCandidates|smart|setProject|addLsp|delLsp|resetProject|delProject|host|stop|status|baseline|diagnostics|installAddon|bridgeStatus`)。
-**有副作用的 action 必须带 `x-dsh-lsp-echo: 1` 头**(`installAddon`/`smart`/`setProject`/`addLsp`/`delLsp`/`resetProject`/`delProject`/`baseline`/`host`/`stop`,以及带参数的 `config`/`enginePort`):
-浏览器不会给跨站请求附加自定义头,因此别的网页无法让 DSH 写你的项目或停你的引擎;只读 action 不设门。
+(action:`projects|engines|config|enginePort|addCandidates|smart|setProject|addLsp|delLsp|resetProject|delProject|host|stop|status|baseline|diagnostics|installAddon|bridgeStatus|locales|setLocale`)。
+**有副作用的 action 必须带 `x-dsh-lsp-echo: 1` 头**(`installAddon`/`smart`/`setProject`/`addLsp`/`delLsp`/`resetProject`/`delProject`/`baseline`/`host`/`stop`,以及带参数的 `config`/`enginePort`/`setLocale`):
+浏览器不会给跨站请求附加自定义头,因此别的网页无法让 DSH 写你的项目、停你的引擎,也无法改掉浮窗提示所用的语言;只读 action(`projects`/`engines`/`diagnostics`/`status`/`addCandidates`/`bridgeStatus`/`locales`)不设门。
 详见 `docs/design.md` §8。
 
-## 引擎桥(让运行中的引擎发现新建脚本)
+## 多语言(中 / 英)
+
+界面文案与浮窗提示都走词典,**一种语言一个 JSON,键值对**:
+
+```
+lib/locales/zh.json     中文(默认语言,也是回退目标)
+lib/locales/en.json     英文
+```
+
+**语言跟随 DSH,插件不另设开关**。浏览器半把词典注册进 Client 的 `locale` 服务,你在 DSH 设置里选中文还是
+英文,插件的设置页、浮层、按钮提示**立即跟着切换**,并复用该服务的回退链(活跃语言 → 回退语言 →
+`common` 命名空间 → 原样显示 key)。`locale` 服务缺席时(极简组合)退回用 API 返回的当前语言词典,
+插件照常可用——少一个服务不该让设置页变空。
+
+**Host 侧文本(浮窗提示)也是同一语言**。host 发通知时并不知道当前语言,所以浏览器半在语言变化时通过
+`action=setLocale` 告知它,host 用**同一份 JSON** 翻译。
+
+**段落排版**:一个键的值可以是**字符串数组**,数组每一项就是一段。长说明因此逐段成行、段间留间距,
+而不是挤成一大段。渲染侧有三个入口:`t(key, params)` 返回原值(字符串或数组)、`tLine()` 拼成单行
+(给浮窗这类单行目标)、`renderParts()` 渲染成多段(给设置页)。
+
+**加一种语言**:在 `lib/locales/` 放 `<lang>.json`,键集合与 `zh.json` 保持一致,并在 `lib/i18n.js` 的
+`localeIds()` 里登记。占位符写成 `{name}`,由调用方通过 `params` 替换,两种语言里的位置可以不同。
+
+## 安装自检
+
+`install/install.ps1` 复制完成后会跑四道检查,**任何一道失败都中止安装并以 exit 1 结束**,
+而不是等你重启 `dsh web` 才发现问题:
+
+1. **host 半可导入** —— 插件在模块顶层构造 schema,写错会让 `dsh web` 整个起不来;
+2. **`client.js` 可作为浏览器半解析** —— 它由页面原样加载,只能 `require` 平台种子。
+   注意 `node --check` 对 `.js` 会按 ESM 解析(包里有 `"type": "module"`),因此这一步是把它
+   复制成 `.cjs` 再解析的:**`import`/`export`/顶层 await 会在这里失败**,而这正是零构建产物最致命的错误;
+3. **词典可解析、中英键完全一致、段落结构一致** —— 不一致会静默退化成显示 key;
+4. **源码引用的每个 i18n 键都存在于词典** —— 从**源码树**检查(陈旧安装掩盖不了),并指出缺失键所在的文件与行号;
+   同时报告**未被引用的死键**(不判失败,只提示清理)。
+
+复制规则只有 `lib/*.js` **加上** `lib/locales/`;新增其它运行期资源目录时要同步补上复制规则,
+否则文件不会进 profile。
+
+## 引擎桥(让运行中的 Godot 引擎发现新建脚本)
 
 **问题**:Godot 只在**扫描项目文件系统**时把脚本的 `class_name` 注册为全局类名
 (`EditorFileSystem::_update_script_classes` → `ScriptServer::add_global_class`)。
@@ -174,11 +230,11 @@ node "$env:DSH_HOME\profiles\node_modules\@dsh-user\lsp-echo\checkers\godot-lsp\
 
 **做法**:插件把一个随引擎分发的 Godot 编辑器插件复制进项目并登记启用:
 
-1. 设置页项目卡 → **安装引擎桥** → 写入 `<项目>/addons/dsh_echo_bridge/`(plugin.cfg + plugin.gd),
+1. 设置页项目卡 → **安装 Godot 引擎桥** → 写入 `<项目>/addons/dsh_echo_bridge/`(plugin.cfg + plugin.gd),
    并在 `project.godot` 的 `[editor_plugins] enabled` 里追加一条(已有该条则不动,幂等);
 2. **重启 Godot 编辑器**(或在「项目设置 → 插件」里确认已启用)后生效;
    **headless 引擎下次启动会自动读取该设置**——不需要额外操作;
-3. **检测引擎桥** 报告当前是否有引擎实例在线(能响应重扫请求)。
+3. **检测 Godot 引擎桥** 报告当前是否有引擎实例在线(能响应重扫请求)。
 
 addon 在本机 `127.0.0.1` 上监听一个控制端口,把一行 `rescan` 变成
 `EditorInterface.get_resource_filesystem().scan_sources()`(与编辑器获得焦点时同一条扫描路径)。

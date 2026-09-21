@@ -231,16 +231,17 @@ window.__ModuleLoader__.load({
     // ============================================================
     // 组件 1:会话头部图标(当前会话 cwd 命中项目时显示)
     // ============================================================
+    // seat 可用性放外层判定:内层必须**无条件**调用 useSessions,否则 props 在
+    // 两次渲染间从无到有会改变 hooks 数量,React 直接报错(Panel/PanelInner 同款手法)。
     function HeaderIcon(props) {
+      if (typeof props.useSessions !== 'function' || !props.sessionId) return null
+      return React.createElement(HeaderIconInner, props)
+    }
+
+    function HeaderIconInner(props) {
       var sessionId = props.sessionId
-      // 标准订阅 hook(useSessions)必须在渲染顶层调用:订阅会话 cwd 快照,
-      // 会话数据变化(切换/载入)时本组件自动重渲染,effect 随之重跑。
-      var cwd = undefined
-      try {
-        if (props.useSessions && sessionId && typeof props.useSessions === 'function') {
-          cwd = props.useSessions(function (s) { return s && s.byId ? s.byId[sessionId].cwd : undefined })
-        }
-      } catch (e) { cwd = undefined }
+      // 订阅会话 cwd 快照:会话数据变化(切换/载入)时本组件重渲染,effect 随之重跑。
+      var cwd = props.useSessions(function (s) { return s && s.byId && s.byId[sessionId] ? s.byId[sessionId].cwd : undefined })
 
       var pair = React.useState(null) // {path, engine} | null
       var known = pair[0]
@@ -262,6 +263,8 @@ window.__ModuleLoader__.load({
 
       // 项目已知后,定期刷新角标摘要(轻量)
       var knownPath = known ? known.path : null
+      // 订阅语言:必须在下面任何 return 之前,否则 hooks 数量会随分支变化。
+      var T = useT()
       React.useEffect(function () {
         if (!knownPath) return
         var timer = setInterval(function () {
@@ -283,8 +286,8 @@ window.__ModuleLoader__.load({
       return React.createElement('button', {
         type: 'button',
         className: 'lspi-trigger',
-        title: 'LSP 诊断 · ' + known.path,
-        'aria-label': 'LSP 诊断面板(' + known.path + ')',
+        title: T('overlay.title', { path: known.path }),
+        'aria-label': T('overlay.aria', { path: known.path }),
         onClick: function (ev) {
           // 记录图标当前位置,浮层据此定位(头部下方右对齐)
           try {
@@ -311,6 +314,8 @@ window.__ModuleLoader__.load({
 
     function PanelInner(props) {
       var path = props.path
+      // 订阅语言:下面的分支众多,必须在任何 return 之前取出。
+      var T = useT()
       // 定位:头部下方、左对齐锚点图标(像下拉菜单向右展开);窗口太窄则贴左缘
       var PANEL_W = 440
       var stylePos = { top: 8, left: 8 }
@@ -377,21 +382,26 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
-      var modeText = 'engine …'
+      // 引擎模式徽章:文案随语言走(T 在渲染路径里,语言一变换就会重算)
+      var modeText = T('overlay.mode.engine')
       var modeCls = 'lspi-mode'
       var mode = st && st.mode ? st.mode : ''
-      if (mode === 'editor') { modeText = 'editor attach'; modeCls += ' lspi-editor' }
-      else if (mode === 'headless') { modeText = 'headless'; modeCls += ' lspi-headless' }
-      else if (mode === 'off') { modeText = 'off'; modeCls += ' lspi-off' }
-      else if (mode === 'running') { modeText = 'running'; }
+      if (mode === 'editor') { modeText = T('overlay.mode.editor'); modeCls += ' lspi-editor' }
+      else if (mode === 'headless') { modeText = T('overlay.mode.headless'); modeCls += ' lspi-headless' }
+      else if (mode === 'off') { modeText = T('overlay.mode.off'); modeCls += ' lspi-off' }
+      else if (mode === 'running') { modeText = T('overlay.mode.running'); }
 
       var summaryText = ''
       if (diag && !diag.empty && diag.summary) {
-        summaryText = diag.summary.files_checked + ' files · ' + diag.summary.errors + ' err · ' + diag.summary.warnings + ' warn'
+        summaryText = T('overlay.summary', {
+          files: diag.summary.files_checked,
+          err: diag.summary.errors,
+          warn: diag.summary.warnings,
+        })
       } else if (diag && diag.empty) {
-        summaryText = '尚未扫描'
+        summaryText = T('overlay.notScanned')
       } else if (!diag) {
-        summaryText = '读取中…'
+        summaryText = T('overlay.reading')
       }
 
       // 组装按文件分组的行
@@ -420,7 +430,7 @@ window.__ModuleLoader__.load({
         React.createElement('span', { key: 't', className: 'lspi-title', title: path }, path),
         React.createElement('span', { key: 'm', className: modeCls }, modeText),
         React.createElement('button', {
-          key: 'x', type: 'button', className: 'lspi-x', title: '关闭',
+          key: 'x', type: 'button', className: 'lspi-x', title: T('overlay.close'),
           onClick: function () { panelSignal.set(null) },
         }, '\u00d7'),
       ])
@@ -429,7 +439,7 @@ window.__ModuleLoader__.load({
         React.createElement('button', {
           key: 'refresh', type: 'button', className: 'lspi-btn',
           onClick: function () { refresh() },
-        }, '刷新'),
+        }, T('overlay.refresh')),
         React.createElement('button', {
           key: 'baseline', type: 'button', className: 'lspi-btn',
           disabled: busy !== '',
@@ -437,35 +447,35 @@ window.__ModuleLoader__.load({
             setBusy('baseline')
             apiGet('baseline', path).then(function () { setBusy(''); refresh() })
           },
-        }, busy === 'baseline' ? '扫描中…' : '全量重扫'),
+        }, busy === 'baseline' ? T('overlay.rescanning') : T('overlay.rescan')),
         React.createElement('button', {
           key: 'host', type: 'button', className: 'lspi-btn',
           disabled: busy !== '',
-          title: mode === 'editor' || mode === 'headless' ? '引擎已在运行' : '启动引擎',
+          title: mode === 'editor' || mode === 'headless' ? T('overlay.start.running') : T('overlay.start.title'),
           onClick: function () {
             setBusy('host')
             apiGet('host', path).then(function () { setBusy(''); refresh() })
           },
-        }, busy === 'host' ? '启动中…' : '启动引擎'),
+        }, busy === 'host' ? T('overlay.starting') : T('overlay.start')),
         React.createElement('button', {
           key: 'stop', type: 'button', className: 'lspi-btn',
           disabled: busy !== '',
-          title: mode === 'off' ? '引擎未在运行' : '停止引擎(headless)',
+          title: mode === 'off' ? T('overlay.stop.off') : T('overlay.stop.title'),
           onClick: function () {
             setBusy('stop')
             apiGet('stop', path).then(function () { setBusy(''); refresh() })
           },
-        }, busy === 'stop' ? '停止中…' : '停止'),
+        }, busy === 'stop' ? T('overlay.stopping') : T('overlay.stop')),
         React.createElement('span', { key: 'sum', className: 'lspi-sum' }, summaryText),
       ])
 
       var body
       if (busy === 'baseline') {
-        body = React.createElement('div', { className: 'lspi-status' }, '全量扫描中…(几百个文件约 5s)')
+        body = React.createElement('div', { className: 'lspi-status' }, T('overlay.scanning'))
       } else if (fileRows.length === 0) {
         body = React.createElement('div', { className: 'lspi-empty' },
-          diag && diag.empty ? '还没有诊断快照 — 点「全量重扫」生成。'
-            : '✓ 无错误、无警告。',
+          diag && diag.empty ? T('overlay.noSnapshot')
+            : T('overlay.clean'),
         )
       } else {
         var groups = fileRows.map(function (fr) {
@@ -506,7 +516,9 @@ window.__ModuleLoader__.load({
               caret,
               React.createElement('span', { key: 'p', className: 'lspi-fpath' }, fr.rel),
               React.createElement('span', { key: 'n', className: 'lspi-fcount' },
-                (fr.errs > 0 ? fr.errs + ' error' : '') + (fr.errs > 0 && fr.warns > 0 ? ' · ' : '') + (fr.warns > 0 ? fr.warns + ' warning' : '')),
+                (fr.errs > 0 ? T('overlay.fileCount.error', { n: fr.errs }) : '')
+                + (fr.errs > 0 && fr.warns > 0 ? ' · ' : '')
+                + (fr.warns > 0 ? T('overlay.fileCount.warning', { n: fr.warns }) : '')),
             ]),
             items.length > 0 ? React.createElement('div', { key: 'i' }, items) : null,
           ])
@@ -519,14 +531,19 @@ window.__ModuleLoader__.load({
         className: 'lspi-panel',
         style: stylePos,
         role: 'dialog',
-        'aria-label': 'LSP 诊断',
+        'aria-label': T('overlay.label'),
       }, [head, tools, body])
     }
 
     // ============================================================
     // 组件 3:设置页(settings.section)—— 项目为主 + LSP chips(v2)
     // ============================================================
-    var SRC_LABEL = { config: 'DSH 配置', manual: '手动添加', workspace: '自动发现' }
+    // 来源标签:函数取值,调用时才翻译(语言切换后自然跟着变)
+    function srcLabel(id) {
+      if (id === 'config') return t('settings.source.config')
+      if (id === 'manual') return t('settings.source.manual')
+      return t('settings.source.workspace')
+    }
 
     function SettingsPanel() {
       var state = React.useState({
@@ -534,6 +551,8 @@ window.__ModuleLoader__.load({
         projects: [],        // [{path, source, engine, lsp:[ids], autoInject}]
         engines: [],         // [{id, name, marker, extensions}]
         autoInject: true,    // 全局自动注入开关
+        autoAddon: true,     // 全局自动安装引擎桥(addon)开关
+        bridgeInfo: {},      // path -> 检测引擎桥结果(就地显示在项目卡里,不必去页顶找提示)
         enginePorts: {},     // engineId -> 编辑器 LSP 端口(仅含显式覆盖)
         engPortDraft: {},    // 引擎卡端口输入草稿 engineId -> string|''
         busy: '',            // busy token(单飞行)
@@ -545,6 +564,31 @@ window.__ModuleLoader__.load({
       })
       var s = state[0]
       var set = function (patch) { state[1](function (prev) { return Object.assign({}, prev, patch) }) }
+      // 提示存 key + params,而不是当场算好的字符串:切换语言后已显示的提示也要
+      // 跟着变。存字符串会一直重放旧语言的文本,直到用户再点一次按钮。
+      function noteOf(key, params) { return { key: key, params: params } }
+      // params 的值可以是 {key, params}:嵌在提示里的片段(「该项目」「该引擎」等)
+      // 也必须跟着语言走,否则会拼出「壳是新语言、内嵌片段是旧语言」的混排句子。
+      function noteParams(params) {
+        if (!params) return params
+        var out = {}
+        for (var name in params) {
+          if (!Object.prototype.hasOwnProperty.call(params, name)) continue
+          var value = params[name]
+          out[name] = (value && typeof value === 'object' && typeof value.key === 'string')
+            ? t(value.key, noteParams(value.params))
+            : value
+        }
+        return out
+      }
+      function noteText(note) {
+        if (!note) return null
+        if (typeof note === 'string') return note
+        return T(note.key, noteParams(note.params))
+      }
+      // 订阅语言:Switch 语言或词典晚到时重渲染本卡。必须在任何 return 之前调用,
+      // 否则「加载中/出错」分支会改变 hooks 数量。
+      var T = useT()
 
       function reloadProjects() {
         apiGet('projects').then(function (d) { if (d && d.ok) set({ projects: d.projects || [] }) })
@@ -554,9 +598,25 @@ window.__ModuleLoader__.load({
           if (d && d.ok && Array.isArray(d.candidates)) set({ candidates: d.candidates })
         })
       }
+      // 自动安装引擎桥:开 = 发现项目缺 addon 就自动装上;关 = 只用手动按钮。
+      function toggleAddon() {
+        if (s.busy) return
+        var next = s.autoAddon ? 0 : 1
+        set({ busy: 'config:addon' })
+        apiGet('config', null, { autoAddon: next }).then(function (d) {
+          set({ busy: '' })
+          if (d && d.ok) {
+            set({
+              autoAddon: !!d.autoAddon,
+              note: d.autoAddon ? noteOf('settings.note.autoAddonOn') : noteOf('settings.note.autoAddonOff'),
+            })
+          }
+        })
+      }
+
       function loadAll() {
         apiGet('projects').then(function (d) {
-          if (!d || d.ok !== true) { set({ loaded: true, error: '读取项目失败(插件未激活? 需重启 dsh web)' }); return }
+          if (!d || d.ok !== true) { set({ loaded: true, error: noteOf('settings.error.projects') }); return }
           set({ loaded: true, projects: d.projects || [] })
         })
         apiGet('engines').then(function (e) {
@@ -571,10 +631,10 @@ window.__ModuleLoader__.load({
             if (Array.isArray(c.enginePorts)) {
               for (var i = 0; i < c.enginePorts.length; i++) {
                 var ep = c.enginePorts[i]
-                if (ep && ep.engine) map[ep.engine] = ep.port
+                if (ep && ep.key) map[ep.key] = ep.port
               }
             }
-            set({ autoInject: c.autoInject, enginePorts: map })
+            set({ autoInject: c.autoInject, autoAddon: c.autoAddon !== false, enginePorts: map })
           }
         })
         loadCandidates()
@@ -583,8 +643,8 @@ window.__ModuleLoader__.load({
       React.useEffect(function () { loadAll() /* eslint-disable-line react-hooks/exhaustive-deps */ }, [])
 
       if (s.error) return React.createElement('div', { className: 'lspi-set' },
-        React.createElement('div', { className: 'lspi-set-err' }, s.error))
-      if (!s.loaded || !s.newEngine) return React.createElement('div', { className: 'lspi-set' }, '加载中…')
+        React.createElement('div', { className: 'lspi-set-err' }, noteText(s.error)))
+      if (!s.loaded || !s.newEngine) return React.createElement('div', { className: 'lspi-set' }, T('settings.loading'))
 
       var engineById = {}
       for (var i = 0; i < s.engines.length; i++) engineById[s.engines[i].id] = s.engines[i]
@@ -593,7 +653,7 @@ window.__ModuleLoader__.load({
       function toggleGlobal() {
         var next = s.autoInject ? '0' : '1'
         apiGet('config', null, { autoInject: next }).then(function (d) {
-          if (d && d.ok) set({ autoInject: d.autoInject, note: d.autoInject ? '已开启自动注入:新项目加入 DSH 会自动配置并反馈' : '已关闭自动注入:新项目需手动配置' })
+          if (d && d.ok) set({ autoInject: d.autoInject, note: d.autoInject ? T('settings.note.autoInjectOn') : T('settings.note.autoInjectOff') })
         })
       }
       function doAddLsp(path, engineId) {
@@ -602,8 +662,8 @@ window.__ModuleLoader__.load({
         apiGet('addLsp', path, { engine: engineId }).then(function (d) {
           set({ busy: '' })
           reloadProjects()
-          if (d && d.ok) set({ note: d.added ? '已为项目添加 LSP:' + engineId : engineId + ' 已在项目中' })
-          else set({ note: '添加 LSP 失败' })
+          if (d && d.ok) set({ note: d.added ? noteOf('note.addLsp.ok', { engine: engineId }) : noteOf('note.addLsp.exists', { engine: engineId }) })
+          else set({ note: noteOf('note.addLsp.fail') })
         })
       }
       function doDelLsp(path, engineId) {
@@ -612,8 +672,8 @@ window.__ModuleLoader__.load({
         apiGet('delLsp', path, { engine: engineId }).then(function (d) {
           set({ busy: '' })
           reloadProjects()
-          if (d && d.ok) set({ note: d.removed ? '已移除 LSP:' + engineId : '该项目没有 ' + engineId })
-          else set({ note: '移除 LSP 失败' })
+          if (d && d.ok) set({ note: d.removed ? noteOf('note.delLsp.ok', { engine: engineId }) : noteOf('note.delLsp.absent', { engine: engineId }) })
+          else set({ note: noteOf('note.delLsp.fail') })
         })
       }
       function doSmart(path) {
@@ -624,9 +684,9 @@ window.__ModuleLoader__.load({
           reloadProjects()
           if (d && d.ok) {
             set({ note: d.applied
-              ? '智能配置完成,新增 LSP:' + (d.added || []).join(', ') + '(补充不覆盖)'
-              : (d.reason === 'user-configured; not overwritten' ? '该项目的 LSP 是手动配置,智能配置不覆盖' : '该项目已包含建议的 LSP,无需补充') })
-          } else set({ note: '智能配置失败' })
+              ? noteOf('note.smart.applied', { list: (d.added || []).join(', ') })
+              : (d.reason === 'user-configured; not overwritten' ? noteOf('note.smart.manual') : noteOf('note.smart.nothing')) })
+          } else set({ note: noteOf('note.smart.fail') })
         })
       }
       function doRemoveManual(path) {
@@ -635,8 +695,8 @@ window.__ModuleLoader__.load({
         apiGet('delProject', path).then(function (d) {
           set({ busy: '' })
           reloadProjects()
-          if (d && d.ok) set({ note: d.removed ? '已移除手动配置:' + path : path + ' 不是手动配置' })
-          else set({ note: '移除失败' })
+          if (d && d.ok) set({ note: d.removed ? noteOf('note.removeManual.ok', { path }) : noteOf('note.removeManual.absent', { path }) })
+          else set({ note: noteOf('note.removeManual.fail') })
         })
       }
       function doReset(path) {
@@ -645,8 +705,8 @@ window.__ModuleLoader__.load({
         apiGet('resetProject', path).then(function (d) {
           set({ busy: '' })
           reloadProjects()
-          if (d && d.ok) set({ note: d.reset ? '已还原为配置种子:' + path : '无手动覆盖,无需还原' })
-          else set({ note: '还原失败' })
+          if (d && d.ok) set({ note: d.reset ? noteOf('note.reset.ok', { path }) : noteOf('note.reset.absent') })
+          else set({ note: noteOf('note.reset.fail') })
         })
       }
       function doAddProject() {
@@ -657,14 +717,14 @@ window.__ModuleLoader__.load({
           set({ busy: '', addSelPath: '' })
           reloadProjects()
           loadCandidates()
-          if (d && d.ok) set({ note: '已登记项目 ' + p + '(绑定 LSP:' + s.newEngine + ')' })
-          else set({ note: '登记失败' })
+          if (d && d.ok) set({ note: noteOf('note.project.ok', { path: p, engine: s.newEngine }) })
+          else set({ note: noteOf('note.project.fail') })
         })
       }
       function doSmartAll() {
         if (s.busy) return
         var pending = s.projects.filter(function (x) { return x.source !== 'manual' && x.path })
-        if (!pending.length) { set({ note: '没有待智能配置的项目(手动配置的不会被覆盖)' }); return }
+        if (!pending.length) { set({ note: noteOf('note.smartAll.none') }); return }
         set({ busy: 'smart-all:' + pending.length })
         var chain = Promise.resolve()
         pending.forEach(function (x) {
@@ -673,62 +733,100 @@ window.__ModuleLoader__.load({
         chain.then(function () {
           set({ busy: '', note: null })
           reloadProjects()
-          set({ note: '已对 ' + pending.length + ' 个非手动项目执行智能配置(补充缺失 LSP,不动手动配置)' })
+          set({ note: noteOf('note.smartAll.done', { count: pending.length }) })
         })
       }
 
-      function saveEnginePort(engineId) {
+      // enginePorts 的键必须与 Host 的 portEntries 生成的完全一致:两边各写一份
+      // 就会分叉(反斜杠 vs 正斜杠),保存进去的值落在另一个键上,重开设置页
+      // 看起来就像没保存。规则:正斜杠 + 小写 + 去掉尾部斜杠。
+      function portRowKey(engineId, projectPath) {
+        return projectPath
+          ? engineId + '::' + String(projectPath).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+          : engineId
+      }
+      function saveEnginePort(engineId, projectPath) {
         if (s.busy) return
+        var key = portRowKey(engineId, projectPath)
         var drafts0 = s.engPortDraft || {}
-        // 没编辑过的引擎(输入框 = 已存值/占位),点了保存也不提交。
-        if (!Object.prototype.hasOwnProperty.call(drafts0, engineId)) return
-        var v = String(drafts0[engineId] || '').trim()
-        set({ busy: 'enginePort:' + engineId })
-        apiGet('enginePort', null, { engine: engineId, port: v }).then(function (d) {
+        // 没编辑过的条目(输入框 = 已存值/占位),点了保存也不提交。
+        if (!Object.prototype.hasOwnProperty.call(drafts0, key)) return
+        var v = String(drafts0[key] || '').trim()
+        set({ busy: 'enginePort:' + key })
+        var query = { engine: engineId, port: v }
+        if (projectPath) query.project = projectPath
+        apiGet('enginePort', null, query).then(function (d) {
           set({ busy: '' })
           if (d && d.ok) {
             var map = Object.assign({}, s.enginePorts)
             var drafts = Object.assign({}, drafts0)
-            if (d.port > 0) map[engineId] = d.port
-            else delete map[engineId]
-            delete drafts[engineId] // 保存完回到「未编辑」态:回显已存值 / 空 + 占位
+            if (d.port > 0) map[key] = d.port
+            else delete map[key]
+            delete drafts[key] // 保存完回到「未编辑」态:回显已存值 / 空 + 占位
+            var where = projectPath
+              ? noteOf('note.port.project', { name: String(projectPath).replace(/\\/g, '/').split('/').pop() })
+              : noteOf('note.port.engine', { engine: engineId })
             set({
               enginePorts: map, engPortDraft: drafts,
-              note: d.port > 0 ? '引擎 ' + engineId + ' 的编辑器端口已设为 ' + d.port : '引擎 ' + engineId + ' 已恢复默认端口(自动探测)',
+              note: d.port > 0 ? noteOf('note.port.set', { where, port: d.port }) : noteOf('note.port.cleared', { where }),
             })
-          } else set({ note: (d && d.error) || '保存端口失败' })
-        })
+          } else set({ note: (d && d.error) || noteOf('note.port.fail') })        })
       }
 
       // 引擎桥:把 addons/dsh_echo_bridge 装进项目,让运行中的 Godot 引擎
       // (编辑器或 headless)可以被要求重扫文件系统 —— 新建脚本的 class_name
       // 因此立即可见,不必重启引擎。
       function doInstallAddon(path) {
-        if (s.busy) return
+        if (s.busy) { set({ note: noteOf('settings.note.busy', { busy: s.busy }) }); return }
         set({ busy: 'addon:' + path })
         apiGet('installAddon', path).then(function (d) {
-          set({ busy: '' })
+          // 安装改变了桥的状态,上一次的检测结论作废
+          var bi = Object.assign({}, s.bridgeInfo)
+          delete bi[path]
+          set({ busy: '', bridgeInfo: bi })
           if (d && d.ok) {
-            set({ note: '引擎桥已安装到 ' + path
-              + (d.enableChanged ? ',并已在 project.godot 启用' : ',project.godot 已是启用状态')
-              + (d.enabled
-                ? (d.stoppedForRestart ? ' —— 已停止本项目正在运行的引擎,下次检查会自动重启并加载引擎桥' : ' —— 重启 Godot 编辑器后生效(或在「项目设置 → 插件」里确认已启用)')
-                : ' —— 但未能自动启用:' + (d.error || '')) })
-          } else set({ note: (d && d.error) || '安装引擎桥失败' })
+            set({ note: noteOf('note.bridge.installed', {
+              path: path,
+              enabled: d.enableChanged ? noteOf('note.bridge.enabled') : noteOf('note.bridge.alreadyEnabled'),
+              restart: d.enabled
+                ? (d.stoppedForRestart ? noteOf('note.bridge.stopped') : noteOf('note.bridge.restart'))
+                : noteOf('note.bridge.notEnabled', { error: d.error || '' }),
+            }) })
+          } else set({ note: (d && d.error) || noteOf('note.bridge.fail') })
         })
       }
+      // 检测结果的一行摘要:结论(能否被要求重扫)在前,细节在后。
+      function bridgeInfoText(path) {
+        var b = s.bridgeInfo[path]
+        if (!b) return ''
+        if (b.pending) return T('settings.card.bridge.checking')
+        if (b.ok === false) return '\u274c ' + (b.error || T('settings.card.bridge.failed'))
+        var installed = b.installed ? T('settings.card.bridge.installed') : T('settings.card.bridge.missing')
+        if (b.online) return '\u2705 ' + T('settings.card.bridge.online', { port: b.port || '?', installed })
+        if (b.declared === false) return '\u274c ' + T('settings.card.bridge.undeclared') + (b.error ? ':' + b.error : '')
+        return '\u26a0\ufe0f ' + T('settings.card.bridge.unresponsive', { port: b.port || '?', installed }) + (b.error ? ' —— ' + b.error : '')
+      }
       function doCheckBridge(path) {
-        if (s.busy) return
+        // 占用中也要给反馈:静默 return 会让按钮看起来是坏的
+        if (s.busy) { set({ note: noteOf('settings.note.busy', { busy: s.busy }) }); return }
         set({ busy: 'bridge:' + path })
+        var pending = Object.assign({}, s.bridgeInfo)
+        pending[path] = { pending: true }
+        set({ bridgeInfo: pending })
         apiGet('bridgeStatus', path).then(function (d) {
-          set({ busy: '' })
+          var bi = Object.assign({}, s.bridgeInfo)
           if (d && d.ok) {
-            set({ note: d.online
-              ? '引擎桥在线(端口 ' + d.port + '):运行中的引擎可被要求重扫'
-              : (d.declared === false
-                ? '该项目绑定的引擎不支持引擎桥:' + (d.error || '')
-                : '引擎桥未响应(' + (d.port ? '端口 ' + d.port + ',' : '') + 'addon ' + (d.installed ? '已安装' : '未安装') + '):' + (d.error || '')) })
-          } else set({ note: '检测引擎桥失败' })
+            var on = !!d.online
+            bi[path] = {
+              ok: true, port: d.port, installed: !!d.installed, online: on,
+              declared: d.declared !== false, error: d.error || '',
+            }
+            set({ busy: '', bridgeInfo: bi,
+              note: on ? noteOf('note.bridge.checkOnline', { port: d.port }) : noteOf('note.bridge.checkOffline') })
+          } else {
+            bi[path] = { ok: false, error: (d && d.error) || T('note.bridge.checkRequestFail') }
+            set({ busy: '', bridgeInfo: bi, note: noteOf('note.bridge.checkFail') })
+          }
         })
       }
 
@@ -737,11 +835,18 @@ window.__ModuleLoader__.load({
         var info = engineById[engineId]
         var name = info ? info.name : engineId
         var ext = info && info.extensions ? info.extensions.join(' ') : ''
-        return React.createElement('span', { key: engineId, className: 'lspi-chip', title: '认领扩展名:' + (ext || '?') }, [
+        // A project may bind an engine this plugin never registered (its config came
+        // from elsewhere, or the engine directory is not installed). Such a binding
+        // claims no extensions and produces no diagnostics, which is invisible
+        // unless the chip says so.
+        var chipTitle = info
+          ? T('settings.card.claimExt', { ext: ext || '?' })
+          : T('settings.card.unknownEngine')
+        return React.createElement('span', { key: engineId, className: 'lspi-chip', title: chipTitle }, [
           React.createElement('span', { key: 'n', className: 'lspi-chip-name' }, name),
           ext ? React.createElement('span', { key: 'e', className: 'lspi-chip-ext' }, ext) : null,
           React.createElement('button', {
-            key: 'x', type: 'button', className: 'lspi-chip-x', title: '移除该 LSP',
+            key: 'x', type: 'button', className: 'lspi-chip-x', title: T('settings.card.removeLsp.title'),
             disabled: !!s.busy,
             onClick: function () { doDelLsp(rec.path, engineId) },
           }, '\u2715'),
@@ -762,10 +867,10 @@ window.__ModuleLoader__.load({
         var opts
         if (!available.length) {
           opts = [React.createElement('option', { key: '_none', value: '', disabled: true },
-            '已装引擎都已加入此项目')]
+            T('note.card.addPicker.empty', { list: s.engines.map(function (e) { return e.name }).join(', ') }))]
         } else {
           opts = [React.createElement('option', { key: '_ph', value: '', disabled: true },
-            '添加引擎…')].concat(available.map(function (e) {
+            T('note.card.addPicker.placeholder'))].concat(available.map(function (e) {
             return React.createElement('option', { key: e.id, value: e.id },
               e.name + ' (' + e.extensions.join(' ') + ')')
           }))
@@ -774,7 +879,7 @@ window.__ModuleLoader__.load({
           className: 'lspi-set-select',
           value: cur,
           disabled: !!s.busy || !canAdd,
-          title: '选择要手动添加到该项目的引擎',
+          title: canAdd ? T('note.card.addPicker.title') : T('note.card.addPicker.empty.title'),
           onChange: function (ev) {
             var sel = Object.assign({}, s.addSel)
             sel[rec.path] = ev.target.value
@@ -783,44 +888,66 @@ window.__ModuleLoader__.load({
         }, opts)
         var addBtn = React.createElement('button', {
           type: 'button', className: 'lspi-set-btn', disabled: !!s.busy || !canAdd,
-          title: '手动添加引擎:' + (canAdd ? '把下拉选中的引擎加入项目' : '没有可添加的引擎(已全部加入)'),
+          title: T('note.card.add.title', { action: canAdd ? T('note.card.add.action') : T('note.card.add.noEngine') }),
           onClick: function () { doAddLsp(rec.path, cur) },
-        }, s.busy === 'addLsp:' + rec.path ? '添加中…' : '添加')
+        }, s.busy === 'addLsp:' + rec.path ? T('note.card.adding') : T('note.card.add'))
         return [picker, addBtn]
       }
 
-      // 引擎(LSP)卡的一行:引擎标识 + 编辑器 LSP 端口输入(空 = 默认自动)
-      function engineRow(e) {
-        var saved = s.enginePorts[e.id] // number | undefined
+      // 引擎(LSP)卡的一行端口输入。projectPath 为空 = 引擎级兜底(所有未单独设置的项目)。
+      // 键与后端 portEntries/查找侧一致:项目级 = 引擎 + 归一化项目路径。
+      function portRow(e, projectPath, label) {
+        var key = portRowKey(e.id, projectPath)
+        var saved = s.enginePorts[key] // number | undefined
         var drafts = s.engPortDraft || {}
         // draft 有无(而非值)区分「未编辑」与「显式清空」:这样有覆盖值时
         // 也能清空输入并保存,真正恢复默认(否则永远回显已存值,清不掉)。
-        var hasEdit = Object.prototype.hasOwnProperty.call(drafts, e.id)
-        var inputVal = hasEdit ? drafts[e.id] : (saved ? String(saved) : '')
-        var busyPort = s.busy === 'enginePort:' + e.id
-        return React.createElement('div', { key: e.id, style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } }, [
-          React.createElement('span', { key: 'c', className: 'lspi-chip', title: 'marker:' + e.marker }, [
-            React.createElement('span', { key: 'n', className: 'lspi-chip-name' }, e.name),
-            React.createElement('span', { key: 'e', className: 'lspi-chip-ext' }, (e.extensions || []).join(' ')),
-          ]),
-          React.createElement('span', { key: 'lab', className: 'lspi-set-hint', style: { flex: 'none' } }, '编辑器 LSP 端口'),
+        var hasEdit = Object.prototype.hasOwnProperty.call(drafts, key)
+        var inputVal = hasEdit ? drafts[key] : (saved ? String(saved) : '')
+        var busyPort = s.busy === 'enginePort:' + key
+        return React.createElement('div', { key: key, style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } }, [
+          React.createElement('span', { key: 'lab', className: 'lspi-set-hint', style: { flex: 'none', minWidth: 128 } }, label),
           React.createElement('input', {
             key: 'port', className: 'lspi-set-input', type: 'number', min: 1, max: 65535,
-            placeholder: '6005', style: { width: 76 },
+            placeholder: projectPath ? T('note.engine.inherit') : '6005', style: { width: 76 },
             value: inputVal, disabled: !!s.busy,
-            title: 'attach 你打开的 Godot 编辑器时探测的端口。默认 6005;若你在 编辑器设置 → Network → Language Server → Remote Port 改过端口,在这里填并保存,插件就不再盲找 6005。',
+            title: projectPath
+              ? T('note.engine.port.project.title')
+              : T('note.engine.port.fallback.title'),
             onChange: function (ev) {
               var nd = Object.assign({}, s.engPortDraft)
-              nd[e.id] = ev.target.value
+              nd[key] = ev.target.value
               set({ engPortDraft: nd })
             },
           }),
           React.createElement('button', {
             key: 'save', type: 'button', className: 'lspi-set-btn', disabled: !!s.busy || !hasEdit,
-            title: hasEdit ? '保存端口设置(留空 = 恢复默认)' : '先修改端口再保存',
-            onClick: function () { saveEnginePort(e.id) },
-          }, busyPort ? '保存中…' : '保存'),
+            title: hasEdit ? T('note.engine.save.title') : T('note.engine.save.needEdit'),
+            onClick: function () { saveEnginePort(e.id, projectPath) },
+          }, busyPort ? T('note.engine.saving') : T('note.engine.save')),
         ])
+      }
+
+      // 引擎(LSP)卡:一张引擎卡 = 引擎标识 + 引擎级端口行 + 每个绑定该引擎的项目一行端口。
+      // 项目级必须能单独设置,因为两个 Godot 项目共用一个引擎 id:它们各有自己的编辑器、
+      // 各占一个 LSP 端口,只留一条引擎级端口会让第二个项目的编辑器被当成"服务别的项目"而拒掉。
+      function engineRow(e) {
+        var bound = []
+        for (var i = 0; i < s.projects.length; i++) {
+          if ((s.projects[i].lsp || []).indexOf(e.id) >= 0) bound.push(s.projects[i])
+        }
+        var rows = [React.createElement('div', { key: 'head', style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } }, [
+          React.createElement('span', { key: 'c', className: 'lspi-chip', title: 'marker:' + e.marker }, [
+            React.createElement('span', { key: 'n', className: 'lspi-chip-name' }, e.name),
+            React.createElement('span', { key: 'e', className: 'lspi-chip-ext' }, (e.extensions || []).join(' ')),
+          ]),
+        ])]
+        rows.push(portRow(e, undefined, T('engine.fallbackRow')))
+        for (var j = 0; j < bound.length; j++) {
+          var np = String(bound[j].path).replace(/\\/g, '/').replace(/\/+$/, '')
+          rows.push(portRow(e, bound[j].path, '└ ' + (np.slice(np.lastIndexOf('/') + 1) || bound[j].path)))
+        }
+        return React.createElement('div', { key: e.id, style: { display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 6 } }, rows)
       }
 
       var cards = s.projects.map(function (p) {
@@ -828,11 +955,11 @@ window.__ModuleLoader__.load({
         var chips = []
         for (var j = 0; j < lspList.length; j++) chips.push(chipFor(p, lspList[j]))
         var manualOverride = p.source === 'manual'
-        var srcText = SRC_LABEL[p.source] || p.source
+        var srcText = srcLabel(p.source) || p.source
         // 项目名 = 目录名(一般目录即项目);全路径小字放下面
         var normPath = String(p.path).replace(/\\/g, '/').replace(/\/+$/, '')
         var projName = normPath.slice(normPath.lastIndexOf('/') + 1) || p.path
-        var injText = p.autoInject === false ? '已静音' : (s.autoInject ? '自动注入' : '注入关闭')
+        var injText = p.autoInject === false ? T('note.card.injectMuted') : (s.autoInject ? T('note.card.autoInject') : T('note.card.injectClosed'))
         var addPicker = addPickerFor(p)
         // 引擎桥按钮只对该项目绑定的、声明了 rescan 能力的引擎出现(否则点了只会报错)
         var canBridge = false
@@ -844,43 +971,53 @@ window.__ModuleLoader__.load({
         }
         return React.createElement('div', { key: p.path, className: 'lspi-card' }, [
           React.createElement('div', { key: 'head', className: 'lspi-card-head' }, [
-            React.createElement('span', { key: 't', className: 'lspi-card-title', title: p.path + '\n来源:' + srcText }, projName),
+            React.createElement('span', { key: 't', className: 'lspi-card-title', title: T('note.card.source', { path: p.path, source: srcText }) }, projName),
             React.createElement('span', { key: 'inj', className: 'lspi-set-hint', style: { flex: 'none' } }, injText),
           ]),
           React.createElement('div', { key: 'sub', className: 'lspi-card-sub', title: p.path }, p.path),
           React.createElement('div', { key: 'lsp', className: 'lspi-chips' },
-            chips.length ? chips : [React.createElement('span', { key: 'e', className: 'lspi-empty-lsp' }, '未绑定 LSP(编辑时不注入诊断)')]),
+            chips.length ? chips : [React.createElement('span', { key: 'e', className: 'lspi-empty-lsp' }, T('settings.card.unbound'))]),
           React.createElement('div', { key: 'foot', className: 'lspi-card-foot' }, [
             addPicker ? React.createElement('span', { key: 'addbar', style: { display: 'inline-flex', alignItems: 'center', gap: 6 } }, [
-              React.createElement('span', { key: 'l', className: 'lspi-set-hint' }, '手动添加引擎'),
+              React.createElement('span', { key: 'l', className: 'lspi-set-hint' }, T('settings.card.manualAdd')),
               addPicker[0],
               addPicker[1],
             ]) : null,
             canBridge ? React.createElement('button', {
               type: 'button', className: 'lspi-set-btn', disabled: !!s.busy,
-              title: '在项目里安装 addons/dsh_echo_bridge(编辑器插件):运行中的 Godot 引擎(编辑器或 headless)可被要求重扫文件系统,新建脚本的 class_name 立即可见,不必重启引擎',
+              title: T('settings.card.bridge.install.title'),
               onClick: function () { doInstallAddon(p.path) },
-            }, s.busy === 'addon:' + p.path ? '…' : '安装引擎桥') : null,
+            }, s.busy === 'addon:' + p.path ? T('settings.busy') : T('settings.card.bridge.install')) : null,
             canBridge ? React.createElement('button', {
               type: 'button', className: 'lspi-set-btn', disabled: !!s.busy,
-              title: '检测运行中的引擎是否已加载引擎桥(能否响应重扫请求)',
+              title: T('settings.card.bridge.check.title'),
               onClick: function () { doCheckBridge(p.path) },
-            }, s.busy === 'bridge:' + p.path ? '…' : '检测引擎桥') : null,
+            }, s.busy === 'bridge:' + p.path ? T('settings.busy') : T('settings.card.bridge.check')) : null,
             React.createElement('button', {
               type: 'button', className: 'lspi-set-btn', disabled: !!s.busy,
-              title: '智能配置:探测项目语言,自动补上缺失的 LSP —— 只追加,绝不覆盖你手动删的',
+              title: T('settings.card.smart.title'),
               onClick: function () { doSmart(p.path) },
-            }, s.busy === 'smart:' + p.path ? '…' : '智能配置'),
+            }, s.busy === 'smart:' + p.path ? T('settings.busy') : T('settings.card.smart')),
             manualOverride ? React.createElement('button', {
               type: 'button', className: 'lspi-set-btn danger', disabled: !!s.busy,
-              title: '移除该手动配置(项目将从列表消失)',
+              title: T('settings.card.removeManual.title'),
               onClick: function () { doRemoveManual(p.path) },
-            }, s.busy === 'delProject:' + p.path ? '…' : '移除手动配置') : React.createElement('button', {
+            }, s.busy === 'delProject:' + p.path ? T('settings.busy') : T('settings.card.removeManual')) : React.createElement('button', {
               type: 'button', className: 'lspi-set-btn', disabled: !!s.busy,
-              title: '删除手动覆盖,还原为 config/自动发现种子',
+              title: T('settings.card.reset.title'),
               onClick: function () { doReset(p.path) },
-            }, s.busy === 'reset:' + p.path ? '…' : '还原种子'),
+            }, s.busy === 'reset:' + p.path ? T('settings.busy') : T('settings.card.reset')),
           ]),
+          // 检测结果就地贴在这一行下面:按钮在哪,反馈就在哪
+          (canBridge && s.bridgeInfo[p.path])
+            ? React.createElement('div', {
+              key: 'bridgeinfo', className: 'lspi-set-hint',
+              style: {
+                marginTop: 2,
+                color: s.bridgeInfo[p.path].pending ? '#6b7280' : (s.bridgeInfo[p.path].online ? '#15803d' : '#b45309'),
+              },
+            }, bridgeInfoText(p.path))
+            : null,
         ])
       })
 
@@ -891,13 +1028,13 @@ window.__ModuleLoader__.load({
       var candidateOpts = (function () {
         var opts = []
         if (!s.candidates.length) {
-          opts.push(React.createElement('option', { key: '_none', value: '', disabled: true }, 'DSH 没有可登记的工作区项目'))
+          opts.push(React.createElement('option', { key: '_none', value: '', disabled: true }, T('settings.projects.none')))
         } else {
-          opts.push(React.createElement('option', { key: '_ph', value: '', disabled: true }, '选择工作区项目…'))
+          opts.push(React.createElement('option', { key: '_ph', value: '', disabled: true }, T('settings.projects.choose')))
           for (var ci = 0; ci < s.candidates.length; ci++) {
             var cand = s.candidates[ci]
             opts.push(React.createElement('option', { key: cand.path, value: cand.path, disabled: !!cand.registered },
-              (cand.title || cand.path) + (cand.registered ? '(已登记)' : '')))
+              (cand.title || cand.path) + (cand.registered ? T('settings.projects.registered') : '')))
           }
         }
         return opts
@@ -911,35 +1048,40 @@ window.__ModuleLoader__.load({
               type: 'checkbox', checked: s.autoInject,
               onChange: toggleGlobal,
             }),
-            '自动注入(全局)',
+            T('settings.global.autoInject.label'),
           ]),
-          React.createElement('span', { className: 'lspi-set-hint' },
-            '开:项目第一次加入 DSH 时自动智能配置 LSP,并在编辑后把编译错误反馈给 AI。'
-            + '关:新项目只登记不自动注入,需手动配置。'),
+          React.createElement('div', { key: 'hint', className: 'lspi-set-hint' }, renderParts('settings.global.autoInject.hint', null, 3)),
+        ]),
+        // 全局自动安装引擎桥(addon)开关
+        React.createElement('div', { key: 'addon', className: 'lspi-global-row' }, [
+          React.createElement('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontWeight: 600 } }, [
+            React.createElement('input', {
+              type: 'checkbox', checked: s.autoAddon,
+              onChange: toggleAddon,
+            }),
+            T('settings.global.autoAddon.label'),
+          ]),
+          React.createElement('div', { key: 'hint', className: 'lspi-set-hint' }, renderParts('settings.global.autoAddon.hint', null, 4)),
         ]),
         // 操作结果提示:放整页顶部,引擎卡/项目卡的操作都能看到
-        s.note ? React.createElement('p', { key: 'note', className: 'lspi-set-hint', style: { color: '#1d4ed8', margin: '0 0 6px' } }, s.note) : null,
+        s.note ? React.createElement('p', { key: 'note', className: 'lspi-set-hint', style: { color: '#1d4ed8', margin: '0 0 6px' } }, noteText(s.note)) : null,
         // 说明(独立卡):项目 = 目录,含语言,每语言一个 LSP
         React.createElement('div', { key: 'about', className: 'lspi-set-card' }, [
-          React.createElement('h3', null, '工作原理'),
-          React.createElement('p', { className: 'lspi-set-hint' },
-            '一个项目(目录)可含多种语言(如 GDScript + C#),每种语言配一个 LSP;'
-            + '该语言的 LSP 认领自己的扩展名,在文件编译/编辑变化时把诊断反馈给 AI。'),
-          React.createElement('p', { className: 'lspi-set-hint', style: { marginTop: 6 } },
-            '「智能配置」扫描项目自动补上缺失的 LSP —— 只补充,绝不覆盖你手动删的。'
-            + '你改过的项目以「手动」来源显示,可随时还原为配置种子。'),
+          React.createElement('h3', null, T('settings.about.title')),
+          React.createElement('div', { className: 'lspi-set-hint' }, renderParts('settings.about.body', null, 4)),
+          React.createElement('div', { className: 'lspi-set-hint', style: { marginTop: 6 } }, renderParts('settings.about.config', null, 4)),
         ]),
         // 项目卡片(项目为主:一项目一卡)
         React.createElement('div', { key: 'projects', className: 'lspi-set-card' }, [
-          React.createElement('h3', null, '项目'),
+          React.createElement('h3', null, T('settings.projects.title')),
           cards.length ? React.createElement('div', { key: 'cards', style: { display: 'flex', flexDirection: 'column', gap: 8 } }, cards) : null,
           React.createElement('div', { key: 'addrow', className: 'lspi-set-row', style: { marginTop: 10, borderBottom: 0 } }, [
-            React.createElement('span', { key: 'lab', className: 'lspi-set-hint', style: { flex: 'none' } }, '登记 DSH 项目'),
+            React.createElement('span', { key: 'lab', className: 'lspi-set-hint', style: { flex: 'none' } }, T('settings.projects.register')),
             React.createElement('select', {
               className: 'lspi-set-select', style: { maxWidth: 300 },
               value: s.addSelPath || '',
               disabled: !!s.busy || !s.candidates.length,
-              title: '选择要登记的 DSH 工作区项目(含无 GDScript 的项目;登记不产生引擎文件的项目只是占位,无诊断)',
+              title: T('settings.projects.register.title'),
               onChange: function (ev) { set({ addSelPath: ev.target.value }) },
             }, candidateOpts),
             React.createElement('select', {
@@ -948,28 +1090,172 @@ window.__ModuleLoader__.load({
             }, addEngineOptions),
             React.createElement('button', {
               type: 'button', className: 'lspi-set-btn', disabled: !!s.busy || !s.addSelPath,
-              title: '把选中的 DSH 项目登记到列表(绑定所选引擎)',
+              title: T('settings.projects.add.title'),
               onClick: doAddProject,
-            }, s.busy.indexOf('add:') === 0 ? '添加中…' : '添加项目'),
+            }, s.busy.indexOf('add:') === 0 ? T('settings.projects.adding') : T('settings.projects.add')),
             React.createElement('button', {
               type: 'button', className: 'lspi-set-btn', disabled: !!s.busy,
-              title: '对没有手动配置的项目自动探测并补 LSP',
+              title: T('settings.projects.smartAll.title'),
               onClick: doSmartAll,
-            }, s.busy.indexOf('smart-all') === 0 ? '配置中…' : '全部智能配置'),
+            }, s.busy.indexOf('smart-all') === 0 ? T('settings.projects.smartAlling') : T('settings.projects.smartAll')),
           ]),
         ]),
         // 引擎列表(每引擎一行:标识 + 编辑器 LSP 端口)
         React.createElement('div', { key: 'eng', className: 'lspi-set-card' }, [
-          React.createElement('h3', null, '引擎(LSP)'),
+          React.createElement('h3', null, T('settings.engines.title')),
           React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
             s.engines.map(engineRow)),
-          React.createElement('p', { className: 'lspi-set-hint', style: { marginTop: 8 } },
-            '引擎(LSP)即 checkers/ 下注册的语言服务器;添加新引擎 = 在插件 checkers/ 加目录(自动出现)。'
-            + '「编辑器 LSP 端口」是 attach 你已打开的 Godot 编辑器时探测的端口(默认 6005)。'
-            + '若你的 Godot 在 编辑器设置 → Network → Language Server → Remote Port 改过端口,'
-            + '在这里填上并保存即可,插件 attach 时用你填的端口,不再盲找。清空后保存 = 恢复默认。'),
+          React.createElement('div', { className: 'lspi-set-hint', style: { marginTop: 8 } },
+            renderParts('settings.engines.body', null, 4)),
         ]),
       ])
+    }
+
+    // ---------- i18n(本插件自带词典) ----------
+    // 词典是 lib/locales/<lang>.json,由 Host 经 action=locales 提供:本文件是零构建
+    // 产物,只能 require 'react',无法直接读 JSON。拿到后注册进 Client 的 `locale`
+    // 服务,语言即跟随用户在 DSH 设置里选的那一项。`locale` 不存在时(极简组合)退回
+    // 用 API 返回的当前语言词典,插件照常可用 —— 少一个服务不该让设置页变空。
+    var I18N_NS = 'lsp-echo'
+    var allDicts = {}        // lang -> dict(Host 发来的全部语言)
+    var localDict = {}       // 当前语言的词典(locale 服务缺席时的兜底)
+    var tFn = null           // locale.bind 返回的翻译函数
+    var localeService = null
+    var localeRevision = createSignal(0)
+    var currentLang = 'zh'
+    var reportedLang = null  // 已告知 Host 的语言;null = 还没报过
+
+    function fillParams(text, params) {
+      if (!params) return text
+      return String(text).replace(/\{(\w+)\}/g, function (whole, name) {
+        return Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : whole
+      })
+    }
+    // 翻译。locale 服务未命中时原样返回 key,此时用本地词典再试一次。
+    function t(key, params) {
+      // 数组值(分段文案)一律本地处理:locale 服务的词典契约是 Record<string,
+      // string>,它的 translate 在带 params 时会对值执行 template.replace,数组会
+      // 抛 TypeError。分段文案本来就由 renderParts/tParts 呈现,不经过服务。
+      var local = localDict[key]
+      if (Array.isArray(local)) return local.map(function (x) { return fillParams(x, params) })
+      if (tFn) {
+        var hit = tFn(key, params)
+        if (hit !== key) return hit
+      }
+      if (local !== undefined) return fillParams(local, params)
+      // 产品对 'en' 的 fallback 链终止于自身(它的 FALLBACK_LOCALE),而 Host 侧
+      // en 缺键时会回落到 zh。两边不一致的后果是:同一个键在 toast 里显示中文、
+      // 在 GUI 里显示裸 key。这里补上同一层回落,让两侧行为一致。
+      var source = allDicts.zh && allDicts.zh[key]
+      if (source === undefined) return key
+      return Array.isArray(source)
+        ? source.map(function (x) { return fillParams(x, params) })
+        : fillParams(source, params)
+    }
+    // 段落:值是多段说明时逐段取出,渲染成多行,而不是挤成一大段。
+    function tParts(key, params) {
+      var v = t(key, params)
+      return Array.isArray(v) ? v : [v]
+    }
+    // 把段落渲染成一组块元素;首段无上边距,其余段之间留 gap。
+    function renderParts(key, params, gap) {
+      return tParts(key, params).map(function (line, i) {
+        return React.createElement('div', { key: 'p' + i, style: i ? { marginTop: gap } : null }, line)
+      })
+    }
+    function syncLocalDict() {
+      localDict = allDicts[currentLang] || allDicts.zh || {}
+    }
+    // Host 发 toast 时没有语言信息,由这里告知;失败则下次重试,否则 toast 会一直
+    // 停在 Host 的默认语言上,而 GUI 已经是另一种语言。走 apiGet 以复用信任头。
+    function reportLocaleToHost() {
+      if (reportedLang === currentLang) return
+      reportedLang = currentLang
+      apiGet('setLocale', null, { locale: currentLang }).then(function (d) {
+        if (!d || d.ok !== true) reportedLang = null // 下一次注册/切换语言时再试
+      })
+    }
+    // 语言变化:换本地词典并触发重渲染。上报独立于这一切 —— 语言没变时也要报,
+    // 因为"没变"只是相对本模块的初值,Host 那边可能还不知道。
+    function applyLocale() {
+      if (localeService && typeof localeService.getLocale === 'function') {
+        var snapshot
+        try { snapshot = localeService.getLocale() } catch (e) { snapshot = null }
+        var next = (snapshot && snapshot.active) || currentLang
+        if (next !== currentLang) {
+          currentLang = next
+          if (typeof localeService.bind === 'function') tFn = localeService.bind(I18N_NS)
+          syncLocalDict()
+          localeRevision.set(localeRevision.get() + 1)
+        }
+      }
+      reportLocaleToHost()
+    }
+    function installI18n(ctx) {
+      var api = ctx.get('locale')
+      if (api && typeof api.register === 'function') localeService = api
+      // 词典注册是框架侧的可撤销贡献,而它在这里是异步完成的(词典来自 API)。
+      // 把 disposer 收进 effect:重复 apply 或插件卸载时不会留下重复注册和累积订阅
+      // —— 重复的 (ns, locale) 会直接抛,把后面的 bind/subscribe 全部跳过。
+      var disposers = []
+      ctx.effect(function () {
+        return function () {
+          // 定时器也要撤:插件停用后它还会去 register 词典,而那时 disposers 已经是
+          // 死实例的数组,注册下来的东西再也撤不掉。
+          if (loadRetryTimer) clearTimeout(loadRetryTimer)
+          loadRetryTimer = null
+          for (var i = 0; i < disposers.length; i++) {
+            try { disposers[i]() } catch (e) { /* 已失效 */ }
+          }
+          disposers = []
+        }
+      })
+      var attempt = 0
+      var loadRetryTimer = null
+      function loadDictionaries() {
+        apiGet('locales').then(function (d) {
+          if (!d || !d.ok || !d.locales) throw new Error('locales unavailable')
+          allDicts = d.locales
+          if (localeService) {
+            var ids = Object.keys(allDicts)
+            for (var i = 0; i < ids.length; i++) {
+              // 只把字符串值交给服务:它的词典契约是 Record<string, string>,带 params
+              // 时会对值执行 template.replace,数组会抛 TypeError。分段文案本来就由
+              // renderParts/tParts 从本地词典取值,不进服务,少注册它们没有损失。
+              var dict = allDicts[ids[i]] || {}
+              var strings = {}
+              for (var k in dict) {
+                if (Object.prototype.hasOwnProperty.call(dict, k) && typeof dict[k] === 'string') strings[k] = dict[k]
+              }
+              // 单个语言注册失败(例如已被占用)不该拖垮其余语言
+              try {
+                var off = localeService.register(I18N_NS, ids[i], strings)
+                if (typeof off === 'function') disposers.push(off)
+              } catch (e) { /* 该语言已有归属,用现有词典继续 */ }
+            }
+            if (typeof localeService.bind === 'function') tFn = localeService.bind(I18N_NS)
+            if (typeof localeService.subscribe === 'function') {
+              var unsub = localeService.subscribe(applyLocale)
+              if (typeof unsub === 'function') disposers.push(unsub)
+            }
+          }
+          currentLang = d.active || currentLang
+          syncLocalDict()
+          applyLocale()
+          localeRevision.set(localeRevision.get() + 1)
+        }).catch(function () {
+          // 词典是文案的唯一来源,拿不到就整站显示裸 key:退避重试几次,而不是
+          // 永久停在 key 上(其它 API 有轮询兜底,这一条没有)。
+          if (attempt++ >= 5) return
+          loadRetryTimer = setTimeout(loadDictionaries, 2000 * attempt)
+        })
+      }
+      loadDictionaries()
+    }
+    // 订阅语言:注册词典或切换语言都会 bump locale revision,组件因此重渲染。
+    function useT() {
+      useSignal(localeRevision)
+      return t
     }
 
     // ============================================================
@@ -978,6 +1264,7 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       var slots = ctx.get('slots')
       if (!slots) return
+      installI18n(ctx)
       ctx.effect(function () {
         var removeStyles = installStyles()
         var removers = []
@@ -991,14 +1278,42 @@ window.__ModuleLoader__.load({
         // 避开右上角 toast 浮窗区(utilities 在 toast 下方会被短暂遮挡)。
         injectSeat('conversation.session.header.actions', 'lsp-echo-diag', -5, HeaderIcon)
         injectSeat('shell.overlay', 'lsp-echo-panel', 60, Panel)
-        // 设置页(侧栏设置 → LSP 诊断)
-        var removeSection = slots.inject('settings.section', function () {
-          return slots.register(
-            { name: 'settings.section', id: 'lsp-echo', order: 30, label: function () { return 'LSP 诊断' } },
-            SettingsPanel,
-          )
-        })
-        if (typeof removeSection === 'function') removers.push(removeSection)
+        // 设置页(侧栏设置 → LSP 诊断)。
+        // label 是注册参数,由外壳在读数时经 resolveSlotLabel 调用;本插件的词典是
+        // 异步取回的(零构建产物读不了 JSON,只能走 API),若在词典到达前注册,首帧
+        // 的 label 会原样返回 key —— 导航里就会出现一个 settings.title。外壳确实会
+        // 随 locale revision 重算,但那是把正确性外包给别人的时序。这里改为等词典
+        // 就绪再注册:导航项晚出现几百毫秒,好过一个盯着用户看的英文键名。
+        var removeSection = null
+        var sectionOff = null
+        function registerSection() {
+          if (typeof removeSection === 'function') {
+            try { removeSection() } catch (e) { /* 已失效 */ }
+          }
+          removeSection = slots.inject('settings.section', function () {
+            return slots.register(
+              { name: 'settings.section', id: 'lsp-echo', order: 30, label: function () { return t('settings.title') } },
+              SettingsPanel,
+            )
+          })
+          if (typeof removeSection === 'function') removers.push(removeSection)
+        }
+        // 词典始终取不到时(API 异常)也必须让设置页出现,否则用户连"这个插件坏了"
+        // 都看不到 —— 超时后照样注册,标签退化成 key 是可接受的。
+        function sectionDictionariesReady() { return Object.keys(allDicts).length > 0 }
+        if (sectionDictionariesReady()) {
+          registerSection()
+        } else {
+          var sectionTries = 0
+          sectionOff = setInterval(function () {
+            sectionTries += 1
+            if (!sectionDictionariesReady() && sectionTries < 12) return
+            clearInterval(sectionOff)
+            sectionOff = null
+            registerSection()
+          }, 250)
+          removers.push(function () { if (sectionOff) clearInterval(sectionOff) })
+        }
         return function () {
           for (var i = 0; i < removers.length; i++) {
             try { removers[i]() } catch (e) { /* ignore */ }
@@ -1010,7 +1325,11 @@ window.__ModuleLoader__.load({
     }
 
     exports.name = 'lsp-echo'
-    exports.inject = ['slots']
+    // `locale` is a hard injection: it is a product plugin that is always mounted,
+    // and waiting for the service (rather than reading it once with ctx.get) is
+    // what lets this plugin activate after it — otherwise ctx.get('locale') runs
+    // before the service exists, and the whole UI silently falls back to keys.
+    exports.inject = ['slots', 'locale']
     exports.apply = apply
 
     return module.exports

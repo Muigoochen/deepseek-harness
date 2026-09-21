@@ -211,6 +211,81 @@ function askBridgeRescan(port, timeoutMs = 8000) {
     });
   });
 }
+/** The `res://` form of an absolute path, or undefined when it is outside the project. */
+function toResourcePath(project, absPath) {
+  const rel = path.relative(project, absPath).split(path.sep).join('/');
+  return rel.startsWith('..') ? undefined : `res://${rel}`;
+}
+
+/**
+ * Ask the addon whether that script has unsaved changes in the script editor.
+ * Resolves to `{ ok: false }` when no addon answers, so callers can tell
+ * "no unsaved changes" apart from "could not ask".
+ */
+function askBridgeUnsaved(port, resourcePath, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: '127.0.0.1', port });
+    let out = '';
+    let settled = false;
+    const done = (res) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { sock.destroy(); } catch { /* already closed */ }
+      resolve(res);
+    };
+    const timer = setTimeout(() => done({ ok: false, error: `no reply within ${timeoutMs}ms` }), timeoutMs);
+    sock.once('connect', () => {
+      try { sock.write(`unsaved:${resourcePath}\n`); } catch { done({ ok: false, error: 'write failed' }); }
+    });
+    sock.on('data', (d) => {
+      out += d;
+      const lines = out.split(/\r?\n/).map((line) => line.trim());
+      if (lines.includes('yes')) done({ ok: true, unsaved: true });
+      else if (lines.includes('no')) done({ ok: true, unsaved: false });
+      else if (lines.some((line) => line.startsWith('err'))) done({ ok: false, error: out.trim() });
+    });
+    sock.once('error', (e) => done({ ok: false, error: e.message }));
+    sock.once('close', () => done({ ok: false, error: 'closed without an answer' }));
+  });
+}
+
+/**
+ * Make the language server reload the scripts whose disk content changed.
+ *
+ * `didSave` is the only LSP entry that rebuilds a script's parse tree:
+ * `GDScriptTextDocument::didSave` calls `reload(true)`, and `reload` runs
+ * `GDScriptCache::remove_parser`, which also drops the reverse-dependency
+ * entries that would otherwise pin the previous tree for as long as a referring
+ * script stays open. A filesystem rescan does not reach those scripts at all:
+ * `EditorFileSystem::_should_reload_script()` deliberately skips a script that
+ * is open in the script editor, leaving its cached members stale.
+ *
+ * Scripts with unsaved editor changes are skipped. The reload rewrites the
+ * editor buffer from disk (`ScriptEditor::update_docs_from_script`, reached
+ * through `reload_script`), and the engine itself refuses to do that without
+ * asking — `ScriptEditor::_test_script_times_on_disk` sets `need_ask` whenever
+ * `seb->is_unsaved()`. Asking the addon mirrors that guard; failing to reach the
+ * addon still sends the notification, because the guard is a safety check rather
+ * than a precondition.
+ */
+async function reloadChangedScripts(client, project, absFiles, bridgePort) {
+  for (const abs of absFiles) {
+    const resourcePath = toResourcePath(project, abs);
+    if (!resourcePath) continue;
+    if (bridgePort) {
+      const answer = await askBridgeUnsaved(bridgePort, resourcePath);
+      if (answer.ok && answer.unsaved) {
+        log(`skipping didSave for ${resourcePath}: unsaved editor changes`);
+        continue;
+      }
+      if (!answer.ok) log(`unsaved check unavailable (${answer.error}); sending didSave for ${resourcePath}`);
+    }
+    client.notify('textDocument/didSave', { textDocument: { uri: fileUri(abs) } });
+    log(`didSave sent for ${resourcePath} (rebuilds its parse tree)`);
+  }
+}
+
 /** Explicitly configured bridge port (flag > config file > environment), else undefined. */
 function configuredBridgePort(flags) {
   const raw = configEntry(flags, 'bridge-port', 'DSH_ECHO_BRIDGE_PORT', ['bridgePort']);
@@ -1109,6 +1184,13 @@ async function cmdClientd(project, godotBin, flags) {
         // Only a request that can be served is worth moving engines for.
         await followEngineDecision();
         const outPath = statePaths(project).out;
+        // Reload scripts whose disk content changed before reading diagnostics,
+        // or the engine answers from a parse tree it never rebuilt.
+        const changed = (Array.isArray(item.didsave) ? item.didsave : []).filter(Boolean).map((f) => path.resolve(f));
+        if (changed.length) {
+          const bridgePort = configuredBridgePort(flags) ?? discoveredBridgePort(project) ?? DEFAULT_BRIDGE_PORT;
+          await reloadChangedScripts(client, project, changed, bridgePort);
+        }
         // sweep=true (full-project baseline): bulk open, no settle tax.
         const { files, errors, warnings } = await collectDiagnostics(client, project, absFiles, { sweep: !!item.sweep });
         const payload = {
@@ -1147,7 +1229,7 @@ async function cmdClientd(project, godotBin, flags) {
       if (!line) continue;
       let req;
       try { req = JSON.parse(line); } catch { reply({ id: undefined, ok: false, error: 'malformed request json' }); continue; }
-      queue.push({ id: req && req.id, files: req.files, sweep: !!req.sweep });
+      queue.push({ id: req && req.id, files: req.files, sweep: !!req.sweep, didsave: req.didsave });
       drain();
     }
   });
