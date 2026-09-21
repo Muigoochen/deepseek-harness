@@ -309,6 +309,8 @@ class PluginRowActionsTest(unittest.TestCase):
                      "_bundle_actions", "_state_display"):
             setattr(app, name, getattr(installer.App, name).__get__(app))
         app._plugin_rank = installer.App._plugin_rank
+        app.STATE_CN = installer.App.STATE_CN
+        app.STATE_COLOR = installer.App.STATE_COLOR
         return app
 
     @staticmethod
@@ -321,14 +323,14 @@ class PluginRowActionsTest(unittest.TestCase):
         for state, want in (("external", "禁用"), ("external-disabled", "启用")):
             items = app._merge_plugins([self._card("toast", "@dsh-user/toast", state)], [])
             labels = [a[0] for a in app._actions_for(items[0])]
-            self.assertEqual(labels, [want, "接管"], state)
+            self.assertEqual(labels, [want, "校验", "接管"], state)
 
     def test_first_party_external_row_has_no_adopt_button(self):
         """`@deepseek-ai/*` 的行谈不上接管，但照样能禁停（它也在用户补丁里）。"""
         app = self._app()
         card = self._card("time-context", "@deepseek-ai/dsh-time-context", "external")
         items = app._merge_plugins([card], [])
-        self.assertEqual([a[0] for a in app._actions_for(items[0])], ["禁用"])
+        self.assertEqual([a[0] for a in app._actions_for(items[0])], ["禁用", "校验"])
 
     def test_bundle_gets_disable_and_enable(self):
         app = self._app()
@@ -353,6 +355,7 @@ class PluginRowActionsTest(unittest.TestCase):
         self.assertEqual(labels, ["启用", "卸载"])
 
     def test_state_labels_are_readable(self):
+        """状态词全页一套：本地插件与在线包都说「已启用／已停用」。"""
         app = self._app()
         entry = ps.MarketEntry(name="dshmarket", version="1", downloaded=True,
                                installed=False, builtin=False, spec="dshmarket",
@@ -360,7 +363,66 @@ class PluginRowActionsTest(unittest.TestCase):
         (self.home / "profiles" / "web" / ps.BUNDLE_STATE_FILE).write_text(
             json.dumps({"disabled": {"dshmarket": 0}}), encoding="utf-8")
         items = app._merge_plugins([], [entry], [], self.home)
-        self.assertEqual(app._state_display(items[0])[0], "已禁用")
+        self.assertEqual(app._state_display(items[0])[0], "已停用")
+
+        on = ps.MarketEntry(name="dshmarket", version="1", downloaded=True,
+                            installed=True, builtin=False, spec="dshmarket",
+                            local=None, description="")
+        items = app._merge_plugins([], [on], [], self.home)
+        self.assertEqual(app._state_display(items[0])[0], "已启用")
+        ext = app._merge_plugins([self._card("toast", "@dsh-user/toast", "external")], [])
+        self.assertEqual(app._state_display(ext[0])[0], "已启用")
+
+    def test_source_label_separates_the_two_forms(self):
+        """状态词一样，靠「来源」区分本地插件 / 在线包 / 内置清单。"""
+        app = self._app()
+        managed = app._merge_plugins([self._card("toast", "@dsh-user/toast", "enabled")], [])
+        external = app._merge_plugins(
+            [self._card("lsp-echo", "@dsh-user/lsp-echo", "external")], [])
+        bundle = app._merge_plugins([], [ps.MarketEntry(
+            name="dshmarket", version="1", downloaded=True, installed=True,
+            builtin=False, spec="dshmarket", local=None, description="")], [], self.home)
+        catalog = app._merge_plugins([], [], [{"slug": "toast", "description": "",
+                                               "repo": "https://x/y"}])
+        self.assertEqual(managed[0]["src_label"], "本地补丁·助手管理")
+        self.assertEqual(external[0]["src_label"], "本地补丁·你写的")
+        self.assertEqual(bundle[0]["src_label"], "在线包")
+        self.assertEqual(catalog[0]["src_label"], "内置清单")
+
+    def test_local_version_read_from_the_plugin_itself(self):
+        """本地插件也显示版本号（以前永远是「—」），取自它自己的 package.json。"""
+        src = self.tmp / "plugins" / "toast"
+        src.mkdir(parents=True)
+        (src / "package.json").write_text(
+            json.dumps({"name": "@dsh-user/toast", "version": "0.7.3"}), encoding="utf-8")
+        self.assertEqual(ps.local_plugin_version(self.home, "toast", src), "0.7.3")
+        self.assertEqual(ps.local_plugin_version(self.home, "nope"), "")
+
+    def test_package_sanity_does_not_demand_dsh_user_naming(self):
+        """官方插件不叫 `@dsh-user/*`，用那条命名规则查它会得到假的「不通过」。"""
+        pkg = self.tmp / "dsh-time-context"
+        (pkg / "lib").mkdir(parents=True)
+        (pkg / "lib" / "index.js").write_text("", encoding="utf-8")
+        (pkg / "package.json").write_text(
+            json.dumps({"name": "@deepseek-ai/dsh-time-context",
+                        "main": "./lib/index.js"}), encoding="utf-8")
+        self.assertTrue(ps.package_sanity(pkg).ok)
+        self.assertFalse(ps.validate_package(pkg).ok)      # 老规则误报的正是这一条
+        self.assertEqual(ps.package_name(pkg), "@deepseek-ai/dsh-time-context")
+        (pkg / "lib" / "index.js").unlink()
+        self.assertFalse(ps.package_sanity(pkg).ok)
+
+    def test_first_party_row_can_be_disabled_too(self):
+        """官方插件（如 time-context）也在用户补丁里，一样要给禁用按钮。"""
+        app = self._app()
+        card = self._card("time-context", "@deepseek-ai/dsh-time-context", "first_party")
+        items = app._merge_plugins([card], [])
+        self.assertEqual(items[0]["src_label"], "内置插件·你加的")
+        self.assertEqual([a[0] for a in app._actions_for(items[0])], ["禁用", "校验"])
+        card_off = self._card("time-context", "@deepseek-ai/dsh-time-context",
+                              "first_party-disabled")
+        items = app._merge_plugins([card_off], [])
+        self.assertEqual([a[0] for a in app._actions_for(items[0])], ["启用", "校验"])
 
 
 if __name__ == "__main__":

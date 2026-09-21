@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import time
@@ -126,6 +127,99 @@ class ColumnLayoutTest(unittest.TestCase):
         self._pump(250)
         self.assertAlmostEqual(canvas.winfo_width(), installer.LEFT_COL_WIDTH, delta=2)
         self.assertEqual(installer.saved_left_col_width(), installer.LEFT_COL_WIDTH)
+
+
+@unittest.skipUnless(TK_OK, "没有可用的 Tk（无图形环境）")
+class InstallDirBoxTest(unittest.TestCase):
+    """安装位置输入框：误碰不许生效，【回到上次位置】要回到用户自己的那份安装。
+
+    守两个坑：
+    ① 以前 `StringVar` 的 write 回调里直接 `set_active_dir`，敲错一个字符，
+       「运行 / 自检 / 插件」当场就换目录了（实测过：改一下就启动不起来）；
+    ② 以前【恢复默认】永远跳 C 盘（`%USERPROFILE%\\deepseek-harness`），
+       把用户装在别的盘上的位置丢了——那既不是「默认」也不是「上次」。
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-dirbox-"))
+        self._old = (installer.CONFIG_DIR, installer.CONFIG_PATH, installer._ACTIVE_DIR)
+        installer.CONFIG_DIR = self.tmp
+        installer.CONFIG_PATH = self.tmp / "config.json"
+        self.answers: list[bool] = []
+        for name in ("showinfo", "showwarning", "showerror"):
+            patcher = mock.patch.object(installer.messagebox, name, lambda *a, **k: True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(
+            installer.messagebox, "askyesno",
+            lambda *a, **k: self.answers.pop(0) if self.answers else False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.app = installer.App()
+        for handle in self.app.tk.call("after", "info"):
+            try:
+                self.app.after_cancel(handle)
+            except Exception:  # noqa: BLE001  已经跑掉的排期不用管
+                pass
+        self.app.withdraw()
+
+    def tearDown(self):
+        try:
+            self.app.destroy()
+        except Exception:  # noqa: BLE001  销毁途中出错不影响断言结果
+            pass
+        installer.CONFIG_DIR, installer.CONFIG_PATH, installer._ACTIVE_DIR = self._old
+
+    def _checkout(self, name: str) -> Path:
+        """造一个「凭内容认得出是 DSH 检出」的目录（标记文件 + 官方根包名）。"""
+        path = self.tmp / name
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "package.json").write_text(
+            json.dumps({"name": installer.DSH_ROOT_PACKAGE}), encoding="utf-8")
+        for marker in installer.CHECKOUT_MARKERS:
+            if marker != "package.json":
+                (path / marker).write_text("", encoding="utf-8")
+        return path
+
+    def test_typing_alone_never_changes_where_we_install(self):
+        real = self._checkout("real")
+        installer.set_active_dir(real)
+        self.app.dir_var.set(r"E:\typo\deepseek-harnesss")
+        self.app._dir_hint()
+        self.assertEqual(installer.project_dir(), real, "敲键盘就换了安装位")
+        self.assertIn("尚未生效", self.app.dir_hint.cget("text"))
+
+    def test_committing_a_typo_asks_and_reverts(self):
+        real = self._checkout("real")
+        installer.set_active_dir(real)
+        self.answers.append(False)                    # 弹窗里选「否」
+        self.app.dir_var.set(str(self.tmp / "typo"))
+        self.app._on_dir_committed()
+        self.assertEqual(str(self.app.dir_var.get()), str(real))
+        self.assertEqual(installer.project_dir(), real)
+        self.assertNotEqual(installer.load_config().get("installDir"),
+                            str(self.tmp / "typo"))
+
+    def test_committing_a_new_location_after_yes_applies_it(self):
+        real = self._checkout("real")
+        fresh = self.tmp / "fresh"
+        installer.set_active_dir(real)
+        self.answers.append(True)                     # 弹窗里选「是」
+        self.app.dir_var.set(str(fresh))
+        self.app._on_dir_committed()
+        self.assertEqual(installer.project_dir(), fresh)
+        self.assertEqual(installer.load_config().get("installDir"), str(fresh))
+
+    def test_reset_goes_back_to_the_last_used_dir(self):
+        real = self._checkout("real")
+        installer.CONFIG_PATH.write_text(json.dumps({"installDir": str(real)}),
+                                         encoding="utf-8")
+        self.app.dir_var.set(str(self.tmp / "elsewhere"))
+        self.app._on_reset_dir()
+        self.assertEqual(str(self.app.dir_var.get()), str(real))
+        self.assertNotEqual(str(self.app.dir_var.get()),
+                            str(installer.default_project_dir()),
+                            "又跳回 C 盘默认值了")
 
 
 if __name__ == "__main__":

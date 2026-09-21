@@ -585,6 +585,25 @@ def project_dir() -> Path:
     return default_project_dir()
 
 
+def last_used_dir() -> tuple[Path, str]:
+    """「上次使用的位置」及其来源说明。
+
+    顺序：配置里记住的安装位 → 机器上自动检测到的已安装 → 方案 A 默认。
+    用途是那个【回到上次位置】按钮——以前不管什么情况都跳回 C 盘默认值
+    （`%USERPROFILE%\\deepseek-harness`），把装在别的盘上的那份位置丢了：
+    那既不是「默认」也不是「上次」。
+    """
+    raw = str(load_config().get("installDir", "")).strip()
+    if raw:
+        saved = Path(os.path.expandvars(raw)).expanduser()
+        if is_checkout(saved) or _nonempty_dir(saved):
+            return saved, "配置里记住的位置"
+    found = detect_installed_dir()
+    if found is not None:
+        return found, "自动识别到的已安装目录"
+    return default_project_dir(), "方案 A 默认位置"
+
+
 def set_active_dir(path: Path | None) -> None:
     """记录界面**当前**选定的安装位；立即对自检/运行/插件生效，不必先点安装。"""
     global _ACTIVE_DIR
@@ -958,6 +977,26 @@ def bind_wheel_tree(root: tk.Misc, handler) -> None:
         stack.extend(widget.winfo_children())
 
 
+def plugin_src_label(kind: str, state: str) -> str:
+    """插件行的「来源」短标签。
+
+    状态词全页统一（已启用／已停用／已下载／未下载）之后，靠这一列区分它是
+    本地补丁行、在线包（bundle）还是还没下载的内置清单项——以前是拿状态词兼职
+    说明来源（「已启用·外部(只读)」这种），同一件事三种说法。
+    """
+    if kind == "catalog":
+        return "内置清单"
+    if kind == "bundle":
+        return "在线包"
+    if state == "downloaded":
+        return "已下载"
+    if state in ("first_party", "first_party-disabled"):
+        return "内置插件·你加的"
+    if state in ("external", "external-disabled"):
+        return "本地补丁·你写的"
+    return "本地补丁·助手管理"
+
+
 class App(tk.Tk):
     #: 默认窗口大小；大屏上按屏幕再放大一点（日志栏宽一点更好看），并居中显示。
     WIDTH, HEIGHT = 1000, 720
@@ -1046,10 +1085,12 @@ class App(tk.Tk):
         self.dir_var = tk.StringVar(value=str(project_dir()))
         dir_ent = ttk.Entry(lrow, textvariable=self.dir_var)
         dir_ent.pack(side="left", fill="x", expand=True)
+        # 位置只在回车/失焦时才切换（敲键盘只更新下面的提示），避免误碰一下就跑偏
         dir_ent.bind("<FocusOut>", self._on_dir_committed)
         dir_ent.bind("<Return>", self._on_dir_committed)
         ttk.Button(lrow, text="浏览…", command=self._on_pick_dir).pack(side="left", padx=(6, 0))
-        ttk.Button(lrow, text="恢复默认", command=self._on_reset_dir).pack(side="left", padx=(6, 0))
+        ttk.Button(lrow, text="回到上次位置",
+                   command=self._on_reset_dir).pack(side="left", padx=(6, 0))
         self.dir_hint = ttk.Label(loc, text="", foreground="#666", justify="left",
                                   wraplength=WRAP_LEFT)
         self.dir_hint.pack(anchor="w", pady=(4, 0))
@@ -1356,20 +1397,50 @@ class App(tk.Tk):
         return Path(os.path.expandvars(raw)).expanduser() if raw else project_dir()
 
     def _on_dir_changed(self, *_args) -> None:
-        """输入框一动就立即生效：之后的「运行/自检/插件」都用这个目录。
+        """输入框内容一变：**只更新提示**，不改变实际使用的位置。
 
-        清空输入框不等于「改用方案 A」——那会在用户重打路径的间隙把安装位
-        临时指到一个不存在的目录，所以空值时交回自动优先级。
+        位置只在回车/失焦（`_on_dir_committed`）时才生效——否则误碰一下键盘，
+        后面的「运行 / 自检 / 插件」就全指向另一个目录了（实测过：改一下就启动不起来）。
         """
-        set_active_dir(self._current_dir() if self.dir_var.get().strip() else None)
         self._dir_hint()
-        self._schedule_git_refresh()
 
     def _on_dir_committed(self, _event=None) -> None:
-        """失焦/回车 = 用户确认了这个位置，顺手记进配置（空值不动配置）。"""
-        self._on_dir_changed()
-        if self.dir_var.get().strip():
-            set_project_dir(self._current_dir())
+        """回车或点别处 = 位置定下来（生效 + 记住）。
+
+        从「已经能用的 DSH」改到「认不出是 DSH 的目录」时先问一句（默认退回原位置）：
+        这类改动多半是误碰，改完就启动不起来了。
+        """
+        raw = self.dir_var.get().strip()
+        if not raw:                       # 清空 = 交回自动识别（保持原语义）
+            set_active_dir(None)
+            self._dir_hint()
+            self._schedule_git_refresh()
+            return
+        target = self._current_dir()
+        previous = project_dir()          # 提交前「实际生效」的那个目录
+        if self._looks_like_accident(previous, target) and not messagebox.askyesno(
+                "确认修改安装位置？",
+                f"原来的位置：{previous}\n（已装好，能直接用）\n\n"
+                f"新位置：{target}\n（这里还认不出 DSH 安装）\n\n"
+                "改完之后【运行】【自检】【插件】都会换成新位置。\n"
+                "如果只是想换个地方重新装一份，选「是」；如果是误碰，选「否」退回原位置。",
+                parent=self, default="no"):
+            self.dir_var.set(str(previous))          # 撤回
+            self._dir_hint()
+            return
+        set_active_dir(target)
+        set_project_dir(target)
+        self._dir_hint()
+        self._schedule_git_refresh(400)
+
+    @staticmethod
+    def _looks_like_accident(previous: Path, target: Path) -> bool:
+        """是不是「从一个能用的安装改到一个认不出的目录」。"""
+        if previous == target:
+            return False
+        if not is_checkout(previous):
+            return False                 # 原来也不像 DSH：属于正常的新装/换位置
+        return not is_checkout(target)
 
     @staticmethod
     def _normalize_picked(chosen: Path) -> Path:
@@ -1391,17 +1462,25 @@ class App(tk.Tk):
         if not picked:
             return
         chosen = self._normalize_picked(Path(picked))
-        self.dir_var.set(str(chosen))               # 触发 _on_dir_changed → 立即生效
-        set_project_dir(chosen)
+        self.dir_var.set(str(chosen))               # 只更新提示，不动生效目录
+        self._on_dir_committed()                    # 选目录就是明确确认
 
     def _on_reset_dir(self) -> None:
-        default = default_project_dir()
-        self.dir_var.set(str(default))
-        set_project_dir(default)
+        """回到**上次使用的位置**（配置记住的 → 自动识别到的 → 方案 A 默认）。
+
+        以前不管什么情况都跳回 C 盘默认值，用户装在别的盘上的那份位置就被丢了。
+        """
+        target, why = last_used_dir()
+        self.dir_var.set(str(target))
+        set_active_dir(target)
+        set_project_dir(target)
+        self._dir_hint()
+        self._schedule_git_refresh(400)
+        self._status(f"已回到上次使用的位置（{why}）：{target}")
 
     def _dir_hint(self, _event=None) -> None:
         """即时反馈：红=不能装，橙=可装有风险，绿=已装好/可用（最多 2 条提示）。"""
-        target = self._effective_dir()
+        target = self._current_dir()
         errors, warns = check_install_dir(target)
         why = checkout_identity(target)
         if errors:
@@ -1421,6 +1500,11 @@ class App(tk.Tk):
             text = (f"✓ 可用（所在磁盘剩余 {free:.0f} GB）→ 将安装到这里"
                     if free >= 0 else "✓ 可用 → 将安装到这里")
             color = "#1a6b1a"
+        # 改了但还没确认：明确说一句此刻尚未生效（位置只在回车/失焦时才切换）
+        if self.dir_var.get().strip() and target != project_dir():
+            text += "　（改动尚未生效：按回车或点别处才切换）"
+            if color != "#b00000":
+                color = "#a05a00"
         self.dir_hint.configure(text=text, foreground=color)
 
     # ---------------- 版本与更新（结论全部来自真实 git 命令）----------------
@@ -1913,19 +1997,25 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ 插件区
 
+    # 状态词全页统一：本地插件与在线包用同一套说法（来源另用一列标明），
+    # 以前本地行说「已启用·外部(只读)」、在线包说「已安装」，同一件事三种说法。
     STATE_CN = {
         "enabled": "已启用",
         "disabled": "已停用",
-        "external": "已启用·外部(只读)",
-        "external-disabled": "已停用·外部(只读)",
-        "first_party": "内置(只读)",
-        "first_party-disabled": "内置·停用(只读)",
+        "external": "已启用",
+        "external-disabled": "已停用",
+        "installed": "已启用",
+        "bundle-off": "已停用",
+        "first_party": "内置",
+        "first_party-disabled": "内置·停用",
         "downloaded": "已下载",
+        "nodl": "未下载",
     }
     STATE_COLOR = {
-        "enabled": "#1a6b1a", "disabled": "#888", "external": "#1a4a8a",
-        "external-disabled": "#888", "first_party": "#666",
-        "first_party-disabled": "#888", "downloaded": "#a06700",
+        "enabled": "#1a6b1a", "external": "#1a6b1a", "installed": "#1a6b1a",
+        "first_party": "#666", "downloaded": "#a06700", "nodl": "#999",
+        "disabled": "#888", "external-disabled": "#888", "bundle-off": "#a05a00",
+        "first_party-disabled": "#888",
     }
 
     def _scrollable(self, parent, *,
@@ -2118,12 +2208,15 @@ class App(tk.Tk):
         self.market_updates: dict[str, str] = {}
         self.plugin_note = ttk.Label(
             box,
-            text="一行一个插件，安装/卸载/启用/停用按类型自动处理；"
-                 "本地插件为草稿，点「全部保存并重启网页版」落盘；"
-                 "在线插件真实安装到 profile，需重启网页版生效。\n"
-                 "排查启动冲突：「禁用」只把那一行停掉（写成官方的 disabled: true）或把 bundle "
-                 "从 dsh.profile.bundles 摘掉，文件与依赖都留着，点「启用」立刻还原；"
-                 "原生「外部」行也能这样禁停，不必先接管。",
+            text="一行一个插件，状态词统一（已启用／已停用／已下载／未下载），"
+                 "「来源」说明它是哪种插件：\n"
+                 "　本地补丁·你写的／助手管理＝写 cordis.patch.yml 的本地插件；"
+                 "在线包＝bundle；内置清单＝还没下载。\n"
+                 "本地插件的安装/禁用/启用/卸载是草稿，点「全部保存并重启网页版」落盘；"
+                 "在线插件即时生效，需重启网页版。两边都能【校验】。\n"
+                 "排查启动冲突：【禁用】只把那一行停掉（写成官方 disabled: true）"
+                 "或把 bundle 从 dsh.profile.bundles 摘掉，文件与依赖都留着，"
+                 "【启用】立刻还原；你手写的「外部」行也能直接禁用，不必先接管。",
             foreground="#888", font=("Microsoft YaHei UI", 8), justify="left")
         self.plugin_note.pack(anchor="w", pady=(4, 0))
         self.btn_save = ttk.Button(box, text="全部保存并重启网页版",
@@ -2418,11 +2511,13 @@ class App(tk.Tk):
         for card in cards:
             known.add(card.slug)
             items.append({
-                "kind": "managed", "name": card.slug, "version": "",
+                "kind": "managed", "name": card.slug,
+                "version": getattr(card, "version", "") or "",
                 "state": card.state, "desc": (card.description or "")[:40],
                 "warning": card.validation_errors[0][:24] if card.validation_errors else "",
                 "value": card.slug, "spec": card.slug,
                 "full_name": getattr(card, "name", card.slug),
+                "src_label": plugin_src_label("managed", card.state),
             })
         # 内置清单里尚未下载（未克隆）的插件
         for c in catalog:
@@ -2432,7 +2527,7 @@ class App(tk.Tk):
                 "kind": "catalog", "name": c["slug"], "version": "",
                 "state": "nodl", "desc": (c["description"] or "")[:24],
                 "warning": "", "value": c["slug"], "spec": c["repo"],
-                "full_name": c["slug"],
+                "full_name": c["slug"], "src_label": "内置清单",
             })
         # bundle：禁用的判据是「名字不在 dsh.profile.bundles 里但包还在」——
         # 这正是禁用后的样子，不能混成「已下载」（那样用户看不出自己关过什么）
@@ -2445,7 +2540,7 @@ class App(tk.Tk):
                 "kind": "bundle", "name": e.name, "version": e.version, "state": st,
                 "desc": (e.description or "")[:22], "warning": "",
                 "value": str(e.local) if e.local else e.spec, "spec": e.spec,
-                "full_name": e.name,
+                "full_name": e.name, "src_label": "在线包",
             })
         items.sort(key=lambda it: (self._plugin_rank(it), it["name"]))
         return items
@@ -2462,8 +2557,11 @@ class App(tk.Tk):
         ttk.Label(row, text=it["version"] or "—", width=9,
                   foreground="#888").pack(side="left")
         st, color = self._state_display(it)
-        ttk.Label(row, text=st, width=12, foreground=color).pack(side="left")
-        ttk.Label(row, text=it["desc"], foreground="#666").pack(side="left", fill="x", expand=True)
+        ttk.Label(row, text=st, width=10, foreground=color).pack(side="left")
+        src = it.get("src_label", "")
+        desc = it["desc"]
+        ttk.Label(row, text=(f"{src}｜{desc}" if desc else src),
+                  foreground="#666").pack(side="left", fill="x", expand=True)
         if it["warning"]:
             ttk.Label(row, text="⚠ " + it["warning"], foreground="#b00000",
                       font=("Microsoft YaHei UI", 8)).pack(side="left")
@@ -2476,14 +2574,7 @@ class App(tk.Tk):
 
     def _state_display(self, it) -> tuple[str, str]:
         s = it["state"]
-        if it["kind"] == "managed":
-            return self.STATE_CN.get(s, s), self.STATE_COLOR.get(s, "#000")
-        if it["kind"] == "catalog":
-            return {"nodl": ("未下载", "#999")}.get(s, (s, "#000"))
-        return {"installed": ("已安装", "#2a6b2a"),
-                "bundle-off": ("已禁用", "#a05a00"),
-                "downloaded": ("已下载", "#1a6bb0"),
-                "nodl": ("可下载", "#999")}.get(s, (s, "#000"))
+        return self.STATE_CN.get(s, s), self.STATE_COLOR.get(s, "#000")
 
     def _actions_for(self, it) -> list[tuple[str, str, str]]:
         if it["kind"] == "managed":
@@ -2497,15 +2588,24 @@ class App(tk.Tk):
         if st == "downloaded":
             return [("看原因", "none", slug)] if warn else [("安装", "install", slug)]
         if st == "enabled":
-            return [("停用", "set_off", slug), ("卸载", "uninstall", slug)]
+            return [("禁用", "set_off", slug), ("卸载", "uninstall", slug),
+                    ("校验", "check_local", slug)]
         if st == "disabled":
-            return [("启用", "set_on", slug), ("卸载", "uninstall", slug)]
+            return [("启用", "set_on", slug), ("卸载", "uninstall", slug),
+                    ("校验", "check_local", slug)]
         if st in ("external", "external-disabled"):
             # 外部行照样能禁停（排查启动冲突时最需要）：写成官方 disabled，不碰原文
             acts = [("禁用", "row_off", slug)] if st == "external" \
                 else [("启用", "row_on", slug)]
+            acts.append(("校验", "check_local", slug))
             if str(it.get("full_name", "")).startswith("@dsh-user/"):
                 acts.append(("接管", "adopt", slug))     # 只有 @dsh-user/* 才谈得上接管
+            return acts
+        if st in ("first_party", "first_party-disabled"):
+            # 官方插件（如 time-context）也在用户补丁里，一样能禁停——排查冲突时要的正是它
+            acts = [("禁用", "row_off", slug)] if st == "first_party" \
+                else [("启用", "row_on", slug)]
+            acts.append(("校验", "check_local", slug))
             return acts
         return []
 
@@ -2572,7 +2672,67 @@ class App(tk.Tk):
             self._post(self._set_plugin_busy, False)
             self._post(self._refresh_plugins)
 
+    def _local_check_worker(self, slug: str) -> None:
+        """本地插件的【校验】：查共享锚目录/来源目录里的包是否自洽。
+
+        在线包的【校验】一直有，本地插件却没有，同一个页面两种规格；这里补上，
+        两边都回答同一个问题——「这个包能不能装、能不能跑」。
+        """
+        try:
+            env = self._plugin_env()
+            if env is None:
+                return
+            home, project = env
+            targets: list[Path] = []
+            anchor = pstore.anchor_dir(home, slug)
+            if anchor.exists():
+                targets.append(anchor)
+            src = next((s for s in self._plugin_sources(home, project) if s.slug == slug),
+                       None)
+            if src is not None and src.path.exists():
+                targets.append(src.path)
+            # 官方/在线插件没有来源目录，包就在 profile 的 node_modules 里
+            # （本地与官方在 profiles/node_modules，bundle 在 profiles/web/node_modules）
+            full = next((str(it.get("full_name", "")) for it in
+                         getattr(self, "plugin_items", []) if it.get("value") == slug), "")
+            for rel in (full, f"@dsh-user/{slug}"):
+                if not rel:
+                    continue
+                for root in (home / "profiles" / "node_modules",
+                             home / "profiles" / "web" / "node_modules"):
+                    cand = root / rel
+                    if cand.exists() and cand not in targets:
+                        targets.append(cand)
+            if not targets:
+                raise pstore.PluginError(
+                    f"找不到 {slug} 的包目录（共享锚与来源目录都没有）")
+            lines: list[str] = []
+            ok = True
+            for path in targets:
+                # 只有 @dsh-user 的包才套那条命名约定；官方/在线包用通用自洽检查
+                pkg_name = pstore.package_name(path)
+                res = (pstore.validate_package(path) if pkg_name.startswith("@dsh-user/")
+                       else pstore.package_sanity(path))
+                ok = ok and res.ok
+                lines.append(f"{path}\n    " + ("✓ 通过" if res.ok
+                                                else "✗ " + "；".join(res.errors)))
+            self._plog(f"[插件] 校验 {slug}：{'✓ 通过' if ok else '✗ 有问题'}")
+            for line in lines:
+                self._plog("        " + line.replace("\n", "\n        "))
+            self._post(lambda: messagebox.showinfo(
+                "校验结果", f"{slug}：{'通过' if ok else '有问题'}\n\n" + "\n".join(lines),
+                parent=self))
+            self._post(self._status, f"{slug} 校验：{'✓ 通过' if ok else '✗ 有问题'}",
+                       "#2a6b2a" if ok else "#b00000")
+        except Exception as exc:  # noqa: BLE001
+            self._plog(f"[插件] ✗ 校验 {slug} 失败：{exc}")
+            self._post(self._status, f"{slug} 校验失败 ✗", "#b00000")
+
     def _plugin_act(self, slug: str, action: str) -> None:
+        if action == "check_local":              # 只读校验：立即跑，不进待办
+            threading.Thread(target=self._local_check_worker, args=(slug,),
+                             daemon=True).start()
+            return
         if self.plugin_busy or action == "none":
             if action == "none":
                 card = next((c for c in getattr(self, "plugin_cards", [])

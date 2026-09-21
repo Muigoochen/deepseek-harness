@@ -153,6 +153,7 @@ class PluginCard:
     source: Optional[Path]           # 发现的来源目录（存在时）
     first_party: bool = False
     validation_errors: tuple[str, ...] = ()
+    version: str = ""                # 本地插件读它自己 package.json 的 version
 
 
 # ---------------------------------------------------------------- 路径
@@ -407,6 +408,32 @@ def validate_package(pkg_dir: Path) -> Validation:
         errs.append("声明 dsh.client 但缺 lib/client.js（冷启动会失败，拒绝安装）")
     if pkg.get("dsh", {}).get("client") and "./client" not in pkg.get("exports", {}):
         errs.append("声明 dsh.client 时 exports 需含 './client' 导出")
+    return Validation(ok=not errs, errors=tuple(errs))
+
+
+def package_name(pkg_dir: Path) -> str:
+    """目录里那个包的 npm 名字（读不到就空串）。"""
+    pkg = _pkg_json(pkg_dir)
+    name = (pkg or {}).get("name", "")
+    return name if isinstance(name, str) else ""
+
+
+def package_sanity(pkg_dir: Path) -> Validation:
+    """通用自洽检查：有没有 package.json、入口在不在、客户端声明有没有产物。
+
+    与 `validate_package` 的区别是**不要求** `@dsh-user/<目录名>` 那条命名约定——
+    官方插件（`@deepseek-ai/*`）与在线包不遵守它，拿那条规则去查只会得到一句假的
+    「不通过」（实测：查 time-context 会报「name 必须恰为 @dsh-user/dsh-time-context」）。
+    """
+    pkg = _pkg_json(pkg_dir)
+    if pkg is None:
+        return Validation(ok=False, errors=("缺 package.json",))
+    errs: list[str] = []
+    main = str(pkg.get("main", "./lib/index.js"))
+    if not (pkg_dir / main.lstrip("./")).is_file():
+        errs.append(f"入口 {main} 缺失（未构建 lib/？）")
+    if pkg.get("dsh", {}).get("client") and not _client_js(pkg, pkg_dir):
+        errs.append("声明了 dsh.client 但客户端产物缺失")
     return Validation(ok=not errs, errors=tuple(errs))
 
 
@@ -1303,7 +1330,7 @@ def set_row_enabled(home: Path, row_id: str, enabled: bool, *,
     if not hit:
         raise PluginError(f"补丁里没有 id 为 {row_id} 的插件行。")
     if hit[0].managed:
-        raise PluginError(f"{row_id} 在助手自有管理段内：请在插件页对它点『停用』。")
+        raise PluginError(f"{row_id} 在助手自有管理段内：请在插件页对它点『禁用』。")
 
     state = switch_state(home)
     if enabled:
@@ -2067,6 +2094,48 @@ def web_patch_declared_ids(home: Path) -> set[str]:
     return ids
 
 
+def local_plugin_version(home: Path, slug: str,
+                         source: Optional[Path] = None) -> str:
+    """本地插件的版本号：先看共享锚目录，再看来源目录，都没有就空字符串。
+
+    在线包（bundle）一直有版本列，本地插件却显示「—」，同一个页面两种样子；
+    版本其实就写在插件自己的 package.json 里，读出来即可。
+    """
+    for path in (anchor_dir(home, slug), source):
+        version = _read_package_version(path)
+        if version:
+            return version
+    return ""
+
+
+def profile_package_version(home: Path, name: str) -> str:
+    """profile 里那个已装包的版本号。
+
+    本地插件装在 `profiles/node_modules/@dsh-user/<slug>`、官方插件在
+    `profiles/node_modules/<包名>`、bundle 在 `profiles/web/node_modules/<包名>`，
+    版本都写在各自的 package.json 里——读出来就能和别处一样填进版本列。
+    """
+    roots = (home / "profiles" / "node_modules",
+             home / "profiles" / "web" / "node_modules")
+    for root in roots:
+        found = _read_package_version(root / name)
+        if found:
+            return found
+    return ""
+
+
+def _read_package_version(path: Optional[Path]) -> str:
+    """从目录的 package.json 里取 version；读不到/格式怪就返回空（绝不抛错）。"""
+    if path is None:
+        return ""
+    try:
+        data = json.loads((path / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    version = data.get("version") if isinstance(data, dict) else None
+    return version.strip() if isinstance(version, str) else ""
+
+
 def status_view(home: Path, sources: Sequence[PluginSource], dump: DumpResult,
                 local_rows: Optional[Sequence[PatchRow]] = None) -> list[PluginCard]:
     """合成插件页行：台账(意图) + dump(有效) [+ 文件级兜底]。
@@ -2100,7 +2169,8 @@ def status_view(home: Path, sources: Sequence[PluginSource], dump: DumpResult,
                 installed_dir=anchor_dir(home, slug) if anchor_dir(home, slug).exists() else None,
                 source=src.path if src else None,
                 first_party=False,
-                validation_errors=src.validation.errors if src else ()))
+                validation_errors=src.validation.errors if src else (),
+                version=local_plugin_version(home, slug, src.path if src else None)))
     # 第一方 @deepseek-ai 行只读展示（仅用户补丁里显式加过的那几条）
     for e in dump.entries:
         if e.id in declared and e.name.startswith("@deepseek-ai/") \
@@ -2109,9 +2179,10 @@ def status_view(home: Path, sources: Sequence[PluginSource], dump: DumpResult,
                 slug=e.id, name=e.name,
                 state="first_party" if not e.disabled else "first_party-disabled",
                 description="", origin="bundle/profile",
-                installed_dir=None, source=None, first_party=True))
+                installed_dir=None, source=None, first_party=True,
+                version=profile_package_version(home, e.name)))
 
-    # 已下载（来源有、补丁没声明）→ 可安装；声明了但 dump 未带出（如结构门因 bundle 失败）→ 外部·只读
+    # 已下载（来源有、补丁没声明）→ 可安装；声明了但 dump 未带出（如结构门因 bundle 失败）→ 外部行
     for s in sources:
         if s.slug in slugs:
             continue
@@ -2121,13 +2192,15 @@ def status_view(home: Path, sources: Sequence[PluginSource], dump: DumpResult,
                 slug=s.slug, name=f"@dsh-user/{s.slug}", state="external",
                 description=s.description, origin=s.origin,
                 installed_dir=None, source=s.path,
-                first_party=False, validation_errors=s.validation.errors))
+                first_party=False, validation_errors=s.validation.errors,
+                version=local_plugin_version(home, s.slug, s.path)))
         else:
             cards.append(PluginCard(
                 slug=s.slug, name=f"@dsh-user/{s.slug}", state="downloaded",
                 description=s.description, origin=s.origin,
                 installed_dir=None, source=s.path,
-                first_party=False, validation_errors=s.validation.errors))
+                first_party=False, validation_errors=s.validation.errors,
+                version=local_plugin_version(home, s.slug, s.path)))
     # 结构门跑不了（dsh 起不来）时的文件级兜底：至少把用户补丁里的插件行列出来，
     # 否则插件页一片空白，用户就没有「禁用它试试」的入口了
     if local_rows:
@@ -2150,7 +2223,8 @@ def status_view(home: Path, sources: Sequence[PluginSource], dump: DumpResult,
                 installed_dir=anchor_dir(home, slug) if anchor_dir(home, slug).exists() else None,
                 source=src.path if src else None,
                 first_party=False,
-                validation_errors=src.validation.errors if src else ()))
+                validation_errors=src.validation.errors if src else (),
+                version=local_plugin_version(home, slug, src.path if src else None)))
     cards.sort(key=lambda c: (c.state not in ("enabled",), c.name))
     return cards
 
