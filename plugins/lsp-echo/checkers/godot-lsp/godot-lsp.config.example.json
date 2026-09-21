@@ -1,9 +1,10 @@
 {
-  "_readme": "换到另一台电脑时:复制本文件为 godot-lsp.config.json,按需修改。全部留空 = 全自动(要求 Godot 在 PATH 中、在项目目录内运行命令)。editorPort/attachEditor 控制智能连接:默认 editorPort=6005(你已打开的 Godot 编辑器 LSP),引擎会 attach 到它而不是额外启动 headless;若你的编辑器端口不是 6005,把它填到 editorPort;若想始终用独立 headless(不开编辑器也扫),设 attachEditor=false。",
+  "_readme": "换到另一台电脑时:复制本文件为 godot-lsp.config.json,按需修改。全部留空 = 全自动(要求 Godot 在 PATH 中、在项目目录内运行命令)。editorPort/attachEditor 控制智能连接:默认 editorPort=6005(你已打开的 Godot 编辑器 LSP),引擎会 attach 到它而不是额外启动 headless;若你的编辑器端口不是 6005,把它填到 editorPort;若想始终用独立 headless(不开编辑器也扫),设 attachEditor=false。attachPolicy 控制“编辑器后开”时怎么办:prefer-editor(默认)= 下次检查迁到你的编辑器并停掉自起的 headless,一个项目只留一个引擎;cold-start = 谁先起就用谁(适合你同时用 VSCode 的 Godot 插件连编辑器 LSP 的场景,迁回会把它挤掉一次)。",
   "godotBin": "",
   "defaultProject": "",
   "watchSkip": [".godot", "addons"],
   "editorPort": 6005,
   "attachEditor": true,
+  "attachPolicy": "prefer-editor",
   "out": ""
 }

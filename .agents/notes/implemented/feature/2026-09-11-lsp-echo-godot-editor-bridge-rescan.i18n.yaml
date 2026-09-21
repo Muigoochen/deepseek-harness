@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-09-11-lsp-echo-godot-editor-bridge-rescan.md
-2026-09-11-lsp-echo-godot-editor-bridge-rescan.md: cf8ad0013a88e57b34ec2345c74fc8a40742f4ca
-2026-09-11-lsp-echo-godot-editor-bridge-rescan.zh.md: eeddc2572d9af3a632b6731048cc0cfbb2d989e9
+2026-09-11-lsp-echo-godot-editor-bridge-rescan.md: fa1030ffd695d1a1cdd0464ce800d9a4892660b3
+2026-09-11-lsp-echo-godot-editor-bridge-rescan.zh.md: 0dbf5ca44ba47c75738c2e748bf9b1936c362515

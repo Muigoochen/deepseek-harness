@@ -12,6 +12,8 @@ The language server exposes no way to ask for one. `gdscript_language_protocol.c
 
 The consequence lands on the agent loop in its most expensive form: a script that declares `class_name X` is written, a second file referencing `X` is checked before the engine has scanned, and the check reports `Could not find type "X" in the current scope.` The diagnostic is false, it arrives immediately after the edit that caused it, and it persists until the engine restarts — the loop is told to fix a file that is already correct.
 
+The same mechanism reads externally edited content as stale in editor-attach mode. An editor caches a script's text while scanning the project and reloads it only when its window regains focus, so a parent method edited through the harness keeps surfacing in its subclasses as `Parent signature is "… -> void"`: the check opens the subclass, the editor re-analyses it against the copy it still holds, and the diagnostic describes the signature from before the edit — on a file that is already correct on disk. An engine we start ourselves has no such window: it reads a dependency from disk when it analyses a file, which the [dependent-recheck note](2026-09-11-lsp-echo-dependent-recheck.md) measures with a dependency that had been opened first and one that never had.
+
 ## Decision
 
 lsp-echo ships a Godot editor plugin beside the engine bridge and asks the running engine to rescan through it.
@@ -30,16 +32,17 @@ The plugin reads a port from the published record and falls back to the engine's
 
 ### Self-heal triggers
 
-The plugin asks for a rescan in two places, both automatic:
+The plugin asks for a rescan in three places, all automatic:
 
 - A structural change — a `.gd` created or deleted, tracked in [`lib/watcher.js`](../../../../plugins/lsp-echo/lib/watcher.js) — is drained before the check runs, so the new file exists in the engine's view before anything references it.
+- A round whose files changed asks for a rescan first, with the success interval skipped, because the engine's copy of those files is what the check would otherwise describe. The `fresh` option exists for this trigger alone: it must land on the round that saw the edit, not on whichever round follows the interval.
 - A payload containing `Could not find type "X"` is treated as suspect only when the project really declares `class_name X` (`missingTypeNames` over this round's files, against an mtime-incremental class index in [`lib/index.js`](../../../../plugins/lsp-echo/lib/index.js)). The plugin then rescans and runs one more check, whose budget is capped and which keeps the first payload if it throws. A missing type that the project does not declare is a real error and triggers nothing.
 
 The request travels through the same bridge process the checks use, whose session ownership the [editor LSP session note](../bug-fix/2026-09-11-lsp-echo-editor-lsp-single-session.md) records.
 
 ### Failure is visible
 
-After a failed attempt, that engine/project pair is not asked again for 120 s, and the toast that states the engine has not published its new classes repeats at most every 600 s; a successful rescan suppresses the next request for 3 s. A failed rescan never turns into a clean result: the check payload is the engine's own answer either way. `bridgeStatus` reports `{installed, port, declared, online, error}` and `installAddon` reports `{ok, addonPath, enabled, enableChanged, stoppedForRestart, error}`; the settings panel surfaces both verdicts.
+After a failed attempt, that engine/project pair is not asked again for 120 s, and the toast that states the engine has not published its new classes repeats at most every 600 s; a successful rescan suppresses the next request for 3 s, except for the changed-file trigger, which is exempt so that an edit cannot wait out the interval. A failed rescan never turns into a clean result: the check payload is the engine's own answer either way. `bridgeStatus` reports `{installed, port, declared, online, error}` and `installAddon` reports `{ok, addonPath, enabled, enableChanged, stoppedForRestart, error}`; the settings panel surfaces both verdicts.
 
 The plugin's HTTP actions that write state or stop engines require the `x-dsh-lsp-echo: 1` header, which a cross-site page cannot attach to a plain GET: another web page cannot make the harness install files into a user's project or stop an engine.
 
@@ -65,3 +68,7 @@ Costs accepted: the plugin writes an addon directory and one `project.godot` ent
 The addon installer was exercised against five `project.godot` shapes (section at EOF without a trailing newline, an existing list followed by another section, no section, an enabled path containing `)`, and a commented-out entry), each idempotent with exactly one `[editor_plugins]` section afterwards. Port discovery was exercised with no state file, a dead publisher pid, and a live one. End to end, with the default port occupied, the addon bound the next port, published it, and answered both a probe and the bridge's `rescan`, after which a file referencing a class created while the engine ran went from one error to none; against a dead port the bridge exits `2` and reports the failure.
 
 The installer and port checks ran from a throwaway script against temporary projects, so the results are recorded here and in the plugin's design notes rather than shipped as a test file; the engine steps reproduce with the bridge CLI commands the plugin README documents.
+
+The changed-file trigger was measured on the real project: a parent method edited through the harness left two subclasses and one caller reporting nine errors about the old `-> void` signature while the file on disk already returned `bool`. One rescan — a 138 ms socket round trip to the editor's bridge, which does not include starting the bridge process — followed by a re-check of the same six files reported zero errors, which is what the pre-check rescan reproduces. The mode difference was measured on a throwaway project with a real headless engine: after editing a dependency, checking its caller reports the new signature whether or not the caller opened the dependency first, so a self-started engine never needs this trigger and an attached editor is the only mode that does.
+
+The plugin ships no packaged test, and adds none here: the repository's test and typecheck targets cover `packages/`, `apps/`, and `scripts/`, not `plugins/`.

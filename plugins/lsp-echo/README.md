@@ -16,7 +16,8 @@
 | **多 LSP(项目为主)** | 一个项目(目录)可绑**多个引擎**,各自认领自己的文件扩展名(如 GDScript `.gd` + 未来 C# `.cs`);编辑变化按扩展名路由到对应引擎检查,结果合并进一个按项目诊断快照 |
 | **显式管理工具** | 模型工具 `lsp_echo`:`host`/`stop`/`status`/`check`/`baseline`/`projects`/`scan` |
 | **引擎生命周期** | **智能连接**:你已打开该项目的 Godot 编辑器时,直接 attach 它的 LSP 端口(6005,零额外内存、秒级就绪);否则自起 headless 引擎常驻复用;启动决策带**跨进程文件锁**(杜绝并发双起);插件卸载时自动 detach/停止,`stop` 显式停 |
-| **引擎桥(新脚本即时可见)** | Godot 只在**扫描文件系统**时注册 `class_name`,而运行中的引擎不会自己重扫(编辑器靠"窗口重新获得焦点"触发,headless 永不触发)。把一个约 165 行的编辑器插件 `addons/dsh_echo_bridge` 装进项目后,插件可以**要求运行中的引擎重扫**,"新建脚本 → 引用它的文件报 `Could not find type`"这类**假错会自动消失**。见「引擎桥」 |
+| **引擎桥(新脚本即时可见)** | Godot 只在**扫描文件系统**时注册 `class_name`,而运行中的引擎不会自己重扫(编辑器靠"窗口重新获得焦点"触发,headless 永不触发)。把一个约 165 行的编辑器插件 `addons/dsh_echo_bridge` 装进项目后,插件可以**要求运行中的引擎重扫**,"新建脚本 → 引用它的文件报 `Could not find type`"这类**假错会自动消失**。同一机制也覆盖**内容改动**:你在 DSH 里改过的脚本(如父类方法签名)会在检查前先让引擎重扫,不会再出现"子类仍按旧父类签名报错"。见「引擎桥」 |
+| **改签名即时反映到调用点** | 引擎只对递给它的那个文件作答,所以签名变化弄坏的是**调用者**而不是被改的文件。改动 `.gd` 时插件按 `class_name` 与 `res://` 路径找出引用它的文件,并入同一轮检查(实测 500 文件项目索引一趟 18 ms、平均 5.4 个引用者),「改了函数参数却没有任何反馈」不会再发生 |
 | **GUI(浏览器半)** | 会话头部 **⧆ 图标 + 错误角标**(仅项目会话显示),点击弹**诊断浮层面板**:项目路径 + 引擎模式徽章(`editor attach`/`headless`) + 工具条(刷新/全量重扫/启停引擎)+ 按文件分组的 error/warning 列表,每 3s 自动刷新;另有**设置页("LSP 诊断")**:项目为主卡片 + 全局自动注入开关 + 手动添加引擎 + 智能配置 |
 | **按项目门控** | 只对已知项目生效;会话工作区不在其中就不注入、零打扰 |
 | **项目自动发现** | **只在两个时机各扫一次(不周期轮询)**:①插件启用时扫已有 harness 工作区;②会话进入未扫过的工作区时按需扫。发现结果**持久化在 harness 自带 settings(`lsp-echo` 命名空间,settings.yaml 同款机制),以工作区 id 为键**,工作区删除即由同步自动清理;`projects`/`scan` 可查看/手动触发 |
@@ -35,6 +36,7 @@ plugins/lsp-echo/
 │  ├─ tool.js              lsp_echo 模型工具
 │  ├─ manager.js           调引擎 + per-project 串行诊断快照 writer(keyspace 合并/驱逐)
 │  ├─ watcher.js           项目扩展名参数化 mtime 差量 + 重建保差量 + 新增/删除文件跟踪
+│  ├─ dependents.js        改动脚本的反向引用扫描(class_name 词边界 + res:// 路径字面,含 addons/)
 │  ├─ addon.js             引擎桥 addon 的安装/端口发现/探测(installAddonInto/ensureEditorPluginEnabled/discoverBridgePort)
 │  ├─ registry.js          工作区扫描/判定原语(存储=harness settings 命名空间)
 │  └─ checkers.js          引擎注册表(engine.json: name/marker/extensions/bridge[/rescan/rescanPort/addon])
@@ -112,11 +114,25 @@ node "$env:DSH_HOME\profiles\node_modules\@dsh-user\lsp-echo\checkers\godot-lsp\
 
 ```jsonc
 // checkers/godot-lsp/godot-lsp.config.json
-{ "editorPort": 6005,     // 兜底:设置页没填「编辑器 LSP 端口」时用这个(默认 6005)
-  "attachEditor": true }  // false = 不 attach,始终自起 headless
+{ "editorPort": 6005,           // 兜底:设置页没填「编辑器 LSP 端口」时用这个(默认 6005)
+  "attachEditor": true,         // false = 完全不 attach,始终自起 headless(优先于 attachPolicy)
+  "attachPolicy": "prefer-editor" }  // 编辑器后开时:迁回 attach(默认)/ cold-start 保持先到者
 ```
 
 **智能连接语义**:attach 模式下引擎是你编辑器的客人(`stop`/卸载只 detach,**绝不杀你的编辑器进程**);编辑器关掉后下次检查自动 fallback headless;实测 attach 就绪 0.1s、全量 501 文件 ≈4.7s。
+
+**编辑器后开怎么办(attachPolicy)**:引擎决策在**每次检查前**重做,不是"启动时定终身"。
+`prefer-editor`(默认)= 若发现"我们自己的 headless 在跑、而你的编辑器现在也可连",就**迁回 attach 并停掉我们自己那个 headless**,一个项目只留一个引擎;
+`cold-start` = 谁先起就用谁(适合你同时用 VSCode 的 Godot 插件连编辑器 LSP 的机器——迁回会挤掉它一次,它会自己重连)。
+改法:引擎的 `godot-lsp.config.json` 里设 `"attachPolicy": "cold-start"`(见 `godot-lsp.config.example.json`)。
+迁回只停**我们 spawn 的** headless,你的编辑器进程永远不动。
+
+若编辑器端口可达、但它服务的是**别的项目**,插件会拒绝该端口并记 5 分钟黑名单(见下一条)。
+黑名单到期后会重试一次,因此"编辑器长期开着另一个项目"时,每个周期会重复一次
+"迁回 → 拒绝 → 回退自己的引擎";期间诊断不会出错(拿不到就自起引擎),代价是那一轮要多起一次引擎。
+
+**拒绝"服务别的项目"的编辑器**:编辑器 LSP 服务的是它当前打开的那个项目。若握手后发现它 announce 的项目
+不是本次检查的项目,该端口会被记入黑名单并回退到我们自己的引擎——否则拿到的空诊断会伪装成"0 错误"。
 
 **项目注册数据的持久化**:写入 **harness 自带 settings** 的 `lsp-echo` 命名空间(`settings.yaml` 机制),不新增插件配置文件。结构:
 `discovered`(键=工作区 id;自动发现,工作区删除即被同步清理)+ `manual`(键=项目路径;用户/未来 GUI 配置)。
@@ -173,6 +189,8 @@ addon 在本机 `127.0.0.1` 上监听一个控制端口,把一行 `rescan` 变�
 **触发时机**(全部自动):
 
 - 检测到项目里 **`.gd` 文件新增/删除** → 检查前先让引擎重扫;
+- **本轮有 `.gd` 改动**(内容变了,例如你或在 DSH 里改了父类签名) → 检查前先让引擎重扫。
+  attach 到你的编辑器时它可能仍持编辑前的副本,不重扫就会报出**陈旧签名**;headless 引擎无此问题,重扫对它也无害;
 - 诊断里出现 `Could not find type "X"`,而项目里**确实存在** `class_name X` → 判定为"引擎未刷新",
   重扫后**再检查一次**并采用新结果(真错误不会受影响:名字不存在就不重扫)。
 

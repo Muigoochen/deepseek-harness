@@ -36,7 +36,7 @@ godot-lsp-tooling/
 ├── godot-lsp.config.json          # 本机配置(不拷贝/或拷贝后改)
 ├── godot-lsp.config.example.json  # 换机模板
 ├── README.md
-├── .runtime/                      # 运行时状态(自动生成:host pid/port、诊断 JSON、host 日志)
+├── .runtime/                      # 旧位置:仅作读取兜底(host 状态已迁到 $DSH_HOME/lsp-echo-runtime/godot-lsp/)
 └── reference/
     ├── probe.mjs                  # 最小 LSP 客户端(桥的前身/参考实现)
     └── live-test-evidence.json    # 首次实测记录
@@ -55,7 +55,10 @@ node godot-lsp.mjs host | stop     [--project <dir>] [--godot <exe>]
 - **Godot**:`--godot` > 配置 `godot`/`godotBin` > 环境变量 `GODOT_BIN` > PATH(`godot`/`godot4`)
 - **项目**:`--project` > 配置 `project`/`defaultProject` > 从当前目录向上找 `project.godot`
 - **端口**:每次自动挑空闲端口(不写死)
-- **输出**:默认 `<工具目录>/.runtime/lsp_diagnostics-<项目名>.json`,`--out` 覆盖
+- **输出**:默认 `$DSH_HOME/lsp-echo-runtime/godot-lsp/lsp_diagnostics-<项目名>.json`
+  (`DSH_HOME` 未设时为 `~/.dsh`),`--out` 覆盖
+- **状态**:host/attach 状态与 host 日志放在同一目录(`host-<项目名>.json` / `host-<项目名>.log`),
+  引擎目录内的 `.runtime/` 是迁移前的位置,只作读取兜底
 
 退出码:`0` = 无错误;`1` = 发现错误(供脚本分支);`2` = 用法/配置/运行失败。
 

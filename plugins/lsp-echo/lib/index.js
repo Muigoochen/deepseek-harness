@@ -21,6 +21,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { engines, markers, matchExtension } from './checkers.js'
 import { ensureHost, stopHost, status, checkFiles, runtimeRoot, stopClientd, diagnosticsPath, pruneSnapshot, rescanEngine } from './manager.js'
 import { ADDON_ID, discoverBridgePort, installAddonInto, probeEngineBridge, rescanPortOf } from './addon.js'
+import { dependentsOf } from './dependents.js'
 import { ProjectWatcher, scanFiles } from './watcher.js'
 import { registerTool } from './tool.js'
 import { scanProjectRoots } from './registry.js'
@@ -290,9 +291,23 @@ export function apply(ctx, config) {
   const engineHostWarn = (eng, project) => {
     try {
       const safe = (path.basename(path.resolve(project)) || 'project').replace(/[^A-Za-z0-9._-]/g, '_')
-      const file = path.join(path.dirname(eng.bridge), '.runtime', `host-${safe}.json`)
-      const s = JSON.parse(fs.readFileSync(file, 'utf8'))
-      if (s && s.warn && Array.isArray(s.warn.ports) && s.warn.ports.length && typeof s.warn.at === 'number') return s.warn
+      // The bridge keeps host state under the DSH home, one directory per engine
+      // (runtimeRoot()/<engine>/); the engine-local .runtime/ path is the
+      // pre-move location and stays a read fallback so an upgrade keeps
+      // reporting warnings.
+      for (const file of [
+        path.join(runtimeRoot(), eng.id, `host-${safe}.json`),
+        path.join(path.dirname(eng.bridge), '.runtime', `host-${safe}.json`),
+      ]) {
+        try {
+          const s = JSON.parse(fs.readFileSync(file, 'utf8'))
+          // A record for another project must not resurface: its warning is about
+          // an engine this project never used. Compare the way the bridge does,
+          // since the same project path can differ only in letter case.
+          const same = typeof s.project === 'string' && path.resolve(s.project).toLowerCase() === path.resolve(project).toLowerCase()
+          if (same && s.warn && Array.isArray(s.warn.ports) && s.warn.ports.length && typeof s.warn.at === 'number') return s.warn
+        } catch { /* not this location */ }
+      }
     } catch { /* no host state yet */ }
     return undefined
   }
@@ -307,7 +322,9 @@ export function apply(ctx, config) {
     showToast(
       'warning',
       `${eng.name} 编辑器 LSP 端口异常`,
-      `端口 ${warn.ports.join(', ')} 可连接但不响应 LSP 请求(占用它的进程不是该语言的编辑器 LSP,或编辑器 LSP 已卡死)。已自动改用独立引擎,请检查该端口。`,
+      warn.reason === 'wrong-project'
+        ? `端口 ${warn.ports.join(', ')} 上的语言服务器服务的是别的项目(不是你当前检查的项目),不能用来诊断本项目——否则它返回的空诊断会伪装成"0 错误"。已自动改用独立引擎;把编辑器切回本项目后,该端口会在 5 分钟黑名单到期后重新尝试。`
+        : `端口 ${warn.ports.join(', ')} 可连接但不响应 LSP 请求(占用它的进程不是该语言的编辑器 LSP,或编辑器 LSP 已卡死)。已自动改用独立引擎,请检查该端口。`,
       `lsp-echo-engwarn:${key}`,
       8000,
     )
@@ -387,13 +404,15 @@ export function apply(ctx, config) {
    * @param {{ id: string, name: string, bridge: string, rescan?: boolean, rescanPort?: number }} eng
    * @param {string} project project root
    * @param {string} why short reason, for the trace log only
+   * @param {{ fresh?: boolean }} [opts] fresh=true skips the success interval,
+   *   for a rescan that must land on the round that saw the file change
    * @returns {Promise<boolean>} true when the engine acknowledged the rescan
    */
-  const tryEngineRescan = async (eng, project, why) => {
+  const tryEngineRescan = async (eng, project, why, opts = {}) => {
     if (!eng || !eng.rescan) return false
     const key = `${eng.id}:${project.toLowerCase()}`
     if (Date.now() - (rescanFailedAt.get(key) || 0) < RESCAN_FAIL_COOLDOWN_MS) return false
-    if (Date.now() - (rescanOkAt.get(key) || 0) < RESCAN_OK_INTERVAL_MS) return false
+    if (!opts.fresh && Date.now() - (rescanOkAt.get(key) || 0) < RESCAN_OK_INTERVAL_MS) return false
     // A running engine publishes the port it actually bound; the declared
     // engine default is only the fallback when nothing published one.
     const port = discoverBridgePort(project) ?? rescanPortOf(eng)
@@ -524,7 +543,10 @@ export function apply(ctx, config) {
     const declared = projectClassNames(project)
     const stale = missing.filter((n) => declared.has(n))
     if (!stale.length) return payload
-    if (!(await tryEngineRescan(eng, project, `unknown types: ${stale.join(', ')}`))) return payload
+    // fresh: the pre-check rescan just ran, and its 3 s success interval would
+    // otherwise make this self-heal a no-op exactly when a stale payload is what
+    // needs correcting.
+    if (!(await tryEngineRescan(eng, project, `unknown types: ${stale.join(', ')}`, { fresh: true }))) return payload
     trace('rescan', eng.id, `re-checking ${files.length} file(s) after rescan`)
     try {
       // The post-rescan answer is the better one, but a failing re-check must
@@ -1273,6 +1295,7 @@ export function apply(ctx, config) {
     watcher.tick() // full-tree diff at the step boundary (mode B)
     const structural = watcher.drainStructural()
     const dirty = watcher.drain().filter((f) => fs.existsSync(f)) // drop deleted files (routing would throw)
+    const rescannedThisRound = new Set() // engine ids already rescanned in this round
     // A script created or deleted since the last step may declare a class_name
     // the running engine has not registered yet: refresh rescan-capable engines
     // BEFORE checking, or the first check of a file referencing it reports a
@@ -1282,19 +1305,70 @@ export function apply(ctx, config) {
       const stale = boundEngines.filter((e) => e.rescan && touched.some((f) => matchExtension(e, f)))
       if (stale.length) {
         trace('pre-step', agentId, `structural change (${structural.created.length} created / ${structural.deleted.length} deleted) → engine rescan`)
-        await Promise.all(stale.map((e) => tryEngineRescan(e, rec.path, 'structural change')))
+        await Promise.all(stale.map(async (e) => {
+          if (await tryEngineRescan(e, rec.path, 'structural change')) rescannedThisRound.add(e.id)
+        }))
       }
     }
-    if (!dirty.length) { trace('pre-step', agentId, `${rec.path}: ok, no changed files since last step`); return decision }
-    // Route dirty files to their owning engine by extension.
+    // A pure delete or rename leaves `dirty` empty — the deleted file fails the
+    // existsSync filter below and a rename only records `created` — yet that
+    // round still has work: the callers of the removed script need rechecking.
+    const structuralInScope = boundEngines.some((e) =>
+      [...structural.created, ...structural.deleted].some((f) => matchExtension(e, f)),
+    )
+    if (!dirty.length && !structuralInScope) { trace('pre-step', agentId, `${rec.path}: ok, no changed files since last step`); return decision }
+    // A changed script can break the files that reference it, and the engine
+    // reports only on the file it is given: check the referencing files in the
+    // same round, or a signature change reads as no change at all.
+    let touched = dirty
+    try {
+      const changedGd = dirty.filter((f) => f.toLowerCase().endsWith('.gd'))
+      // Watching skips addons/, but an addon script can reference a project
+      // class, so dependencies are resolved over the same file set the
+      // class_name index uses, addons included.
+      const depSkip = (config.watchSkip || DEFAULT_SKIP).filter((d) => d !== 'addons')
+      const candidates = changedGd.length ? scanFiles(rec.path, depSkip, ['.gd']).keys() : []
+      const dependents = changedGd.length ? dependentsOf(rec.path, changedGd, candidates) : []
+      if (dependents.length) {
+        touched = [...dirty, ...dependents]
+        trace('pre-step', agentId, `+${dependents.length} dependent file(s) of the changed script(s)`)
+      }
+    } catch (error) {
+      trace('pre-step', agentId, `dependent scan failed: ${(error && error.message) || error}`)
+    }
+    // A deleted or renamed script leaves its callers holding an unknown type,
+    // and the gone file cannot be read for the name they used: recheck the
+    // project for that round instead of guessing which files to open.
+    if ((structural.deleted || []).some((f) => f.toLowerCase().endsWith('.gd'))) {
+      try {
+        const all = [...scanFiles(rec.path, config.watchSkip || DEFAULT_SKIP, ['.gd']).keys()]
+        touched = [...new Set([...touched, ...all])]
+        trace('pre-step', agentId, `deleted script → project-wide recheck (${all.length} file(s))`)
+      } catch (error) {
+        trace('pre-step', agentId, `project-wide recheck scan failed: ${(error && error.message) || error}`)
+      }
+    }
+    // Route the files this round checks to their owning engine by extension.
     const byEngine = new Map() // engineId -> [abs files]
     for (const eng of boundEngines) byEngine.set(eng.id, [])
-    for (const f of dirty) {
+    for (const f of touched) {
       const owner = boundEngines.find((eng) => matchExtension(eng, f))
       if (owner) byEngine.get(owner.id).push(f)
     }
     const tasks = []
     const keepExts = boundExtensions(rec)
+    // The engine analyses from its own loaded copies, and an editor reloads a
+    // script edited elsewhere only when its window regains focus. Rescan before
+    // checking, or diagnostics describe the pre-edit file: a parent signature
+    // edited here keeps surfacing as callers reporting the old signature.
+    const contentStale = boundEngines.filter(
+      (e) => e.rescan && !rescannedThisRound.has(e.id) && touched.some((f) => matchExtension(e, f)),
+    )
+    if (contentStale.length) {
+      await Promise.all(
+        contentStale.map((e) => tryEngineRescan(e, rec.path, `${touched.length} changed file(s)`, { fresh: true })),
+      )
+    }
     for (const eng of boundEngines) {
       const files = byEngine.get(eng.id) || []
       if (!files.length) continue
@@ -1313,18 +1387,21 @@ export function apply(ctx, config) {
     let totalErrors = 0
     let checked = 0
     const checkedNames = [] // rel basenames actually verified this round (0-error echo)
+    // The merged snapshot on disk holds every engine's keyspace, so its summary
+    // counts the whole project: count only the files this round asked for, per
+    // engine, so totals and echoes never double-count nor report older results.
+    const roundRel = new Set(touched.map((f) => path.relative(rec.path, f).split(path.sep).join('/')))
     for (const { engineId, eng, payload } of results) {
       // An engine that silently fell back to headless (dead editor LSP port)
       // still "succeeds"; surface its host-state warning once per occurrence.
       if (eng) maybeToastEngineWarn(eng, rec.path)
       if (!payload) continue
-      // The merged snapshot on disk holds every engine's keyspace; count only
-      // this engine's files so totals and echoes never double-count.
       const scope = engineScope(payload, eng ? eng.extensions : undefined)
       const scoped = { files: scope.files, summary: scope.summary }
-      checked += scoped.summary.files_checked || 0
-      totalErrors += scoped.summary.errors || 0
       for (const rel of Object.keys(scoped.files)) {
+        if (!roundRel.has(rel)) continue
+        checked += 1
+        totalErrors += scoped.files[rel].errors || 0
         const base = path.basename(rel)
         if (!checkedNames.includes(base)) checkedNames.push(base)
       }

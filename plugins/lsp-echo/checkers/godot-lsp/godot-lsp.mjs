@@ -17,12 +17,19 @@
 //                        --port <n>       --once         --verbose
 import net from 'node:net';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const TOOLING_DIR = path.dirname(fileURLToPath(import.meta.url));
-const RUNTIME_DIR = path.join(TOOLING_DIR, '.runtime');
+// Host state and snapshots live under the DSH home, beside the files the plugin
+// writes, so every copy of this bridge (repo checkout and profile install) reads
+// one location. LEGACY_RUNTIME_DIR is the engine-local directory used before
+// that move and stays a read fallback, so an upgrade keeps reusing the engine
+// that is already running instead of starting a second one.
+const RUNTIME_DIR = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'lsp-echo-runtime', 'godot-lsp');
+const LEGACY_RUNTIME_DIR = path.join(TOOLING_DIR, '.runtime');
 const CONFIG_PATH = path.join(TOOLING_DIR, 'godot-lsp.config.json');
 const BOOT_TIMEOUT_MS = 150_000;
 const DIAG_TIMEOUT_MS = 25_000;
@@ -238,18 +245,43 @@ function statePaths(project) {
   return {
     name,
     host: path.join(RUNTIME_DIR, `host-${name}.json`),
+    legacyHost: path.join(LEGACY_RUNTIME_DIR, `host-${name}.json`),
     out: path.join(RUNTIME_DIR, `lsp_diagnostics-${name}.json`),
     hostLog: path.join(RUNTIME_DIR, `host-${name}.log`),
   };
 }
 function readHostState(project) {
-  const s = readJsonSafe(statePaths(project).host);
-  return s && s.project && path.resolve(s.project) === path.resolve(project) ? s : undefined;
+  for (const file of [statePaths(project).host, statePaths(project).legacyHost]) {
+    const s = readJsonSafe(file);
+    // Case-insensitive: the same project can reach a check through a differently
+    // cased path, and missing our own record there starts a second engine.
+    if (s && s.project && path.resolve(s.project).toLowerCase() === path.resolve(project).toLowerCase()) return s;
+  }
+  return undefined;
 }
 // mode 'editor' = attached to a user's already-running Godot editor LSP
 // (never own/kill that process). mode 'headless' = engine we spawned.
 const MODE_HEADLESS = 'headless';
 const MODE_EDITOR = 'editor';
+
+// Whether a check moves a project onto the user's editor when that editor comes
+// up after our own engine started. 'prefer-editor' (default) stops our headless
+// engine and attaches to the editor, leaving one engine per project;
+// 'cold-start' keeps whichever engine started first. Attaching opens a new
+// session on a single-session server, so any other client already attached to
+// that editor is evicted by the move.
+function attachPolicy() {
+  const cfg = readJsonSafe(CONFIG_PATH);
+  return cfg && cfg.attachPolicy === 'cold-start' ? 'cold-start' : 'prefer-editor';
+}
+
+// Whether attaching to the editor is allowed at all. `attachEditor:false` means
+// headless only, and it outranks the attach policy: a machine that turned
+// attach off must not be moved onto the editor by a later policy default.
+function attachEditorEnabled() {
+  const cfg = readJsonSafe(CONFIG_PATH);
+  return !(cfg && cfg.attachEditor === false);
+}
 
 // ---------- attach-to-editor probing (smart connection) ----------
 // Returns the TCP port of a running Godot editor LSP, or undefined. Never
@@ -313,8 +345,24 @@ function writeHostState(project, state) {
   const p = statePaths(project).host;
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  // A refusal record outlives the mode it was recorded under: starting our own
+  // engine after refusing a peer replaces the state object, and dropping the
+  // record there would make the next check probe that peer again.
+  const previous = readHostState(project);
+  const carried = {};
+  if (previous) {
+    // A refusal and its warning outlive the mode they were recorded under:
+    // starting our own engine, or moving onto an editor, replaces the state
+    // object, and dropping them there would re-probe a refused port and lose
+    // the user-facing warning. Expiry is decided where they are read.
+    if (state.badEditor === undefined && previous.badEditor) carried.badEditor = previous.badEditor;
+    if (state.warn === undefined && previous.warn) carried.warn = previous.warn;
+  }
+  fs.writeFileSync(tmp, JSON.stringify({ ...state, ...carried }, null, 2), 'utf8');
   try { fs.renameSync(tmp, p); } catch { try { fs.unlinkSync(tmp); } catch { /* best effort */ } }
+  // Retire the pre-move copy: it is only a read fallback, and a stale record
+  // left beside a live one makes `status` answer from the wrong file.
+  try { fs.unlinkSync(statePaths(project).legacyHost); } catch { /* nothing to retire */ }
 }
 
 // Cross-process lock around the headless-host start decision. Two bridge
@@ -380,11 +428,41 @@ async function ensureHost(project, godotBin, flags) {
   // for a while so we do not keep re-selecting a dead/fake peer.
   const badActive = (s) => s && s.badEditor && Date.now() - s.badEditor.at < 5 * 60_000;
 
-  // 0) A live own headless always wins. Re-attaching to the single-session
-  //    editor would kick its active client, so we never trade a working
-  //    headless for an editor attach — editor attach is a cold-start choice.
+  // 0) A live headless we own is normally reused as-is. Under the default
+  //    `prefer-editor` policy, first ask whether the user's editor came up after
+  //    it started: moving onto the editor leaves one engine per project. The
+  //    move runs under the host lock, so two bridge processes cannot both stop
+  //    the engine and attach.
   const st0 = readHostState(project);
   if (await hostAlive(st0) && st0.mode === MODE_HEADLESS) {
+    if (attachEditorEnabled() && attachPolicy() === 'prefer-editor' && !badActive(st0)) {
+      const editorPort = await probeEditorPort(project, flags);
+      if (editorPort !== undefined) {
+        const moveLock = await acquireHostLock(project);
+        if (moveLock === 'host-ready') {
+          // Another process completed the start decision while we waited: follow
+          // the state it wrote instead of moving without holding the lock.
+          const settled = readHostState(project);
+          if (await hostAlive(settled) && !badActive(settled)) {
+            return { pid: settled.pid, port: settled.port, mode: settled.mode, reused: true };
+          }
+        } else {
+          try {
+            const current = readHostState(project);
+            if (await hostAlive(current) && current.mode === MODE_HEADLESS) {
+              moveToEditorAttach(project, current, editorPort);
+              return { pid: 0, port: editorPort, mode: MODE_EDITOR, reused: false };
+            }
+            if (await hostAlive(current) && current.mode === MODE_EDITOR) {
+              log(`reusing editor attach port=${current.port} (project ${project})`);
+              return { pid: current.pid, port: current.port, mode: MODE_EDITOR, reused: true };
+            }
+          } finally {
+            moveLock();
+          }
+        }
+      }
+    }
     log(`reusing own headless pid=${st0.pid} port=${st0.port} (project ${project})`);
     return { pid: st0.pid, port: st0.port, mode: MODE_HEADLESS, reused: true };
   }
@@ -400,7 +478,7 @@ async function ensureHost(project, godotBin, flags) {
   try {
     if (lock === 'host-ready') {
       const live = readHostState(project);
-      if (await hostAlive(live)) {
+      if (await hostAlive(live) && !badActive(live)) {
         log(`reusing host started by another process (mode=${live.mode} port=${live.port})`);
         return { pid: live.pid, port: live.port, mode: live.mode, reused: true };
       }
@@ -419,9 +497,7 @@ async function ensureHost(project, godotBin, flags) {
     // Cold start, no live host: prefer the user's editor when reachable and
     // not blacklisted. Skip entirely when the bridge config sets
     // attachEditor:false (headless-only).
-    const cfg = readJsonSafe(CONFIG_PATH);
-    const attachEditor = cfg && cfg.attachEditor === false ? false : true;
-    const editorPort = attachEditor && !badActive(locked) ? await probeEditorPort(project, flags) : undefined;
+    const editorPort = attachEditorEnabled() && !badActive(locked) ? await probeEditorPort(project, flags) : undefined;
     if (editorPort !== undefined) {
       writeHostState(project, {
         mode: MODE_EDITOR, pid: 0, port: editorPort,
@@ -477,6 +553,25 @@ async function ensureHost(project, godotBin, flags) {
     if (typeof lock === 'function') lock();
   }
 }
+/**
+ * Move a project from our own headless engine onto the user's running editor.
+ * The caller holds the host lock. Stopping our engine first keeps two engines
+ * from serving one project while the new session is established; the editor
+ * process itself is never touched.
+ * @param {string} project project root
+ * @param {{pid?: number}} headless live own-headless state being replaced
+ * @param {number} editorPort editor LSP port that answered
+ */
+function moveToEditorAttach(project, headless, editorPort) {
+  if (headless && headless.pid && headless.pid !== process.pid && isAlive(headless.pid)) killTree(headless.pid);
+  writeHostState(project, {
+    mode: MODE_EDITOR, pid: 0, port: editorPort,
+    project: path.resolve(project), godot: '(user editor)',
+    startedAt: new Date().toISOString(),
+  });
+  log(`moved to the running editor LSP on port ${editorPort}; stopped own headless pid=${headless ? headless.pid : 'none'}`);
+}
+
 function stopHost(project) {
   const st = readHostState(project);
   if (st && st.mode === MODE_EDITOR) {
@@ -502,6 +597,7 @@ class GodotLspClient {
     this.seq = 0;
     this.pending = new Map();
     this.diags = new Map(); // decoded-lower uri -> { gotPublish, list, at }
+    this.servesOtherProject = undefined; // set when the peer announces another project
     this.opened = new Map(); // decoded-lower uri -> { version, abs, uri }
     this.verbose = false;
   }
@@ -556,8 +652,16 @@ class GodotLspClient {
     }
     if (msg.method === 'gdscript_client/changeWorkspace') {
       const got = msg.params && msg.params.path;
-      if (got && path.resolve(got) !== this.project) {
+      // Compare case-insensitively: Godot reports its own normalized form of the
+      // path (drive-letter case and separators differ from what we passed in),
+      // and this comparison now decides whether a peer is refused.
+      if (got && path.resolve(got).toLowerCase() !== this.project.toLowerCase()) {
+        // The editor's LSP serves whichever project that editor has open. A
+        // check sent to the wrong project comes back with empty diagnostics,
+        // which reads as a clean pass, so the session is rejected by the caller
+        // instead of being used.
         errl(`warning: LSP host serves ${got}, expected ${this.project}`);
+        this.servesOtherProject = got;
       }
       return;
     }
@@ -639,12 +743,21 @@ async function attachClient(project, godotBin, flags) {
     try {
       await client.connect();
       await client.handshake(h.mode === MODE_EDITOR ? 8000 : 60_000);
+      // A peer serving another project cannot answer for this one; treat it as
+      // a bad editor (blacklist + fall back to our own engine) rather than
+      // letting its empty diagnostics pass as a clean check.
+      if (client.servesOtherProject) {
+        throw new Error(`LSP host on ${h.port} serves ${client.servesOtherProject}, not ${project}`);
+      }
       return { h, client };
     } catch (e) {
       try { client.sock.destroy(); } catch { /* gone */ }
       if (h.mode !== MODE_EDITOR || attempt > 0) throw e;
       const badPort = h.port;
-      log(`editor LSP on ${badPort} unresponsive (${(e && e.message) || e}); blacklisting and falling back to headless`);
+      // The reason decides the user-facing warning label and whether a retry is
+      // plausibly useful: a wrong-project peer and an unresponsive one differ.
+      const why = /serves .*, not /.test(String((e && e.message) || '')) ? 'wrong-project' : 'editor-lsp-unresponsive';
+      log(`editor LSP on ${badPort} rejected (${(e && e.message) || e}); blacklisting and falling back to headless`);
       writeHostState(project, {
         mode: MODE_EDITOR, pid: 0, port: badPort,
         project: path.resolve(project), godot: '(user editor)',
@@ -656,7 +769,7 @@ async function attachClient(project, godotBin, flags) {
         // Surface the dead editor port to the host (toast) via host-state warn.
         try {
           const s = readHostState(project);
-          if (s) writeHostState(project, { ...s, warn: { ports: [badPort], at: Date.now(), reason: 'editor-lsp-unresponsive' } });
+          if (s) writeHostState(project, { ...s, warn: { ports: [badPort], at: Date.now(), reason: why } });
         } catch { /* best effort */ }
       }
     }
@@ -931,13 +1044,54 @@ async function cmdWatch(project, godotBin, flags, outPath) {
 // Non-JSON console chatter may interleave on stdout; readers must filter by
 // JSON.parse. Exits on stdin EOF / SIGINT / SIGTERM / engine socket close.
 async function cmdClientd(project, godotBin, flags) {
-  const { h, client } = await attachClient(project, godotBin, flags);
+  let { h, client } = await attachClient(project, godotBin, flags);
   const reply = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
   log(`clientd ready (host pid=${h.pid} port=${h.port})`);
 
-  const sock = client.sock;
-  sock.on('close', () => { errl('engine socket closed; exiting'); process.exit(0); });
-  sock.on('error', () => { /* socket errors surface via close */ });
+  const bindSocket = () => {
+    client.sock.on('close', () => { errl('engine socket closed; exiting'); process.exit(0); });
+    client.sock.on('error', () => { /* socket errors surface via close */ });
+  };
+  bindSocket();
+
+  // The engine decision is re-made before every request, not only at startup:
+  // the user's editor can open after this session was established, and the
+  // attach policy then moves the project onto it and stops our headless engine.
+  // A changed endpoint means a new session; the old socket is dropped without
+  // exiting the process, since the reconnect below replaces it.
+  const followEngineDecision = async () => {
+    // `changeWorkspace` can also arrive after the handshake window: refusing the
+    // peer here keeps a wrong-project session from serving requests, and the
+    // record sends the reconnect to our own engine.
+    if (h.mode === MODE_EDITOR && client.servesOtherProject) {
+      const badPort = client.port;
+      log(`peer on ${badPort} serves ${client.servesOtherProject}; refusing it and switching to our own engine`);
+      const s = readHostState(project);
+      writeHostState(project, {
+        mode: MODE_EDITOR, pid: 0, port: badPort,
+        project: path.resolve(project), godot: '(user editor)',
+        badEditor: { port: badPort, at: Date.now() },
+        warn: { ports: [badPort], at: Date.now(), reason: 'wrong-project' },
+        startedAt: (s && s.startedAt) || new Date().toISOString(),
+      });
+      try { client.sock.removeAllListeners(); client.sock.destroy(); } catch { /* gone */ }
+      const fallback = await attachClient(project, godotBin, flags);
+      client = fallback.client;
+      h = fallback.h;
+      bindSocket();
+      log(`clientd reconnected (host pid=${h.pid} port=${h.port})`);
+      return;
+    }
+    const decision = await ensureHost(project, godotBin, flags);
+    if (decision.port === h.port && decision.mode === h.mode) return;
+    log(`engine changed to ${decision.mode} port=${decision.port}; reconnecting`);
+    try { client.sock.removeAllListeners(); client.sock.destroy(); } catch { /* gone */ }
+    const next = await attachClient(project, godotBin, flags);
+    client = next.client;
+    h = next.h;
+    bindSocket();
+    log(`clientd reconnected (host pid=${h.pid} port=${h.port})`);
+  };
 
   // Requests MUST run one at a time: the LSP session is single-connection and
   // collectDiagnostics mutates shared client state (opened/diags). Buffer
@@ -952,6 +1106,8 @@ async function cmdClientd(project, godotBin, flags) {
       try {
         const absFiles = (Array.isArray(item.files) ? item.files : []).filter(Boolean).map((f) => path.resolve(f));
         if (!absFiles.length) throw new Error('clientd: request needs a non-empty files[] array');
+        // Only a request that can be served is worth moving engines for.
+        await followEngineDecision();
         const outPath = statePaths(project).out;
         // sweep=true (full-project baseline): bulk open, no settle tax.
         const { files, errors, warnings } = await collectDiagnostics(client, project, absFiles, { sweep: !!item.sweep });
@@ -1014,7 +1170,13 @@ usage:
 
 discovery: Godot  = --godot > config godotBin > env GODOT_BIN > PATH (godot/godot4)
            project = --project > config defaultProject > walk up from cwd to project.godot
-out file default: <tooling>/.runtime/lsp_diagnostics-<projectName>.json  (--out to override)
+attach:    a running editor on config editorPort is attached instead of starting a
+           headless engine (attachEditor:false disables attaching entirely and
+           outranks the policy below); attachPolicy=prefer-editor (default) also
+           moves a project from our own headless engine onto the editor when it
+           opens later, while attachPolicy=cold-start keeps whichever engine
+           started first
+out file default: <DSH_HOME>/lsp-echo-runtime/godot-lsp/lsp_diagnostics-<projectName>.json  (--out to override)
 exit codes: 0 = no errors, 1 = errors found, 2 = usage/config/runtime failure
 `;
 

@@ -216,8 +216,8 @@ main/baseline(v1)同路径双写竞态(二评补充:v1 真实竞态不止双 cli
 - **驱逐旧键只以 lsp 配置变更为准**(二评③):写入时比较 payload 引擎 id 与 known 当前
   lsp 集合,不在集合才驱逐该引擎键;**绝不以**引擎 host 不在、编辑器关、一次 check 失败
   为准(瞬态不能删最后好结果)。停 host/编辑器关闭只影响下次检查,不动文件。
-- 桥 clientd 那份 `.runtime/` 落盘在 v2 明确**停用或声明为残留**(统一由 host writer 写
-  最终文件)。
+- 桥 clientd 那份落盘(v2 起在 `$DSH_HOME/lsp-echo-runtime/<引擎目录名>/`)是**引擎自有的中间产物**,
+  不参与 keyspace 合并;插件侧的最终文件一律由 host writer(`writeSnapshot`)写出,两条路径互不覆盖。
 - GUI `diagnostics` action 与浮层读单文件,展示按文件/引擎分组,无需改(§9)。
 
 ## 9. UI(设置页,settings.section"LSP 诊断")

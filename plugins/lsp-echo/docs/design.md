@@ -28,9 +28,22 @@
 - **归属判定**:信任模型与官方 VSCode 插件一致——单开场景下编辑器端口即当前项目编辑器;
   我们自己 headless 用随机端口,不会占编辑器端口,故 TCP 可连即视为命中
   (实测:attach 0.1s;`gdscript_client/changeWorkspace`/`capabilities` 握手不稳定,
-  不作为判据)。多编辑器/多项目用户可设 `attachEditor:false` 走纯 headless。
+  **不作命中判据**)。多编辑器/多项目用户可设 `attachEditor:false` 走纯 headless——该开关
+  **优先于** `attachPolicy`:关掉 attach 之后,编辑器后开也不会被迁回。
+- **归属的否定判据(唯一用到 `changeWorkspace` 的地方)**:握手窗口内若对端声明它服务的是**别的项目**,
+  则拒绝该端口、记入 5 分钟黑名单并回退我们自己的引擎——否则它对本项目文件的空诊断会伪装成"0 错误"。
+  这里只把该通知当**否定**证据用:没收到就不拒绝,所以它的不稳定性只会让判定退回旧行为,不会误拒;
+  晚到的通知由 clientd 在每次请求前复查,同样触发拒绝 + 回退。黑名单记录在 host 状态里跨 mode 切换保留
+  (`writeHostState` 沿用 `badEditor`,过期与否由 `badActive` 在使用点判定),因此被拒的端口在有效期内不会被再次探测。
 - **state 记录 `mode`**:`editor`(pid=0,进程属于用户,`stop`/插件卸载**只 detach 不杀**)
   或 `headless`(pid=我们 spawn 的,可停)。编辑器关闭后下次 ensure 自动 fallback headless。
+- **attachPolicy(编辑器后开的处置,2026-09-11 定稿)**:`prefer-editor`(默认)= 若检查时发现
+  「我们自己的 headless 在跑、而编辑器现在也可连」,则**迁回 attach 并停掉自己的 headless**(一个项目
+  只留一个引擎);`cold-start` = 谁先起就用谁(适合同时用 VSCode Godot 插件连编辑器 LSP 的机器)。
+  决策在**每次请求前**重做(host 决策不再只在 clientd 启动时做一次),迁回会新建会话,因此会挤掉
+  此刻连在编辑器 LSP 上的其它客户端;被停的 headless 是我们 spawn 的,可安全停。
+- **拒绝服务别的项目的编辑器**:编辑器 LSP 服务它当前打开的项目;握手后若 announce 的项目不是本次检查的
+  项目,该端口记入黑名单(`badEditor`)并回退到我们自己的引擎——它对本项目文件的空诊断会伪装成"0 错误"。
 - **全量扫描在编辑器上同样快**:attach 模式下 501 文件 sweep ≈ 4.8s(headless 相当)。
   外部 didOpen/didClose 不打开编辑器 UI 标签、不干扰用户正在编辑的缓冲(实测)。
 
@@ -71,6 +84,16 @@
   从 ~60s 降到 ~4.7s);`.gdshader` 引擎不发 LSP 诊断,立即记空结果不空等(带 `engine_note`);
 - **逐 step 变更侦测(Mode B)**:无后台轮询;每个 `pre-step` 对该项目全树 mtime diff,
   只把变更文件推给引擎 → 注入(有错才注入,同文本 3s 节流);
+- **改动脚本的引用者一并检查**:引擎只对递给它的那个文件作答,签名变化弄坏的是调用者,
+  所以 pre-step 解析改动 `.gd` 的 `class_name` 与 `res://` 路径,把被监听文件里提到它们的并入
+  同一轮(候选集与类名索引同口径,含 `addons/`;词边界 + 路径字面匹配;实测约 500 文件的项目
+  一趟 18 ms、平均 5.4 个引用者);**删除或改名** `.gd` 时旧名字已无从读取,那一轮改为对该项目
+  做一次全量复查(罕见事件,约 5 s);
+- **检查前刷新引擎的内容视图(attach 编辑器独有的陈旧)**:编辑器在文件系统扫描时缓存脚本文本,
+  只在窗口重新获得焦点时重扫,因此可能按编辑前的副本作答;本轮有改动文件时先让引擎重扫
+  (实测 138 ms socket 往返,不含桥进程启动)再检查。现象:父类方法已改成 `-> bool`,
+  子类仍报 `Parent signature is "… -> void"`;我们自起的 headless 引擎无此窗口(依赖从磁盘读取,
+  实测"先打开过依赖"与"从未打开"两种变体都立刻反映);
 - 调试观测:`$DSH_HOME/lsp-echo-runtime/lsp-echo-trace.log`(pre-step/session-start/baseline 全记录)。
 
 ## 7. 自动注入与日志
@@ -89,7 +112,8 @@ lsp-echo 带**静态 client 半**(`lib/client.js`,toast/workspace-files 同款:
 
 ### 8.1 数据与控制通道
 
-- **数据**:诊断结果 `$DSH_HOME/lsp-echo-runtime/lsp_diagnostics-*.json`(bridge 原子写);
+- **数据**:诊断结果 `$DSH_HOME/lsp-echo-runtime/lsp_diagnostics-*.json`(插件侧 host writer 原子写,
+  keyspace 合并后落盘);引擎另有一份自有副本在 `lsp-echo-runtime/<引擎目录名>/`,不参与合并、GUI 不读。
   引擎状态经 host API。
 - **控制(host JSON API,`webServer.register` exact `/lsp-echo/api`)**:
   - `?action=projects` → `{ok, projects:[{source,engine,path,autoInject}]}`
@@ -210,6 +234,9 @@ headless 引擎下次启动即生效。
   「编辑器 LSP 端口」**指定(settings `enginePorts`,优先于 config `editorPort`)或
   `attachEditor:false` 关闭;attach 模式下编辑器关闭会自动 fallback headless;
 - 增量改动检查(role=main)保留 per-file settle(级联诊断语义),全量(sweep)才无 settle;
+- **反向依赖的形状**:引用最广的脚本(实测 233 个引用者)一改,就会把 233 个文件拉进当轮检查,
+  该轮 pre-step 明显变长;引用判定刻意过近似(注释里提到类名也算引用),代价是多查一个干净文件,
+  而漏查会让快照停在旧结果上。规模数字取自约 500 个 GDScript 文件的真实项目,随项目增长;
 - `.gdshader` 无 LSP 诊断(引擎不发 publish),结果带 `engine_note` 说明,不报错;
 - **引擎桥**(§11)：未安装 addon 的项目里,运行中新建的 `class_name` 仍会被误报直到引擎重启或
   编辑器窗口获得一次焦点;`.godot/dsh_echo_bridge.json` 是 addon 公布端口的位置(引擎退出时按 pid 自删)。
@@ -217,3 +244,9 @@ headless 引擎下次启动即生效。
   `.godot/dsh_echo_bridge.json` 公布端口(后启动者覆盖),因此重扫请求可能落到其中任意一个。
   两者用的是同一条文件系统扫描,注册结果一致,所以诊断不受影响;但"哪一个实例执行了扫描"不确定,
   且该发布文件不携带实例身份(只有 port/pid),桥无法按身份挑选。
+  默认 `attachPolicy=prefer-editor` 会在下次检查时收敛成一个(迁回编辑器、停掉自己的 headless);
+  只有 `cold-start` 才让两者长期并存。
+- **引擎自有运行时状态的位置**:`$DSH_HOME/lsp-echo-runtime/godot-lsp/`(`host-<项目>.json` /
+  `host-<项目>.log` / 引擎自己写的那份 `lsp_diagnostics-<项目>.json`)。引擎目录内的 `.runtime/` 是
+  迁移前的位置,只作**读取兜底**,新写入一律落到 DSH home(`writeHostState` 会顺手清掉旧副本),
+  因此桥的两份副本(仓库检出 / profile 安装)看到的是同一份状态。
