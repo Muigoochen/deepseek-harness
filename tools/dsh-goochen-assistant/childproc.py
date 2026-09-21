@@ -33,9 +33,29 @@ _JOB: Optional[int] = None
 _JOB_READY = False
 _JOB_LOCK = threading.Lock()
 
-#: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE / JobObjectExtendedLimitInformation
+#: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE / JOB_OBJECT_LIMIT_BREAKAWAY_OK
+#: / JobObjectExtendedLimitInformation
 _KILL_ON_JOB_CLOSE = 0x2000
+_ALLOW_BREAKAWAY = 0x0800
 _EXTENDED_LIMIT = 9
+
+#: 建 Job 时用的限制位：本进程一死就带走全部成员，但**允许**成员显式逃离
+#: （浏览器这类"用户的程序"必须能留在 Job 外，见 `detached_creation_flags`）。
+JOB_LIMIT_FLAGS = _KILL_ON_JOB_CLOSE | _ALLOW_BREAKAWAY
+
+
+def detached_creation_flags() -> int:
+    """启动"不该被关窗带走"的进程（浏览器、系统工具）时用的创建标志。
+
+    Job 是**遗传**的：本助手在 Job 里的进程（例如 `dsh web` 的 node）拉起的浏览器，
+    默认会进同一个 Job——于是用户关掉小助手时，连整台浏览器（以及他别的标签页）一起
+    被杀。允许 breakaway + 显式声明逃离，这类外部程序才能留在 Job 外。
+    返回 0 表示本平台不需要（非 Windows）。
+    """
+    if os.name != "nt":
+        return 0
+    return (int(getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000))
+            | int(getattr(subprocess, "DETACHED_PROCESS", 0x00000008)))
 
 
 def _win_job() -> Optional[int]:
@@ -98,7 +118,7 @@ def _win_job() -> Optional[int]:
             if not handle:
                 return None
             info = _ExtendedLimit()
-            info.BasicLimitInformation.LimitFlags = _KILL_ON_JOB_CLOSE
+            info.BasicLimitInformation.LimitFlags = JOB_LIMIT_FLAGS
             if not kernel32.SetInformationJobObject(
                     handle, _EXTENDED_LIMIT, ctypes.byref(info), ctypes.sizeof(info)):
                 kernel32.CloseHandle(handle)

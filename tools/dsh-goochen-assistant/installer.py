@@ -870,11 +870,38 @@ def open_in_browser(choice: str, custom_exe: str | None, url: str) -> str:
 
 
 def _spawn_browser(exe: str, url: str) -> str:
-    try:
-        subprocess.Popen([exe, url], close_fds=True)
-    except Exception as exc:  # noqa: BLE001
-        return f"失败：{exc}"
-    return f"已用 {Path(exe).name} 打开"
+    """用指定浏览器打开 url——**不进 Job、不被关窗带走**。
+
+    先带 `CREATE_BREAKAWAY_FROM_JOB` 起：本进程若在 Job 里（例如被别的 Job 包着），
+    不带它的话浏览器会继承那个 Job，关窗时连人家别的标签页一起被杀。带 BREAKAWAY
+    在"根本不在任何 Job 里"的环境会直接失败，所以失败后退回普通启动——退不回才是真的
+    打不开页面。
+    """
+    for flags in (childproc.detached_creation_flags(), 0):
+        try:
+            subprocess.Popen([exe, url], close_fds=True, creationflags=flags)
+            return f"已用 {Path(exe).name} 打开"
+        except OSError as exc:
+            if flags == 0:
+                return f"失败：{exc}"
+        except Exception as exc:  # noqa: BLE001
+            return f"失败：{exc}"
+    return "失败：未知错误"
+
+
+def web_command(pnpm: str, project: Path) -> str:
+    """`dsh web` 的启动命令（`.CMD` 必须经 cmd 用 call 执行）。
+
+    **必带 `--no-open`**：`dsh web` 默认自己会去开浏览器（web-app 的 `openBrowser`
+    默认 true），而它跑在我们**登记进 Job 的进程树**里——那个浏览器会继承 Job，于是
+    用户关掉小助手时，连整台浏览器（含他所有标签页）一起被杀。关掉它的自动开页，
+    改由小助手自己开（`_spawn_browser`，会显式 breakaway），行为一样但不牵连用户的浏览器。
+    """
+    cmdline = f'call "{pnpm}" dsh web --no-open'
+    overlay = web_clock_overlay(project)
+    if overlay is not None:
+        cmdline += f' --patch "{overlay}"'
+    return cmdline
 
 
 class InstallError(RuntimeError):
@@ -1171,6 +1198,7 @@ class App(tk.Tk):
         self.web_auth_url: str | None = None
         self.custom_browser: str | None = None
         self._open_pending = False
+        self._auto_opened = False
         self._open_deadline = 0.0
         # --- 插件区（v0.1）状态 ---
         self.plugin_home_dir: Path | None = None
@@ -1934,13 +1962,8 @@ class App(tk.Tk):
         self.web_auth_url = None
         self._update_web_buttons()
         pnpm = find_pnpm() or shutil.which("pnpm.cmd") or "pnpm"
-        # pnpm 是 .CMD 批处理：Windows 上必须让 cmd 用 call 执行脚本。
-        # 用 shell=True + 单字符串原样传给 cmd——若用 list 参数，Python 会
-        # 给整条命令再套一层引号，cmd 的引号规则会把带引号的路径误当命令名。
-        cmdline = f'call "{pnpm}" dsh web'
-        overlay = web_clock_overlay(project)
-        if overlay is not None:
-            cmdline += f' --patch "{overlay}"'
+        self._auto_opened = False         # 本次启动是否已自动开过页面（见 _on_auth_url）
+        cmdline = web_command(pnpm, project)
         try:
             proc = subprocess.Popen(
                 cmdline,
@@ -2020,6 +2043,14 @@ class App(tk.Tk):
         """记录从 dsh web 输出里捕获的登录地址并刷新按钮状态。"""
         self.web_auth_url = url
         self._append("[浏览器] 已捕获登录地址，可『复制登录地址』或『打开登录页』。")
+        # `dsh web` 现在带 --no-open 启动（见 web_command），所以自动开页由我们自己来：
+        # 走 _post 到界面线程（这里本来就在工作线程里），并且用户按过【打开登录页】时跳过，
+        # 免得开两个标签。
+        if not self._open_pending and not self._auto_opened:
+            self._auto_opened = True
+            self._append("[浏览器] 自动打开登录页（你也可以关掉这个标签，"
+                         "或改用界面上的按钮）。")
+            self._post(lambda: self._open_selected_browser(url))
         # 网页真的起来了 = 运行验证通过（未确认过的目录在这一刻被定性）
         if self._unconfirmed_dir is not None:
             project, self._unconfirmed_dir = self._unconfirmed_dir, None
