@@ -152,6 +152,19 @@ def find_node() -> str | None:
     return None
 
 
+def find_npm() -> str | None:
+    """npm 的**全路径**（Windows 上是 `npm.CMD`）。
+
+    不能裸写 `"npm"`：Windows 的 CreateProcess 只给名字补 `.exe`，而 npm/corepack/pnpm
+    都是 `.cmd` 批处理，裸名字一律 `FileNotFoundError`。`shutil.which` 认 PATHEXT，
+    拿到的全路径可以直接调用（实测 `C:\\Program Files\\nodejs\\npm.CMD` rc=0）。
+    """
+    try:
+        return shutil.which("npm")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def find_pnpm() -> str | None:
     try:
         return shutil.which("pnpm")
@@ -203,8 +216,10 @@ def save_config(updates: dict) -> None:
     cfg.update(updates)
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
-                               encoding="utf-8")
+        tmp = CONFIG_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, CONFIG_PATH)     # 原子替换：写到一半断电也不会留下坏配置
     except OSError as exc:
         log_line(f"[配置] 保存失败（本次运行仍生效）：{exc}")
 
@@ -962,16 +977,24 @@ class Engine:
             self.log("③ pnpm 已就绪，跳过安装")
             return None
         self.log("③ 安装 pnpm …")
+        # 这一步只在"机器上还没有 pnpm"时才走到——也就是真正需要它的新机器上。
+        # npm / corepack 在 Windows 上是 .cmd 批处理，裸名字交给 CreateProcess 会
+        # FileNotFoundError（实测），必须先解析出全路径再调用。
+        npm = find_npm()
+        if npm is None:
+            raise InstallError(
+                "找不到 npm，无法安装 pnpm。\n"
+                "请先安装 Node.js（本流程的第 ② 步会自动装），再重试。")
         offline = self.use_offline(PNPM_TGZ_ASSET.exists(), "pnpm 离线包")
-        if offline:
-            proc = run(["npm", "install", "-g", str(PNPM_TGZ_ASSET)])
-        else:
-            proc = run(["npm", "install", "-g", "pnpm@11.7.0"])
+        spec = str(PNPM_TGZ_ASSET) if offline else "pnpm@11.7.0"
+        proc = run([npm, "install", "-g", spec])
         if proc.returncode != 0:
             raise InstallError(f"pnpm 安装失败：\n{decode_proc(proc)}")
-        corepack = run(["corepack", "enable"])
-        if corepack.returncode != 0:
-            self.log("  （corepack enable 未生效，不影响：已有 pnpm 可用）")
+        corepack = shutil.which("corepack")
+        if corepack:
+            done = run([corepack, "enable"])
+            if done.returncode != 0:
+                self.log("  （corepack enable 未生效，不影响：已有 pnpm 可用）")
         self.log("  pnpm 安装完成")
         return find_pnpm()
 

@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _tempguard  # noqa: F401,E402  临时目录统一收口，进程结束整体清理
 import plugin_store as ps  # noqa: E402
 
 
@@ -267,6 +268,24 @@ class MarketTest(unittest.TestCase):
         def fake_err(_a: list[str]) -> tuple[int, str, str]:
             return 1, "", "err"
         self.assertIsNone(ps.bundle_latest_version("dshmarket", run_npm=fake_err))
+
+    def test_latest_version_resolves_npm_path(self) -> None:
+        """Windows 上 npm 是 `.CMD`：裸名字调不起来，必须先 which 出全路径。"""
+        from unittest import mock
+        seen: list[list[str]] = []
+
+        class _Done:
+            returncode, stdout, stderr = 0, "1.44.1\n", ""
+
+        def fake_run(argv, **kw):
+            seen.append(list(argv))
+            return _Done()
+
+        with mock.patch.object(ps.shutil, "which",
+                               lambda n: rf"C:\Program Files\nodejs\{n}.CMD"), \
+                mock.patch.object(ps.childproc, "run", fake_run):
+            self.assertEqual(ps.bundle_latest_version("dshmarket"), "1.44.1")
+        self.assertTrue(seen and seen[0][0].upper().endswith(".CMD"), seen)
 
     def test_update(self) -> None:
         home = make_home()

@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import childproc             # 子进程登记：关窗时把 pnpm/dsh/git 连子孙一起结束
 import io
 import json
 import os
@@ -524,7 +525,7 @@ def _git_runner(run_git: Optional[Callable[[list[str]], tuple[int, str, str]]]):
         if run_git is not None:
             return run_git(args)
         try:
-            proc = subprocess.run(["git"] + args, capture_output=True, text=True)
+            proc = childproc.run(["git"] + args, text=True)
             return proc.returncode, proc.stdout, proc.stderr
         except OSError as exc:
             raise PluginError(f"无法运行 git（是否已安装 Git for Windows？）：{exc}") from exc
@@ -802,9 +803,8 @@ def _real_dump(cmd: Sequence[str], tmp_home: Path, _patch_text: str) -> DumpResu
     env["DSH_HOME"] = str(tmp_home)
     argv = list(cmd) + ["--profile", "web", "--dump-config"]
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace",
-                              env=env, timeout=180)
+        proc = childproc.run(argv, text=True, encoding="utf-8",
+                             env=env, timeout=180)
     except subprocess.TimeoutExpired as exc:
         return DumpResult(ok=False, exit_code=-1,
                           warnings=(f"dump 超时（180s）：{exc}",))
@@ -1671,7 +1671,7 @@ def bundle_fetch(spec: str, dest_dir: Path, *,
         if run_git is not None:
             return run_git(args)
         try:
-            r = subprocess.run(["git"] + args, capture_output=True, text=True)
+            r = childproc.run(["git"] + args, text=True)
             return r.returncode, r.stdout, r.stderr
         except OSError as exc:
             raise PluginError(f"无法运行 git（抓取 {spec}）：{exc}") from exc
@@ -1718,8 +1718,9 @@ def bundle_build(dir_: Path, *,
         if run_pnpm is not None:
             return run_pnpm(args)
         try:
-            r = subprocess.run(args, cwd=str(dir_), shell=(os.name == "nt"),
-                               capture_output=True, text=True)
+            # 走 childproc：pnpm install 可能跑几分钟，关窗时要连子孙一起结束
+            r = childproc.run(args, cwd=str(dir_), shell=(os.name == "nt"),
+                              text=True)
             return r.returncode, r.stdout, r.stderr
         except OSError as exc:
             raise PluginError(f"无法运行 pnpm：{exc}") from exc
@@ -1789,8 +1790,7 @@ def _run_dsh_plugin(args: Sequence[str], *, project: Path,
     cmd = (resolve_dsh_command(project) if not dsh_command else list(dsh_command)) \
         + ["plugin", "--profile", "web"] + list(args)
     try:
-        r = subprocess.run(cmd, cwd=str(project), env=env,
-                           capture_output=True, text=True)
+        r = childproc.run(cmd, cwd=str(project), env=env, text=True)
     except OSError as exc:
         raise PluginError(f"无法运行 dsh plugin：{exc}") from exc
     return r.returncode, r.stdout, r.stderr
@@ -2094,9 +2094,11 @@ def bundle_latest_version(spec: str, *,
     def npm(args: list[str]) -> tuple[int, str, str]:
         if run_npm is not None:
             return run_npm(args)
+        npm_exe = shutil.which("npm")      # Windows 上是 npm.CMD：裸名字调不起来
+        if npm_exe is None:
+            return 127, "", "npm 不可用"
         try:
-            r = subprocess.run(["npm", "view", spec, "version"],
-                               capture_output=True, text=True)
+            r = childproc.run([npm_exe, "view", spec, "version"], text=True)
             return r.returncode, r.stdout, r.stderr
         except OSError:
             return 127, "", "npm 不可用"
@@ -2480,9 +2482,8 @@ def pack_bundle(plan: BundlePlan, *, pnpm: str, timeout: int = 300) -> Path:
     if not plan.out_dir.is_dir():
         raise PluginError(f"暂存目录不存在：{plan.out_dir}")
     try:
-        proc = subprocess.run([pnpm, "pack"], cwd=str(plan.out_dir),
-                              capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout)
+        proc = childproc.run([pnpm, "pack"], cwd=str(plan.out_dir),
+                             text=True, encoding="utf-8", timeout=timeout)
     except subprocess.TimeoutExpired:
         raise PluginError(f"pnpm pack 超时（{timeout} 秒）") from None
     except OSError as exc:

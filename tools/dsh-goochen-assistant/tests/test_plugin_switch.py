@@ -23,6 +23,7 @@ from unittest import mock
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _tempguard  # noqa: F401,E402  临时目录统一收口，进程结束整体清理
 
 import plugin_store as ps  # noqa: E402
 

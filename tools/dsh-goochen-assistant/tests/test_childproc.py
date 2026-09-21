@@ -19,6 +19,7 @@ import time
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _tempguard  # noqa: F401,E402  临时目录统一收口，进程结束整体清理
 
 import childproc  # noqa: E402
 

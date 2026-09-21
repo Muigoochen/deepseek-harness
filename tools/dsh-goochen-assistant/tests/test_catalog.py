@@ -25,6 +25,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _tempguard  # noqa: F401,E402  临时目录统一收口，进程结束整体清理
 
 import installer  # noqa: E402
 import plugin_store as ps  # noqa: E402
@@ -1109,6 +1110,76 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(len(items), len(ps.PLUGIN_REPOS))
         self.assertEqual(names.count(slug), 1)
         self.assertEqual(next(i for i in items if i["name"] == slug)["kind"], "managed")
+
+
+class InstallPnpmTest(unittest.TestCase):
+    """pnpm 缺失时才走到的那条路：npm/corepack 必须用 which 解析出的全路径。
+
+    实测：Windows 上裸名字 `"npm"` 交给 CreateProcess 会 FileNotFoundError（只给名字补
+    `.exe`，而 npm 是 `.CMD`）。这条恰恰**只为新机器存在**（老机器上 pnpm 已就绪会直接
+    跳过），所以一直没被现网发现——修好之前，一台干净机器点「一键完整安装」必炸在这里。
+    """
+
+    def _engine(self) -> installer.Engine:
+        return installer.Engine(mode="online", use_mirror=False, log=lambda _s: None)
+
+    def test_uses_resolved_paths_instead_of_bare_names(self):
+        calls: list[list[str]] = []
+
+        def fake_run(argv, cwd=None, env=None):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with mock.patch.object(installer, "find_pnpm", lambda: None), \
+                mock.patch.object(installer, "find_npm",
+                                  lambda: r"C:\Program Files\nodejs\npm.CMD"), \
+                mock.patch.object(installer.shutil, "which",
+                                  lambda n: rf"C:\Program Files\nodejs\{n}.CMD"), \
+                mock.patch.object(installer, "run", fake_run):
+            self._engine().install_pnpm()
+        self.assertTrue(calls, "pnpm 缺失时必须真的去装")
+        for argv in calls:
+            self.assertNotIn(argv[0], ("npm", "corepack"), f"不能用裸名字：{argv}")
+            self.assertTrue(argv[0].upper().endswith(".CMD") or os.path.isabs(argv[0]),
+                            f"必须是解析出来的全路径：{argv}")
+
+    def test_missing_npm_explains_instead_of_crashing(self):
+        with mock.patch.object(installer, "find_pnpm", lambda: None), \
+                mock.patch.object(installer, "find_npm", lambda: None):
+            with self.assertRaises(installer.InstallError) as ctx:
+                self._engine().install_pnpm()
+        self.assertIn("找不到 npm", str(ctx.exception))
+
+
+class SaveConfigAtomicTest(unittest.TestCase):
+    """配置写盘要原子：中途失败不能把已有的配置毁掉（写的中间断电=空文件）。"""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-cfg-"))
+        self._old = (installer.CONFIG_DIR, installer.CONFIG_PATH)
+        installer.CONFIG_DIR = self.tmp
+        installer.CONFIG_PATH = self.tmp / "config.json"
+        installer.CONFIG_PATH.write_text('{"installDir": "D:\\\\keep"}',
+                                         encoding="utf-8")
+
+    def tearDown(self) -> None:
+        installer.CONFIG_DIR, installer.CONFIG_PATH = self._old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_failed_replace_keeps_the_old_config(self):
+        with mock.patch.object(installer.os, "replace",
+                               side_effect=OSError("disk full")):
+            installer.save_config({"publishScope": "@me"})
+        self.assertEqual(
+            json.loads(installer.CONFIG_PATH.read_text(encoding="utf-8")),
+            {"installDir": "D:\\keep"})
+
+    def test_successful_save_replaces_and_leaves_no_tmp(self):
+        installer.save_config({"publishScope": "@me"})
+        self.assertEqual(
+            json.loads(installer.CONFIG_PATH.read_text(encoding="utf-8")),
+            {"installDir": "D:\\keep", "publishScope": "@me"})
+        self.assertEqual(list(self.tmp.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

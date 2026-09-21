@@ -21,6 +21,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _tempguard  # noqa: F401,E402  临时目录统一收口，进程结束整体清理
 
 import gitinfo as gi  # noqa: E402
 from git_helpers import GIT, add_remote, git, make_repo, write_pkg  # noqa: E402,F401
