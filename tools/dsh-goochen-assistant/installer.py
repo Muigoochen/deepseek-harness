@@ -413,6 +413,23 @@ def is_checkout(path: Path) -> bool:
     return bool(checkout_identity(path))
 
 
+def install_state(project: Path) -> tuple[str, str]:
+    """这个目录还要不要装：返回 ("missing" | "incomplete" | "ready", 给用户看的理由)。
+
+    判据与安装流程**同一套**（`install_deps` 看 `node_modules`、`build` 看 `BUILD_MARK`），
+    这样"界面说已装好"和"点了安装会不会真干活"永远是同一件事——否则就会出现"看着都装好
+    了、点一下却又重装一遍"这种没人想要的惊喜。
+    """
+    if not is_checkout(project):
+        return "missing", "这里还不是 DSH 检出：需要全新安装"
+    missing = [name for name, path in (("node_modules", project / "node_modules"),
+                                       ("构建产物", project / BUILD_MARK))
+               if not path.exists()]
+    if missing:
+        return "incomplete", "缺少 " + "、".join(missing) + "：需要安装"
+    return "ready", "依赖与构建产物都在，无需重复安装"
+
+
 def verify_install_dir(path: Path, info=None) -> ginfo.DshIdentity:
     """确认「这个目录就是装好的 DSH」，返回判定结果（含依据强弱）。
 
@@ -1319,6 +1336,15 @@ class App(tk.Tk):
         btns.pack(fill="x", pady=(6, 0))
         self.btn_full = ttk.Button(btns, text="一键完整安装", command=self.on_full)
         self.btn_full.pack(fill="x", ipady=3)
+        # 装好之后主按钮变灰（一切正常时点它多半是误触，而安装会重装依赖、重新构建、
+        # 还会先停掉正在跑的服务）；重装能力挪到这个明确命名的入口，点它有二次确认。
+        self.btn_repair = ttk.Button(btns, text="修复安装（重新装依赖并重新构建）",
+                                     command=lambda: self.on_full(force=True))
+        self.btn_repair.pack(fill="x", pady=(4, 0))
+        self.install_hint = ttk.Label(left, text="", foreground="#666", justify="left",
+                                      wraplength=WRAP_LEFT)
+        self.install_hint.pack(anchor="w", pady=(4, 0))
+        self._refresh_install_buttons()     # 开场就按"这个目录装好没有"定按钮状态
         brow = ttk.Frame(left)
         brow.pack(fill="x", pady=(4, 0))
         self.btn_term = ttk.Button(brow, text="运行", command=self.on_terminal)
@@ -1525,17 +1551,44 @@ class App(tk.Tk):
         log_line(msg)
         self._append(msg)
 
+    def _refresh_install_buttons(self) -> None:
+        """主安装按钮按「这个目录还要不要装」决定能不能点，理由写在下面那行。
+
+        已经装好（依赖 + 构建产物都在）时把它**变灰**：那种状态下点安装基本是误触，
+        而代价不小（重装依赖、重新构建、先停掉正在跑的服务）。真要重装走【修复安装】。
+        """
+        if getattr(self, "btn_full", None) is None or getattr(self, "btn_repair", None) is None:
+            return                  # 按钮区还没建好：构造前期会先走一次目录回调
+        target = self._effective_dir()
+        state, reason = install_state(target)
+        try:
+            busy = bool(getattr(self, "busy", False)) or self._long_task_running()
+        except AttributeError:      # 构造期间这几个状态字段还没建好
+            busy = False
+        if state == "ready":
+            self.btn_full.configure(state="disabled", text="已装好（无需安装）")
+            self.btn_repair.configure(state="disabled" if busy else "normal")
+            note = f"{reason}。要重装请点【修复安装】。"
+        else:
+            self.btn_full.configure(state="disabled" if busy else "normal",
+                                    text="一键完整安装")
+            self.btn_repair.configure(state="disabled")
+            note = f"{reason}。"
+        try:
+            self.install_hint.configure(text=note)
+        except Exception:  # noqa: BLE001  按钮区还没建好（构造期间）时会走到这里
+            pass
+
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
-        state = "disabled" if busy else "normal"
-        self.btn_full.configure(state=state)
+        self._refresh_install_buttons()     # 忙闲之外还要看"这个目录装好没有"
         for b in getattr(self, "_plugin_btns", ()):
             try:
                 b.configure(state="disabled" if busy or self.plugin_busy else "normal")
             except Exception:  # noqa: BLE001
                 pass
         self._set_git_buttons(not busy)        # 安装期间不许碰 git（同一目录会打架）
-        self.btn_open_page.configure(state=state)
+        self.btn_open_page.configure(state="disabled" if busy else "normal")
         self._update_run_buttons()
 
     def _update_run_buttons(self) -> None:
@@ -1568,11 +1621,19 @@ class App(tk.Tk):
             self.status.configure(text=text, foreground=color)
         self._post(setit)
 
-    def on_full(self) -> None:
+    def on_full(self, force: bool = False) -> None:
+        """一键完整安装；force=True 是【修复安装】那条路（已装好也照做，先二次确认）。"""
         if self.busy or self.git_busy or self.plugin_busy or self.mig_busy:
             # 安装和更新会往同一个 node_modules 里写：必须互斥，否则两个 pnpm 打架
             messagebox.showinfo("有任务在进行",
                                 "正在进行的任务结束之后再开始安装。", parent=self)
+            return
+        # 重装是"明确要求"才做的事：先确认，免得把跑得好好的安装重做一遍（几分钟）
+        if force and not messagebox.askyesno(
+                "重新安装（修复）？",
+                f"目标位置：{self._current_dir()}\n\n"
+                "会重新安装依赖并重新构建（几分钟）；开始前会先停掉正在运行的 dsh web。\n\n"
+                "确定要重做吗？", parent=self, default="no"):
             return
         # 服务正跑着时也能点安装（以前直接放行）：安装会重装依赖、可能重新构建，两边
         # 一起动会撞文件锁；而且安装末尾会自动启动服务，原来那个还在跑就必然 EADDRINUSE。
@@ -1607,7 +1668,7 @@ class App(tk.Tk):
         if retry:
             self._append("[安装位置] 上次安装被中途关窗打断过，这次重新装依赖并重新构建")
         eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
-                     log=self._append, force=retry)
+                     log=self._append, force=retry or force)
         threading.Thread(target=self._job, args=(eng,), daemon=True).start()
 
     def _current_dir(self) -> Path:
@@ -1626,6 +1687,7 @@ class App(tk.Tk):
         后面的「运行 / 自检 / 插件」就全指向另一个目录了（实测过：改一下就启动不起来）。
         """
         self._dir_hint()
+        self._refresh_install_buttons()
 
     def _on_dir_committed(self, _event=None) -> None:
         """回车或点别处 = 位置定下来（生效 + 记住）。
@@ -1654,6 +1716,7 @@ class App(tk.Tk):
         set_active_dir(target)
         set_project_dir(target)
         self._dir_hint()
+        self._refresh_install_buttons()
         self._schedule_git_refresh(400)
 
     @staticmethod
@@ -1698,6 +1761,7 @@ class App(tk.Tk):
         set_active_dir(target)
         set_project_dir(target)
         self._dir_hint()
+        self._refresh_install_buttons()
         self._schedule_git_refresh(400)
         self._status(f"已回到上次使用的位置（{why}）：{target}")
 
