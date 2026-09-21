@@ -67,7 +67,7 @@
 ## 安装 / 卸载
 
 ```powershell
-# 安装（幂等：复制包 + 只追加一次 patch 行；缺 lib/client.js 会直接报错）
+# 安装（幂等：链入 profile + 登记为 bundle；缺 lib/client.js 会直接报错）
 powershell -ExecutionPolicy Bypass -File E:\Deepseek\deepseek_harness\plugins\repeat-stream-guard\install\install.ps1
 
 # 重启 dsh web 后生效（已在跑的实例仍用它的旧 host 行）
@@ -76,11 +76,18 @@ powershell -ExecutionPolicy Bypass -File E:\Deepseek\deepseek_harness\plugins\re
 powershell -ExecutionPolicy Bypass -File E:\Deepseek\deepseek_harness\plugins\repeat-stream-guard\install\uninstall.ps1
 ```
 
-install.ps1 会：
-1. 把包复制到 `$DSH_HOME\profiles\node_modules\@dsh-user\repeat-stream-guard\`；
-2. 在 `$DSH_HOME\profiles\web\cordis.patch.yml` 幂等追加一行 `- id: repeat-stream-guard / name: '@dsh-user/repeat-stream-guard'`（这一行同时带起 Host 半和浏览器半）。
+install.ps1 会（幂等）：
 
-改了 `lib/*.js` 之后要**重跑 install.ps1**（profile 里那份是拷贝），再重启。
+1. 用 DSH 官方方式安装本包 —— `dsh plugin --profile web add <本包路径>`，由它把包链入 profile 并登记为
+   依赖与 bundle。**不再复制文件**：安装后 profile 通过 `link:` 指向本目录；
+2. 自检：导入宿主半，并按浏览器半的规则解析 `lib/client.js`。
+
+本包贡献的配置层在包根的 `cordis.patch.yml`（这一行同时带起 Host 半和浏览器半）；profile 自己那份
+`$DSH_HOME\profiles\web\cordis.patch.yml` 在同 id 上后应用、会覆盖它。改了 `lib/*.js` 无需重跑安装
+（`link:` 指向源码），重启或刷新即可。
+
+`uninstall.ps1` 走 `dsh plugin --profile web remove @dsh-user/repeat-stream-guard`，**不会递归删除**
+profile 的 `node_modules` 目录 —— 那个路径可能是指回本 checkout 的链接，递归删除会连带删掉源码。
 
 ## 验证
 
