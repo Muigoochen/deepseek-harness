@@ -11,8 +11,12 @@
     },
     "./package.json": "./package.json"
   },
+  "dsh": {
+    "role": "engine"
+  },
   "files": [
     "lib",
+    "presets",
     "README.md"
   ],
   "license": "MIT"

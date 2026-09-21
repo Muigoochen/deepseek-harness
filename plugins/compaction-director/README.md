@@ -25,7 +25,7 @@
 
 行 config 支持 `defaultEngine` / `engines`（sessionId→'basic'|'instant'）/ `debug`；其它键（官方引擎遗留键）被静默忽略，避免带配置的 preset 挂载失败。
 
-安装 = 把包放进 `profiles/node_modules/@dsh-user/compaction-director`（本人命名空间）。官方引擎由代码 `import('@deepseek-ai/dsh-compaction-basic')` 直接按名导入——它解析到共享镜像的官方 junction，无需改名副本、不会自递归。
+安装 = `dsh plugin --profile web add <本包路径>`，包链在 `profiles/web/node_modules/@dsh-user/compaction-director`（本人命名空间，是指回本仓库的 junction）。官方引擎由代码 `import('@deepseek-ai/dsh-compaction-basic')` 直接按名导入——它解析到共享镜像的官方 junction，无需改名副本、不会自递归。
 
 > ⚠️ 从 shipped `cordis` 复制预设时，**删掉其中的 `tool-cordis`（@deepseek-ai/dsh-tool-cordis）裸行**再改引擎行。该行把 inspect provider 注册进进程全局 realm，第二个 cordis 系会话（本副本或 shipped cordis）与已在跑的 cordis 会话并存时会撞车：`failed to apply loader entry tool-cordis … inspect provider "Service" is already registered`，并且曾表现为浏览器 `commands/list` 无限刷新的报错风暴。engine 实验不需要动态 cordis 工具；要用 cordis 工具请回 plain `cordis` 预设（同一进程只开一个 cordis 系会话）。
 
@@ -46,6 +46,21 @@
 - 踩坑记录：把 director alias 放到官方名、把官方复制为 `-official` → 启动与结构门双双报错；现场已由 boot 自愈修复（官方名重建 junction），残留备份在 `C:\Users\kelei\.dsh\_spike_backup_20260906\`。
 - 回滚/修复一律走：**删掉 `@deepseek-ai` 下的实体占位 → 重启让 boot 重建 junction**；不要手动 rename/复制回填。
 - 若某天要"顶替官方名"，只能走**受管安装**（`dsh plugin`，由安装器决定 junction/proxy 形态），且与镜像自愈的兼容性需先实测——不作为默认路线。
+
+## 安装 / 卸载
+
+本包**不是 Cordis 插件**，而是 `ctx.compaction` 的一个引擎实现（`export default class DirectorCompactionEngine`）。因此它**不声明 `dsh.bundle`、也不作为 bundle 安装到 profile**：它只作为 preset 压缩组的引擎行生效（见上节）。
+
+```powershell
+# 安装 = 让包可被解析（从仓库根执行，链进 web profile 的 node_modules）
+pnpm dsh plugin --profile web add ./plugins/compaction-director
+```
+
+`add` 把它登记为 profile 的**普通依赖**（不是 bundle），包链在 `profiles\web\node_modules\@dsh-user\compaction-director`（指回本仓库的 junction）。首次把该依赖加进 profile 时，`dsh plugin` 会提示它没有 bundle 声明——这是预期行为（重复 `add` 不再提示）。反过来，若它带上 `dsh.bundle`，profile 启动时会试图把它当插件挂载并因缺少 `apply` 而失败。
+
+要真正启用它，在一个 local preset 的压缩组里把引擎行换成本包（上节 YAML），引擎行为随 `$DSH_HOME/compaction-director.json` 热切换。
+
+卸载：`pnpm dsh plugin --profile web remove @dsh-user/compaction-director`（同时把 preset 里那行改回官方 basic）。
 
 ## 仓库参考文件
 
