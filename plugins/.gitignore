@@ -10,3 +10,9 @@ __pycache__/
 *.pyc
 .dsh/
 tmp/
+
+# 小助手【下载】进来的第三方插件检出（各自带 .git，属于外部仓库，不进本仓库）
+dsh-market/
+dsh-lsp-actions/
+dsh-godot-bridge/
+dsh-compaction-instant/

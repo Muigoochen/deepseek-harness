@@ -1,4 +1,8 @@
 CLAUDE.local.md
+AGENTS.local.md
+/logs/
+/.dsh-ts-probe-tmp.ts
+/临时文件.md
 .env
 node_modules/
 lib/
