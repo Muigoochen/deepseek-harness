@@ -12,8 +12,17 @@
   "dsh": {
     "client": {
       "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
     }
   },
+  "files": [
+    "lib/",
+    "checkers/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
   "description": "Self-contained language-server diagnostics echo for the DeepSeek Harness. Manages bundled checker engines (Godot LSP first) and auto-injects compile diagnostics into agent context after file edits. No npm dependencies; @deepseek-ai/* services resolve from the profile node_modules at load time.",
   "license": "UNLICENSED"
 }

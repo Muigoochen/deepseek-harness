@@ -1,6 +1,14 @@
-# install.ps1 — install the lsp-echo plugin into the DSH user profile.
-# Idempotent: copies the package, generates a machine-local bridge config when
-# missing, and appends the cordis.patch.yml row exactly once.
+# install.ps1 — install lsp-echo into a DSH profile the supported way.
+#
+# Installation is `dsh plugin --profile <name> add <package>`, which links the
+# package into the profile and records it as a bundle, so the profile owns the
+# dependency and the plugin's cordis.patch.yml supplies its row. This script does
+# not copy files and does not remove the package directory: a link writes nothing
+# into the checkout, so the only machine-local state left to manage is the
+# engine config and the optional project list.
+#
+# Idempotent: `add` on an already-linked package is a no-op, the machine config is
+# created only when missing, and the profile patch row is appended exactly once.
 #
 # Examples:
 #   powershell -ExecutionPolicy Bypass -File install.ps1
@@ -8,6 +16,7 @@
 param(
   [string]$PluginSource = (Join-Path $PSScriptRoot '..'),            # plugins/lsp-echo
   [string]$ProfileRoot   = '',                                       # defaults to $env:DSH_HOME or ~\.dsh
+  [string]$ProfileName   = 'web',
   [string]$GodotBin      = '',
   [string]$Project       = ''
 )
@@ -24,57 +33,69 @@ function Write-TextNoBom([string]$Path, [string]$Text) {
 if (-not $ProfileRoot) {
   if ($env:DSH_HOME) { $ProfileRoot = $env:DSH_HOME } else { $ProfileRoot = Join-Path $HOME '.dsh' }
 }
-$patchFile = Join-Path $ProfileRoot 'profiles\web\cordis.patch.yml'
-if (-not (Test-Path $patchFile)) { throw "profile patch not found: $patchFile (expected DSH_HOME layout profiles\web\cordis.patch.yml)" }
-$dest = Join-Path $ProfileRoot 'profiles\node_modules\@dsh-user\lsp-echo'
-$engineDir = Join-Path $dest 'checkers\godot-lsp'
+$PluginSource = (Resolve-Path $PluginSource).Path
+$profileDir = Join-Path $ProfileRoot "profiles\$ProfileName"
+$patchFile = Join-Path $profileDir 'cordis.patch.yml'
+if (-not (Test-Path $patchFile)) { throw "profile patch not found: $patchFile (expected a DSH_HOME layout; is '$ProfileName' the right profile?)" }
+$dest = Join-Path $ProfileRoot "profiles\node_modules\@dsh-user\lsp-echo"
+
+# Machine config is shared by every profile and must not live inside the package:
+# the install is a link to this checkout, so writing there would put this
+# machine's absolute paths into the repository.
+$configDir = Join-Path $ProfileRoot 'lsp-echo'
+$machineConfig = Join-Path $configDir 'godot-lsp.config.json'
+$legacyConfig = Join-Path $PluginSource 'checkers\godot-lsp\godot-lsp.config.json'
 
 Write-Host "source : $PluginSource"
-Write-Host "target : $dest"
+Write-Host "profile: $profileDir"
 
-# ---------- 1. copy the package (skip machine/runtime artifacts) ----------
-# The machine config lives inside $dest, so keep its content across the wipe:
-# reinstalling must not silently drop a hand-edited editorPort/attachEditor or
-# the godotBin this machine was set up with.
-$machineConfig = Join-Path $dest 'checkers\godot-lsp\godot-lsp.config.json'
-$previousConfig = ''
+# ---------- 1. link the package into the profile ----------
+# `dsh plugin` forwards to pnpm inside the profile directory, then reconciles the
+# profile's bundle list against what is installed. It must run from the checkout
+# root so the launcher resolves; a relative spec would otherwise be anchored to
+# whatever directory the caller happened to be in.
+$RepoRoot = (Resolve-Path (Join-Path $PluginSource '..\..')).Path
+$pnpm = (Get-Command pnpm -ErrorAction SilentlyContinue)
+if (-not $pnpm) { throw 'pnpm is not on PATH; `dsh plugin` needs it to link the package into the profile' }
+$pnpmExe = $pnpm.Source
+if ($pnpmExe -like '*.ps1') {
+  # Invoking the .ps1 shim fails under the default execution policy on Windows.
+  $cmd = [System.IO.Path]::ChangeExtension($pnpmExe, '.cmd')
+  if (Test-Path $cmd) { $pnpmExe = $cmd }
+}
+Push-Location $RepoRoot
+# pnpm echoes the command it runs to stderr, which PowerShell turns into an error
+# record; with $ErrorActionPreference = 'Stop' that would abort a run that actually
+# succeeded. Capture the exit code instead and judge by it.
+$prevAddEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+  $addOut = (& $pnpmExe dsh plugin --profile $ProfileName add $PluginSource 2>&1 | Out-String)
+  $addExit = $LASTEXITCODE
+} finally {
+  Pop-Location
+  $ErrorActionPreference = $prevAddEap
+}
+if ($addExit -ne 0) {
+  Write-Host ''
+  Write-Host 'dsh plugin add FAILED:' -ForegroundColor Red
+  Write-Host $addOut
+  exit 1
+}
+Write-Host 'package linked into the profile'
+
+# ---------- 2. machine-local engine config (only when missing) ----------
 # Read and write UTF-8 explicitly: Get-Content's default encoding under
 # PowerShell 5.1 is the ANSI code page, so a config holding any non-ASCII path
 # would come back re-encoded and be written out corrupted.
-if (Test-Path $machineConfig) { $previousConfig = [System.IO.File]::ReadAllText($machineConfig) }
-if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $dest | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $dest 'lib') | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $dest 'checkers') | Out-Null
-Copy-Item (Join-Path $PluginSource 'package.json') (Join-Path $dest 'package.json') -Force
-Copy-Item (Join-Path $PluginSource 'README.md') (Join-Path $dest 'README.md') -Force
-Copy-Item (Join-Path $PluginSource 'lib\*.js') (Join-Path $dest 'lib\') -Force
-# One JSON dictionary per language sits beside the host half; the browser fetches
-# them through the API, and `lib\*.js` alone would leave them out of the install.
-if (Test-Path (Join-Path $PluginSource 'lib\locales')) {
-  Copy-Item (Join-Path $PluginSource 'lib\locales') (Join-Path $dest 'lib\locales') -Recurse -Force
+$existing = ''
+if (Test-Path $machineConfig) { $existing = [System.IO.File]::ReadAllText($machineConfig) }
+elseif (Test-Path $legacyConfig) { $existing = [System.IO.File]::ReadAllText($legacyConfig) }
+if ($existing) {
+  New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+  Write-TextNoBom -Path $machineConfig -Text $existing
+  Write-Host "kept existing engine config: $machineConfig"
 } else {
-  Write-Warning "locale dictionaries missing from source: $(Join-Path $PluginSource 'lib\locales')"
-}
-# Every bundled engine, discovered rather than named. A fixed engine id here
-# silently omitted engines added later: a project could bind one (its config comes
-# from elsewhere) while the plugin never shipped it, leaving a chip with no
-# extensions, no diagnostics, and no clue why.
-$checkersSource = Join-Path $PluginSource 'checkers'
-$engineNames = @()
-foreach ($d in (Get-ChildItem $checkersSource -Directory -ErrorAction SilentlyContinue)) {
-  if (-not (Test-Path (Join-Path $d.FullName 'engine.json'))) { continue }
-  Copy-Item $d.FullName (Join-Path (Join-Path $dest 'checkers') $d.Name) -Recurse -Force
-  $engineNames += $d.Name
-}
-if (-not $engineNames.Count) { throw "no engine found under $checkersSource (each engine needs engine.json)" }
-Write-Host ("installed engines: " + ($engineNames -join ', '))
-
-# ---------- 2. machine-local bridge config (only when missing) ----------
-if ($previousConfig) {
-  Write-TextNoBom -Path $machineConfig -Text $previousConfig
-  Write-Host "restored existing machine config: $machineConfig"
-} elseif (-not (Test-Path $machineConfig)) {
   if (-not $GodotBin) {
     try { $GodotBin = (Get-Command godot -ErrorAction Stop).Source } catch { $GodotBin = '' }
   }
@@ -88,6 +109,7 @@ if ($previousConfig) {
       try { $Project = ([System.IO.File]::ReadAllText($localDev) | ConvertFrom-Json).defaultProject } catch { $Project = '' }
     }
   }
+  New-Item -ItemType Directory -Force -Path $configDir | Out-Null
   $cfg = @{
     godotBin       = $GodotBin
     defaultProject = $Project
@@ -95,26 +117,28 @@ if ($previousConfig) {
     out            = ''
   } | ConvertTo-Json
   Write-TextNoBom -Path $machineConfig -Text $cfg
-  Write-Host "wrote machine config: $machineConfig"
-} else {
-  Write-Host "kept existing machine config: $machineConfig"
+  Write-Host "wrote engine config: $machineConfig"
 }
 
-# ---------- 3. cordis.patch.yml row (append exactly once) ----------
+# ---------- 3. optional project list in the profile patch ----------
+# The bundle ships the row without projects, because which projects a machine
+# checks is local to that machine. A row with the same id here is applied after
+# every bundle layer and wins, so it is where extra or pinned paths belong.
 $needle = 'name: ''@dsh-user/lsp-echo'''
 # ReadAllText, not Get-Content -Raw: 5.1's default ANSI decoding would re-encode
 # any non-ASCII path in this file when it is written back below.
 $content = [System.IO.File]::ReadAllText($patchFile)
 if ($content -match [regex]::Escape($needle)) {
-  Write-Host "patch row already present: $patchFile"
+  Write-Host "profile patch already carries the lsp-echo row: $patchFile"
+} elseif (-not $Project) {
+  Write-Host 'no project path given; the bundle row is used as-is (projects are discovered from the workspace)'
 } else {
   # Without a project path the row must not carry a `projects:` list: an empty
   # `path: ''` passes the plugin's schema, is dropped while seeding, and leaves
   # the plugin running with zero projects — a silent no-op install.
-  $row = if ($Project) {
-    # A single quote inside the path would close the YAML scalar early.
-    $quoted = $Project.Replace("'", "''")
-    @"
+  # A single quote inside the path would close the YAML scalar early.
+  $quoted = $Project.Replace("'", "''")
+  $row = @"
 - insert:
     - id: lsp-echo
       name: '@dsh-user/lsp-echo'
@@ -122,17 +146,9 @@ if ($content -match [regex]::Escape($needle)) {
         projects:
           - path: '${quoted}'
 "@
-  } else {
-    Write-Warning "no project path given (pass -Project, or set defaultProject in godot-lsp.config.local-dev.json); writing the lsp-echo row with no projects list"
-    @"
-- insert:
-    - id: lsp-echo
-      name: '@dsh-user/lsp-echo'
-"@
-  }
   $content = $content.TrimEnd() + "`r`n" + $row + "`r`n"
   Write-TextNoBom -Path $patchFile -Text $content
-  Write-Host "appended lsp-echo row to: $patchFile"
+  Write-Host "appended the lsp-echo row to: $patchFile"
 }
 
 # ---------- 4. load check ----------
@@ -183,6 +199,7 @@ $clientSyntax = (& node --check $clientCjs 2>&1 | Out-String)
 $clientExit = $LASTEXITCODE
 Remove-Item $clientCjs -Force -ErrorAction SilentlyContinue
 if ($clientExit -ne 0) { $checks += "client.js is not valid as a browser half (it is handed to the page as-is, so it may only require the platform seed; no import/export, no top-level await):`n$clientSyntax" }
+
 # The dictionary check runs from a file: PowerShell strips the double quotes in a
 # single-quoted `node -e '...'` argument before the child sees it, so an inline
 # script arrives mangled ("import fs from node:fs") and fails for the wrong reason.
@@ -282,12 +299,13 @@ Remove-Item $keyCheckScript -Force -ErrorAction SilentlyContinue
 $ErrorActionPreference = $prevEap
 if ($keyExit -ne 0) {
   Write-Host ''
-  Write-Host 'i18n key check FAILED - do NOT restart dsh web until this is fixed:' -ForegroundColor Red
+  Write-Host 'i18n key check FAILED - the GUI would show raw keys:' -ForegroundColor Red
   Write-Host $keyCheck
   exit 1
 }
-Write-Host ("i18n keys OK (" + $keyCheck.Trim() + ")")
+Write-Host ("i18n keys OK (" + ($keyCheck.Trim() -split "`n" | Select-Object -First 1) + ")")
+$unusedLine = ($keyCheck -split "`n" | Where-Object { $_ -match '^UNUSED' })
+if ($unusedLine) { Write-Warning $unusedLine.Trim() }
 
 Write-Host ''
 Write-Host 'installed. Restart `dsh web` to activate (a running instance keeps its host rows).'
-Write-Host "verify later with: node `"$dest`/checkers/godot-lsp/godot-lsp.mjs`" smoke <projectFile>"

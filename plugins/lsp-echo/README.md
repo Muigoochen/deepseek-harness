@@ -49,15 +49,17 @@ plugins/lsp-echo/
 │     ├─ README.md         桥自身文档(自检/换机)
 │     └─ reference/        实测证据与探针
 └─ install/
-   ├─ install.ps1          复制到 profile + 生成机器配置 + patch 加行(幂等)
+   ├─ install.ps1          用 `dsh plugin` 装进 profile + 生成机器配置(幂等)
    ├─ uninstall.ps1        逆操作
    └─ patch.example.yml    cordis.patch.yml 行示例
 ```
 
+包根还有 `cordis.patch.yml` —— 本包作为 bundle 贡献给 profile 的配置层(见「安装」)。
+
 ## 安装(每台机器一次)
 
 ```powershell
-# 仓库内(无需网络/依赖,拷贝即用)
+# 需要 pnpm 在 PATH 上:`dsh plugin` 会转发给它
 powershell -ExecutionPolicy Bypass -File E:\Deepseek\deepseek_harness\plugins\lsp-echo\install\install.ps1 `
   -GodotBin "E:\Godot Engine\Godot_v4.7-stable_mono_win64\Godot_v4.7-stable_mono_win64_console.exe" `
   -Project "E:\GodotProject\xu_world"
@@ -67,10 +69,18 @@ powershell -ExecutionPolicy Bypass -File E:\Deepseek\deepseek_harness\plugins\ls
 powershell -ExecutionPolicy Bypass -File ...\install\uninstall.ps1
 ```
 
-install.ps1 会:
-1. 把整个插件包复制到 `$DSH_HOME\profiles\node_modules\@dsh-user\lsp-echo\`(**含 checkers 引擎**);
-2. 若引擎缺机器配置,自动探测/生成 `checkers\godot-lsp\godot-lsp.config.json`(可省略,桥会走 PATH 或 `--godot`);
-3. 在 `profiles\web\cordis.patch.yml` 幂等追加 `lsp-echo` 行(可卸载)。
+install.ps1 会(幂等):
+1. 用 DSH 官方方式安装本包 —— `dsh plugin --profile web add <本包路径>`,在
+   `profiles\node_modules\@dsh-user\lsp-echo` 建立**指回本仓库的 junction**,并把它登记进该 profile 的
+   bundle 列表(层顺序由 `dsh.profile.bundles` 决定);
+2. 若缺引擎机器配置,自动探测并写入 `$DSH_HOME\lsp-echo\godot-lsp.config.json`
+   (机器本地状态一律落在 `$DSH_HOME`,**不写进仓库**;可省略,桥会走 PATH 或 `--godot`);
+3. 若给了 `-Project`,`profiles\web\cordis.patch.yml` 幂等追加带 `projects` 的 `lsp-echo` 行
+   (同 id 的行在 bundle 层之后应用并胜出,所以机器本地项目列表写这里);
+4. 跑安装自检(见「安装自检」)。
+
+装的是 **junction**,所以改源码立即生效,重装不再是必需步骤。卸载:
+`dsh plugin --profile web remove @dsh-user/lsp-echo`,或用 `install\uninstall.ps1`。
 
 **依赖**:需与 `plugins/toast`(@dsh-user/toast)同装——本插件的浮窗提示(就绪 / 自动发现 / 首次全量诊断
 进度与结果)经 `ctx.toast` 发出;`inject` 已声明 `toast`,未装 toast 时插件会等待而不激活。
@@ -110,10 +120,10 @@ node "$env:DSH_HOME\profiles\node_modules\@dsh-user\lsp-echo\checkers\godot-lsp\
 `lsp-echo` 命名空间**(manual 层),与装载行 config 种子叠加(config → discovered → manual
 优先级)。
 
-引擎自身的 Godot exe / 默认项目等**机器配置**在引擎自己的 `godot-lsp.config.json`(由安装脚本生成),与插件配置分离。**编辑器 LSP 端口**建议在**设置页 → LSP 诊断 → 引擎(LSP)卡**直接填(存入 harness settings `enginePorts`,attach 时优先于此 config),config 仅作兜底:
+引擎自身的 Godot exe / 默认项目等**机器配置**位于 `$DSH_HOME\lsp-echo\godot-lsp.config.json`(由安装脚本生成),与插件配置分离。旧位置 `checkers\godot-lsp\godot-lsp.config.json` 仍作**读取兜底**,但不要再往那里写:装成 junction 后那就是本仓库,写进去等于把本机路径提交上去。**编辑器 LSP 端口**建议在**设置页 → LSP 诊断 → 引擎(LSP)卡**直接填(存入 harness settings `enginePorts`,attach 时优先于此 config),config 仅作兜底:
 
 ```jsonc
-// checkers/godot-lsp/godot-lsp.config.json
+// $DSH_HOME/lsp-echo/godot-lsp.config.json
 { "editorPort": 6005,           // 兜底:设置页没填「编辑器 LSP 端口」时用这个(默认 6005)
   "attachEditor": true,         // false = 完全不 attach,始终自起 headless(优先于 attachPolicy)
   "attachPolicy": "prefer-editor" }  // 编辑器后开时:迁回 attach(默认)/ cold-start 保持先到者

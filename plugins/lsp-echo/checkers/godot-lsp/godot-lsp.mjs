@@ -28,11 +28,23 @@ const TOOLING_DIR = path.dirname(fileURLToPath(import.meta.url));
 // one location. LEGACY_RUNTIME_DIR is the engine-local directory used before
 // that move and stays a read fallback, so an upgrade keeps reusing the engine
 // that is already running instead of starting a second one.
-const RUNTIME_DIR = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'lsp-echo-runtime', 'godot-lsp');
+const HOME_DIR = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+const RUNTIME_DIR = path.join(HOME_DIR, 'lsp-echo-runtime', 'godot-lsp');
 const LEGACY_RUNTIME_DIR = path.join(TOOLING_DIR, '.runtime');
-const CONFIG_PATH = path.join(TOOLING_DIR, 'godot-lsp.config.json');
+// Machine config (godotBin, defaultProject) is machine-local, so it lives under
+// the DSH home as well. It used to sit inside the engine directory, which breaks
+// once a profile installs this package as a link to the checkout: the installer
+// would write this machine's absolute paths into the repository. The old
+// location stays a read fallback so an existing config keeps working.
+const CONFIG_PATH = path.join(HOME_DIR, 'lsp-echo', 'godot-lsp.config.json');
+const LEGACY_CONFIG_PATH = path.join(TOOLING_DIR, 'godot-lsp.config.json');
 const BOOT_TIMEOUT_MS = 150_000;
 const DIAG_TIMEOUT_MS = 25_000;
+
+/** Machine config, preferring the DSH home location over the legacy in-package one. */
+function machineConfig() {
+  return readJsonSafe(CONFIG_PATH) || readJsonSafe(LEGACY_CONFIG_PATH) || {};
+}
 
 // ---------- tiny helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -80,7 +92,7 @@ function parseArgs(argv) {
 }
 function configEntry(flags, key, envVar, aliases = []) {
   if (flags[key] !== undefined && flags[key] !== true && flags[key] !== '') return flags[key];
-  const cfg = readJsonSafe(CONFIG_PATH);
+  const cfg = machineConfig();
   if (cfg) {
     for (const k of [key, ...aliases]) {
       if (cfg[k] !== undefined && cfg[k] !== '') return cfg[k];
@@ -96,7 +108,7 @@ function findProject(flags, extraHint) {
     if (fs.existsSync(path.join(abs, 'project.godot'))) return abs;
     throw new Error(`project not found or missing project.godot: ${abs}`);
   }
-  const cfg = readJsonSafe(CONFIG_PATH);
+  const cfg = machineConfig();
   const hint = (extraHint || (cfg && cfg.defaultProject) || process.cwd());
   let dir = path.resolve(hint);
   for (;;) {
@@ -346,7 +358,7 @@ const MODE_EDITOR = 'editor';
 // session on a single-session server, so any other client already attached to
 // that editor is evicted by the move.
 function attachPolicy() {
-  const cfg = readJsonSafe(CONFIG_PATH);
+  const cfg = machineConfig();
   return cfg && cfg.attachPolicy === 'cold-start' ? 'cold-start' : 'prefer-editor';
 }
 
@@ -354,7 +366,7 @@ function attachPolicy() {
 // headless only, and it outranks the attach policy: a machine that turned
 // attach off must not be moved onto the editor by a later policy default.
 function attachEditorEnabled() {
-  const cfg = readJsonSafe(CONFIG_PATH);
+  const cfg = machineConfig();
   return !(cfg && cfg.attachEditor === false);
 }
 
@@ -385,7 +397,7 @@ function editorProbePorts(flags) {
     if (n > 0) return [n];
   }
   // 2) bridge config file (machine-level default when no GUI override is set)
-  const cfg = readJsonSafe(CONFIG_PATH);
+  const cfg = machineConfig();
   if (cfg) {
     if (typeof cfg.editorPort === 'number' && cfg.editorPort > 0) return [cfg.editorPort];
     if (Array.isArray(cfg.editorPorts) && cfg.editorPorts.length) return cfg.editorPorts;
@@ -1056,7 +1068,7 @@ function collectGdFiles(root, skipDirs) {
   return out;
 }
 async function cmdWatch(project, godotBin, flags, outPath) {
-  const cfg = readJsonSafe(CONFIG_PATH) || {};
+  const cfg = machineConfig();
   const skipDirs = cfg.watchSkip || ['.godot', 'addons'];
   const { h, client } = await attachClient(project, godotBin, flags);
   const scan = () => {

@@ -16,12 +16,20 @@
 //     source, code, line, column, file }] } — same shape as the godot bridge.
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const TOOLING_DIR = path.dirname(fileURLToPath(import.meta.url))
+const HOME_DIR = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 
-const CONFIG_PATH = path.join(TOOLING_DIR, 'typescript.config.json')
+// Machine config (tsServer) is machine-local, so it lives under the DSH home. It
+// used to sit inside the engine directory, which breaks once a profile installs
+// this package as a link to the checkout: the installer would write this
+// machine's absolute paths into the repository. The old location stays a read
+// fallback so an existing config keeps working.
+const CONFIG_PATH = path.join(HOME_DIR, 'lsp-echo', 'typescript.config.json')
+const LEGACY_CONFIG_PATH = path.join(TOOLING_DIR, 'typescript.config.json')
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const log = (...a) => console.log('[ts-lsp]', ...a)
@@ -69,7 +77,7 @@ function relOf(project, abs) {
 
 // ---------- tsserver resolution ----------
 function machineConfig() {
-  return readJsonSafe(CONFIG_PATH) || {}
+  return readJsonSafe(CONFIG_PATH) || readJsonSafe(LEGACY_CONFIG_PATH) || {}
 }
 function resolveTsserver(flags, project) {
   if (flags['ts-server']) {

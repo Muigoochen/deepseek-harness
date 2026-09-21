@@ -1,0 +1,18 @@
+# The layer this bundle contributes: a single plugin row.
+#
+# `projects` is deliberately absent. Which projects a machine checks is local to
+# that machine, so the bundle ships no project list and the plugin discovers the
+# projects of the workspace it runs in. A user who needs to pin extra paths — or
+# override any other key — writes their own row in
+# $DSH_HOME/profiles/<name>/cordis.patch.yml, which is applied after every
+# bundle layer and wins by row.
+#
+# Keys here must exist in the plugin's Config schema; that schema also supplies
+# the same defaults, so this row only states them explicitly for a reader.
+- insert:
+    - id: lsp-echo
+      name: '@dsh-user/lsp-echo'
+      config:
+        autoDiscover: true
+        autoInject: true
+        autoBaseline: true
