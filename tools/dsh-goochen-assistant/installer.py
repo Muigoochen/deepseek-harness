@@ -1344,6 +1344,7 @@ class App(tk.Tk):
         self.install_hint = ttk.Label(left, text="", foreground="#666", justify="left",
                                       wraplength=WRAP_LEFT)
         self.install_hint.pack(anchor="w", pady=(4, 0))
+        self._wrap_labels.append(self.install_hint)
         self._refresh_install_buttons()     # 开场就按"这个目录装好没有"定按钮状态
         brow = ttk.Frame(left)
         brow.pack(fill="x", pady=(4, 0))
@@ -1559,7 +1560,10 @@ class App(tk.Tk):
         """
         if getattr(self, "btn_full", None) is None or getattr(self, "btn_repair", None) is None:
             return                  # 按钮区还没建好：构造前期会先走一次目录回调
-        target = self._effective_dir()
+        # 用**生效位置**（`project_dir()`）而不是输入框里的半成品：位置本来就只在回车/
+        # 失焦后才切换，按钮状态跟着它才一致；也避免逐字输入时反复去扫目录（判定 DSH 身份
+        # 在"别的 pnpm 单仓"这条路上要读几十个 package.json）。
+        target = project_dir()
         state, reason = install_state(target)
         try:
             busy = bool(getattr(self, "busy", False)) or self._long_task_running()
@@ -1687,7 +1691,6 @@ class App(tk.Tk):
         后面的「运行 / 自检 / 插件」就全指向另一个目录了（实测过：改一下就启动不起来）。
         """
         self._dir_hint()
-        self._refresh_install_buttons()
 
     def _on_dir_committed(self, _event=None) -> None:
         """回车或点别处 = 位置定下来（生效 + 记住）。
@@ -2026,11 +2029,20 @@ class App(tk.Tk):
         以前这里无条件调 `_launch_web()`：服务若一直在跑，就会起第二个 → EADDRINUSE，
         提示还写着"网页服务正在启动"，把人往错方向带。
         """
-        if port_in_use():
+        if port_in_use() and self.web_proc is not None and self.web_proc.poll() is None:
             self._status("完成 ✓ 网页服务本来就在运行", "#1a6b1a")
             messagebox.showinfo("完成",
                                 "安装完成！\n网页服务已经在运行，点【打开登录页】即可进入。",
                                 parent=self)
+            return
+        if port_in_use():
+            # 端口被**别人**占着（不是本窗口的服务）：别让用户以为一切正常
+            self._status(f"安装完成，但端口 {WEB_PORT} 被别的进程占用", "#b36b00")
+            messagebox.showinfo(
+                "完成",
+                f"安装完成！\n但 127.0.0.1:{WEB_PORT} 已被别的进程占用，网页服务没起来。\n"
+                "先结束占用它的进程（或点【修复安装】前的那个提示里选结束），再点【运行】。",
+                parent=self)
             return
         if self._launch_web():
             self._status("完成 ✓ 网页服务已启动", "#1a6b1a")
