@@ -1,0 +1,517 @@
+# -*- coding: utf-8 -*-
+"""DeepSeek Harness 安装助手（图形版 · 双模：离线/在线/自动）
+
+面向小白：双击 run.bat 或 installer.py 后按按钮即可。同一程序在
+assets/ 齐全时走『全离线零网络』，assets 缺失时自动走官方源 / 镜像
+在线安装；『自动选择』为默认，按步骤独立取源。
+
+依赖：仅 Python 3.11+ 标准库（tkinter/subprocess/threading）。打包成
+exe 用 PyInstaller（未来阶段）。当前直接用解释器运行。
+
+用法：
+  installer.py            启动图形界面
+  installer.py --selfcheck  只打印本机环境检测结果（不弹窗口）
+  installer.py --headless   无界面跑完整安装流程（刷日志到控制台）
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from tkinter import messagebox, ttk
+from pathlib import Path
+from typing import Callable, Iterable
+
+APP_TITLE = "DeepSeek Harness 安装助手 v0.1"
+REQUIRED_NODE = (22, 19)  # ^22.19 || >=24
+REGISTRY_MIRROR = "https://registry.npmmirror.com"
+REGISTRY_OFFICIAL = "https://registry.npmjs.org"
+NODE_MSI_URL = ("https://nodejs.org/dist/v24.20.0/node-v24.20.0-x64.msi")
+HARNESS_GIT_URL = "https://github.com/deepseek-ai/deepseek-harness.git"
+SOURCE_DIR_NAME = "deepseek-harness"
+BUILD_MARK = ".dsh-build/client-build-environment.json"
+
+HERE = Path(__file__).resolve().parent
+ASSETS = HERE / "assets"
+NODE_MSI_ASSET = ASSETS / "node-v24.20.0-x64.msi"
+PNPM_TGZ_ASSET = ASSETS / "pnpm.tgz"
+SOURCE_ARCHIVE = ASSETS / "source.tar.gz"      # 可选：离线源码包
+STORE_DIR = ASSETS / "pnpm-store"              # 可选：离线依赖缓存
+INSTALL_BASE = Path(os.environ.get("USERPROFILE", str(Path.home())))
+PROJECT_DIR = INSTALL_BASE / SOURCE_DIR_NAME
+WEB_URL = "http://127.0.0.1:3080"
+
+
+# ---------------------------------------------------------------- helpers
+def log_line(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def version_ok(version: str) -> bool:
+    """True 当版本满足 ^22.19 || >=24。"""
+    m = re.match(r"^v?(\d+)\.(\d+)(?:\.\d+)?", version)
+    if not m:
+        return False
+    major, minor = int(m.group(1)), int(m.group(2))
+    return (major == 22 and minor >= 19) or major >= 24
+
+
+def run(argv: list[str], cwd: Path | None = None,
+        env: dict | None = None, capture: bool = True) -> subprocess.CompletedProcess:
+    """跑一个外部进程；capture=True 时合并 stdout/stderr 便于日志。"""
+    proc = subprocess.run(argv, cwd=str(cwd) if cwd else None,
+                          env=env if env is not None else dict(os.environ),
+                          capture_output=capture, text=False)
+    return proc
+
+
+def run_text(argv: list[str], cwd: Path | None = None,
+             env: dict | None = None) -> str:
+    proc = run(argv, cwd=cwd, env=env, capture=True)
+    raw = (proc.stdout or b"") + (proc.stderr or b"")
+    for enc in ("utf-8", "gbk"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def find_node() -> str | None:
+    """返回可用 node 的完整路径，或 None。"""
+    try:
+        hit = shutil.which("node")
+        if hit:
+            ver = run_text(["node", "--version"]).strip()
+            if version_ok(ver):
+                return hit
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def find_pnpm() -> str | None:
+    try:
+        return shutil.which("pnpm")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def is_admin() -> bool:
+    """Windows 下是否管理员（用于 msiexec 静默装 Node）。"""
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------------------------------------------------------- engine
+class Engine:
+    """核心安装流程；由 GUI 线程调用、UI 线程发日志。"""
+
+    def __init__(self, mode: str, use_mirror: bool, log: Callable[[str], None]):
+        self.mode = mode          # "auto" | "offline" | "online"
+        self.use_mirror = use_mirror
+        self.log = log
+        self.registry = REGISTRY_MIRROR if use_mirror else REGISTRY_OFFICIAL
+        self.interrupted = False
+
+    def assets(self) -> dict[str, bool]:
+        return {
+            "node_msi": NODE_MSI_ASSET.exists(),
+            "pnpm_tgz": PNPM_TGZ_ASSET.exists(),
+            "source_archive": SOURCE_ARCHIVE.exists(),
+            "store": STORE_DIR.exists(),
+        }
+
+    # ---- 步骤
+    def env_check(self) -> dict:
+        node = find_node()
+        pnpm = find_pnpm()
+        info = {
+            "arch": os.environ.get("PROCESSOR_ARCHITECTURE", ""),
+            "os": os.environ.get("OS", "Windows"),
+            "node": node,
+            "pnpm": pnpm,
+            "admin": is_admin(),
+        }
+        self.log(f"系统: {info['os']} / {info['arch']}  管理员: {info['admin']}")
+        state = Engine._state(
+            node=info["node"] is not None,
+            pnpm=info["pnpm"] is not None,
+            store=STORE_DIR.exists(),
+            archive=SOURCE_ARCHIVE.exists(),
+            node_msi=NODE_MSI_ASSET.exists(),
+            pnpm_tgz=PNPM_TGZ_ASSET.exists(),
+        )
+        self.log("环境自检完成：" +
+                 ("Node ✓ " if state["node"] else "Node ✗ ") +
+                 ("pnpm ✓ " if state["pnpm"] else "pnpm ✗"))
+        return info
+
+    @staticmethod
+    def _state(**kw: bool) -> dict[str, bool]:
+        return kw
+
+    def want_offline(self, has_asset: bool, what: str) -> bool:
+        if self.mode == "offline":
+            if not has_asset:
+                raise RuntimeError(f"当前为离线模式，但缺少 {what}")
+            return True
+        if self.mode == "auto":
+            if has_asset:
+                self.log(f"[自动] 检测到离线 {what}，走离线源")
+                return True
+            self.log(f"[自动] 无离线 {what}，走网络源")
+            return False
+        self.log(f"[在线] {what} 走网络源")
+        return False
+
+    def install_node(self, env_check: dict) -> Path:
+        node = env_check.get("node") or find_node()
+        if node:
+            self.log("Node.js 已满足，跳过（版本 22.19+ 或 24+）")
+            return Path(node).parent
+        offline = self.want_offline(NODE_MSI_ASSET.exists(), "Node 安装包")
+        msi = NODE_MSI_ASSET if offline else None
+        self.log("准备安装 Node.js ..." + ("（离线 msi）" if msi else "（下载官方 msi）"))
+        import urllib.request
+        if msi is None:
+            tmp = HERE / "downloads"
+            tmp.mkdir(exist_ok=True)
+            msi = tmp / "node-v24-x64.msi"
+            self.log(f"下载 {NODE_MSI_URL} ...（较大，耐心等待）")
+            try:
+                urllib.request.urlretrieve(NODE_MSI_URL, str(msi))
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"Node msi 下载失败：{exc}") from exc
+        self.log("静默安装 Node（可能弹出系统权限窗口，请点【是】）...")
+        proc = subprocess.run(
+            ["msiexec", "/i", str(msi), "/qn", "/norestart"],
+            capture_output=True)
+        if proc.returncode not in (0, 3010):
+            raise RuntimeError(f"msiexec 安装失败，退出码 {proc.returncode}")
+        prog = Path(r"C:\Program Files\nodejs")
+        if not (prog / "node.exe").exists():
+            prog = Path(r"C:\Program Files (x86)\nodejs")
+        if not (prog / "node.exe").exists():
+            raise RuntimeError("安装完成但找不到 node.exe；请手动确认安装路径")
+        self.log(f"Node.js 安装完成：{prog}")
+        return prog
+
+    def install_pnpm(self) -> None:
+        if shutil.which("pnpm"):
+            self.log("pnpm 已存在，跳过")
+            return
+        offline = self.want_offline(PNPM_TGZ_ASSET.exists(), "pnpm 离线包")
+        if offline:
+            self.log("离线安装 pnpm ...")
+            proc = run(["npm", "install", "-g", str(PNPM_TGZ_ASSET)])
+        else:
+            self.log("在线安装 pnpm（npm install -g pnpm）…")
+            proc = run(["npm", "install", "-g", "pnpm@11.7.0"])
+        if proc.returncode != 0:
+            raise RuntimeError("pnpm 安装失败：" + _decode(proc))
+        self.log("pnpm 安装成功")
+
+    def prepare_source(self) -> Path:
+        if PROJECT_DIR.joinpath("package.json").exists():
+            self.log(f"源码已存在：{PROJECT_DIR}（复用）")
+            return PROJECT_DIR
+        PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+        offline = self.want_offline(
+            SOURCE_ARCHIVE.exists() or (STORE_DIR.exists() and ASSETS.exists()),
+            "源码包")
+        if offline and SOURCE_ARCHIVE.exists():
+            self.log("解压离线源码 ...")
+            ret = run(["tar", "-xzf", str(SOURCE_ARCHIVE), "-C", str(PROJECT_DIR)])
+            if ret.returncode != 0:
+                raise RuntimeError("源码解压失败：" + _decode(ret))
+        else:
+            self.log("git clone 官方源码（可能需要一点时间）...")
+            ret = run(["git", "clone", "--depth", "1", HARNESS_GIT_URL, str(PROJECT_DIR)])
+            if ret.returncode != 0:
+                raise RuntimeError("git clone 失败：" + _decode(ret))
+        if not PROJECT_DIR.joinpath("package.json").exists():
+            raise RuntimeError("源码目录缺少 package.json")
+        return PROJECT_DIR
+
+    def install_deps(self, project: Path) -> None:
+        if project.joinpath("node_modules").exists():
+            self.log("node_modules 已存在，跳过依赖安装")
+            return
+        offline = self.want_offline(STORE_DIR.exists(), "依赖缓存 store")
+        argv: list[str] = ["pnpm", "install", "--no-patch-commit"]
+        if offline:
+            argv += ["--offline", "--store-dir", str(STORE_DIR), "--frozen-lockfile"]
+        else:
+            argv += ["--registry", self.registry, "--frozen-lockfile"]
+        self.log("安装依赖（核心步骤；无网离线模式约 20s，在线模式看网络）...")
+        self.log("$ " + " ".join(argv))
+        proc = run(argv, cwd=project)
+        if proc.returncode != 0:
+            raise RuntimeError("依赖安装失败：" + _decode(proc))
+        self.log("依赖安装完成")
+
+    def build(self, project: Path) -> None:
+        if project.joinpath(BUILD_MARK).exists():
+            self.log("构建产物已存在，跳过 pnpm run build")
+            return
+        self.log("构建程序（本地编译，不联网；首次约 5–15 分钟，请耐心）...")
+        proc = run(["pnpm", "run", "build"], cwd=project)
+        if proc.returncode != 0:
+            raise RuntimeError("构建失败：" + _decode(proc))
+        self.log("构建完成")
+
+    def start_web(self, project: Path) -> None:
+        self.log(f"启动服务：{WEB_URL}（如未自动打开浏览器，请手动访问上方地址）")
+        self.log("启动 dsh web ...")
+        proc = run(["pnpm", "dsh", "web"], cwd=project)
+        if proc.returncode != 0:
+            raise RuntimeError("启动 dsh web 失败：" + _decode(proc))
+
+
+def _decode(proc: subprocess.CompletedProcess) -> str:
+    raw = (proc.stdout or b"") + (proc.stderr or b"")
+    for enc in ("utf-8", "gbk"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------- headless
+def headless(mode: str, mirror: bool) -> int:
+    eng = Engine(mode=mode, use_mirror=mirror, log=log_line)
+    log_line("开始（无界面模式）…")
+    try:
+        info = eng.env_check()
+        node_dir = eng.install_node(info)
+        if node_dir is not None and not shutil.which("pnpm"):
+            # Path 环境通常在变更后才需要刷新；此处为真实子进程重新取 PATH
+            os.environ["PATH"] = str(node_dir) + os.pathsep + os.environ.get("PATH", "")
+        eng.install_pnpm()
+        project = eng.prepare_source()
+        eng.install_deps(project)
+        eng.build(project)
+        eng.start_web(project)
+    except Exception as exc:  # noqa: BLE001
+        log_line(f"✗ 安装失败：{exc}")
+        return 1
+    log_line("✓ 全部完成")
+    return 0
+
+
+# ---------------------------------------------------------------- GUI
+class App(tk.Tk):
+    WIDTH, HEIGHT = 760, 620
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry(f"{self.WIDTH}x{self.HEIGHT}")
+        self.minsize(680, 540)
+        self.mode = tk.StringVar(value="auto")
+        self.mirror = tk.BooleanVar(value=True)
+        self.logs_var = tk.StringVar(value="欢迎使用 DeepSeek Harness 安装助手。\n"
+                                        "请选择安装方式后点击按钮。")
+        self.state_widgets: dict[str, tk.Label] = {}
+        self.busy = False
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        pad = dict(padx=12, pady=6)
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        title = ttk.Label(frm, text=APP_TITLE, font=("Microsoft YaHei UI", 14, "bold"))
+        title.pack(anchor="w", **pad)
+
+        tip = ttk.Label(frm, text="自动帮你完成：环境检测 → 安装 Node/pnpm → 拉取源码 → 安装依赖 → 构建 → 打开网页版。",
+                        foreground="#444")
+        tip.pack(anchor="w", **pad)
+
+        grp = ttk.LabelFrame(frm, text="安装方式", padding=8)
+        grp.pack(fill="x", **pad)
+        assets_ok = NODE_MSI_ASSET.exists() or STORE_DIR.exists() or SOURCE_ARCHIVE.exists()
+        asset_hint = "已检测到离线数据" if assets_ok else "未检测到离线数据（将走网络）"
+        gtitle = ttk.Label(grp, text=f"离线包：{asset_hint}", foreground="#777")
+        gtitle.pack(anchor="w")
+        ttk.Radiobutton(grp, text="自动选择（推荐）— 有离线包就走离线；缺的自动联网补",
+                        variable=self.mode, value="auto").pack(anchor="w")
+        ttk.Radiobutton(grp, text="离线安装 — 完全不依赖网络（需随包离线数据）",
+                        variable=self.mode, value="offline").pack(anchor="w")
+        ttk.Radiobutton(grp, text="在线安装 — 从网络源下载（较慢）",
+                        variable=self.mode, value="online").pack(anchor="w")
+        ttk.Checkbutton(grp, text="在线源使用国内镜像 npmmirror 加速",
+                        variable=self.mirror).pack(anchor="w")
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", **pad)
+        self.btn_full = ttk.Button(btns, text="✅  一键完整安装", command=self.on_full,
+                                   style="Accent.TButton" if _has_accent() else "")
+        self.btn_full.pack(side="left", ipadx=20, ipady=4)
+        self.btn_run = ttk.Button(btns, text="🚀  只启动网页版", command=self.on_start)
+        self.btn_run.pack(side="left", padx=(8, 0), ipadx=20, ipady=4)
+
+        logf = ttk.LabelFrame(frm, text="日志")
+        logf.pack(fill="both", expand=True, **pad)
+        self.txt = tk.Text(logf, height=12, wrap="word", state="disabled",
+                           font=("Consolas", 9))
+        scb = ttk.Scrollbar(logf, command=self.txt.yview)
+        self.txt.configure(yscrollcommand=scb.set)
+        scb.pack(side="right", fill="y")
+        self.txt.pack(fill="both", expand=True)
+
+        self.status = ttk.Label(frm, text="就绪", foreground="#1a6b1a")
+        self.status.pack(anchor="w", **pad)
+
+    @property
+    def project(self) -> Path:
+        return PROJECT_DIR
+
+    def log(self, msg: str) -> None:
+        def write():
+            self.txt.configure(state="normal")
+            self.txt.insert("end", msg + "\n")
+            self.txt.see("end")
+            self.txt.configure(state="disabled")
+        self.after(0, write)
+
+    def set_status(self, msg: str) -> None:
+        self.after(0, lambda: self.status.configure(text=msg))
+
+    def running(self, flag: bool) -> None:
+        self.busy = flag
+        state = "disabled" if flag else "normal"
+        self.btn_full.configure(state=state)
+        self.btn_run.configure(state=state)
+
+    def on_full(self) -> None:
+        if self.busy:
+            return
+        self.running(True)
+        eng = Engine(self.mode.get(), self.mirror.get(), self.log)
+        threading.Thread(target=self._job_full, args=(eng,), daemon=True).start()
+
+    def on_start(self) -> None:
+        if self.busy:
+            return
+        self.running(True)
+        eng = Engine(self.mode.get(), self.mirror.get(), self.log)
+        threading.Thread(target=self._job_start, args=(eng,), daemon=True).start()
+
+    def _job_full(self, eng: Engine) -> None:
+        try:
+            self.set_status("完整安装进行中…")
+            info = eng.env_check()
+            node_dir = eng.install_node(info)
+            if node_dir is not None and not find_pnpm():
+                os.environ["PATH"] = str(node_dir) + os.pathsep + os.environ.get("PATH", "")
+            eng.install_pnpm()
+            project = eng.prepare_source()
+            eng.install_deps(project)
+            eng.build(project)
+            eng.start_web(project)
+            self.log(f"\n全部完成！浏览器中打开 {WEB_URL} 使用。")
+            self.set_status("安装完成 ✓")
+            self._info_box("安装完成", "DeepSeek Harness 已安装并启动。\n"
+                                     f"浏览器访问：{WEB_URL}")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"\n✗ 安装失败：{exc}")
+            self.set_status("安装失败 ✗")
+            self._info_box("安装失败", str(exc))
+        finally:
+            self.after(0, lambda: self.running(False))
+
+    def _job_start(self, eng: Engine) -> None:
+        try:
+            self.set_status("启动中…")
+            self.log("检查环境…")
+            if not find_node():
+                raise RuntimeError("尚未安装 Node.js。请先点「一键完整安装」。")
+            if not find_pnpm():
+                raise RuntimeError("尚未安装 pnpm。请先点「一键完整安装」。")
+            self.log("直接启动 dsh web（不重新构建）…")
+            eng.start_web(Path(PROJECT_DIR))
+            self.set_status("运行中 ✓")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"\n✗ 启动失败：{exc}")
+            self.set_status("启动失败 ✗")
+            self._info_box("启动失败", str(exc))
+        finally:
+            self.after(0, lambda: self.running(False))
+
+    def _info_box(self, title: str, msg: str) -> None:
+        self.after(0, lambda: messagebox.showinfo(title, msg))
+
+
+def _has_accent() -> bool:
+    try:
+        style = ttk.Style()
+        return bool(style.theme_names() and "vista" in style.theme_names())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def selfcheck() -> int:
+    """终端打印本机环境；供无界面验证与排错。"""
+    log_line("=== 环境自检（DeepSeek Harness 安装助手） ===")
+    for label, val in (
+        ("Windows", os.environ.get("OS", "?")),
+        ("架构", os.environ.get("PROCESSOR_ARCHITECTURE", "?")),
+        ("脚本目录", str(HERE)),
+        ("Python 可执行", sys.executable),
+    ):
+        log_line(f"{label:12}: {val}")
+
+    node = find_node()
+    if node:
+        v = run_text([node, "--version"]).strip()
+        log_line(f"Node 路径 : {node}")
+        log_line(f"Node 版本 : {v}  {'✓ 满足' if version_ok(v) else '✗ 不满足(需 22.19+/24+)'}")
+    else:
+        log_line("Node 路径 : （未检测到可用的 Node）")
+
+    pnpm = find_pnpm()
+    log_line(f"pnpm 路径 : {pnpm or '（未检测到 pnpm）'}")
+
+    log_line("Assets 离线数据：")
+    for name, path in (
+        ("Node msi", NODE_MSI_ASSET),
+        ("pnpm tgz", PNPM_TGZ_ASSET),
+        ("源码包", SOURCE_ARCHIVE),
+        ("依赖 store", STORE_DIR),
+    ):
+        log_line(f"{name:10}: {'✓' if path.exists() else '—'}  {path}")
+
+    admin = is_admin()
+    log_line(f"管理员权限: {admin}")
+    log_line("=== 自检结束 ===")
+    return 0
+
+
+def main() -> int:
+    args = [a.lower() for a in sys.argv[1:]]
+    if "--selfcheck" in args:
+        return selfcheck()
+    mode = "online"
+    for m in ("auto", "offline", "online"):
+        if f"--{m}" in args:
+            mode = m
+    if "--headless" in args:
+        return headless(mode=mode, mirror="--no-mirror" not in args)
+    app = App()
+    app.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

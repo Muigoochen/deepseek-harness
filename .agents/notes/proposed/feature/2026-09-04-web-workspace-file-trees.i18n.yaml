@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/proposed/feature/2026-09-04-web-workspace-file-trees.md
+2026-09-04-web-workspace-file-trees.md: 00ae02ae7d9035d2468ff01e3773ad4dfef5b7d8
+2026-09-04-web-workspace-file-trees.zh.md: 49f94d6db5d799990693744e39134c41f5db7dcc
