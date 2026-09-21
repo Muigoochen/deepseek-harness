@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import tkinter as tk
@@ -499,6 +500,124 @@ def _nonempty_dir(path: Path) -> bool:
         return True
 
 
+def _peek_names(path: Path, limit: int = 3) -> str:
+    """列几个目录里的条目名，用于提示「这个目录里现在有什么」。"""
+    try:
+        with os.scandir(path) as entries:
+            return "、".join(e.name for _, e in zip(range(limit), entries))
+    except OSError:
+        return ""
+
+
+def _nonempty_target_error(project: Path, *, offline: bool) -> InstallError:
+    """目标目录非空、又没有 DSH 身份时的统一提示。
+
+    离线解压会把源码铺进去并**覆盖同名文件**，git clone 则根本写不进非空目录；
+    两者的正确做法一样：换空目录，或指向已经装好的 DSH。
+    """
+    what = ("离线解压会把源码铺进这个目录、并覆盖同名文件" if offline
+            else "git clone 无法写入非空目录")
+    lines = [
+        f"{project}",
+        "这个目录不是空的，里面也没有 DSH 的安装身份（没有本助手的安装标记、"
+        f"也没有官方包名）——{what}，安装已中止。",
+    ]
+    peek = _peek_names(project)
+    if peek:
+        lines.append(f"（目录里现在有：{peek} …）")
+    lines.append("请把「安装位置」换成一个空目录，或指向已经装好的 DeepSeek Harness 目录。")
+    return InstallError("\n".join(lines))
+
+
+def _archive_top_names(archive: Path) -> set[str]:
+    """归档里的顶层名字，**跳过符号链接条目**；读不出来时返回空集。
+
+    跳过 symlink 是必须的：真包的顶层就有 `CLAUDE.md → AGENTS.md`，它在 Windows 上
+    建不出来也不影响使用；把它算进"应有内容"会让完整解压被误判成缺东西。
+    用 Python 的 `tarfile` 而不是 `tar -tzvf`：类型判断不依赖 tar 的输出格式与本地化。
+    """
+    names: set[str] = set()
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            for m in tf.getmembers():
+                if m.issym():
+                    continue
+                name = m.name
+                while name.startswith("./"):     # 只去掉 "./" 前缀：lstrip("./") 会连
+                    name = name[2:]              # 开头的点一起吃掉（.agents → agents）
+                first = name.split("/")[0]
+                if first:
+                    names.add(first)
+    except (OSError, tarfile.TarError):
+        return set()
+    return names
+
+
+def fill_missing_links(project: Path, archive: Path) -> list[str]:
+    """把没落地的符号链接按「复制内容」补齐，返回补齐的相对路径列表。
+
+    Windows 上非管理员且未开开发者模式时建不了符号链接，而 `source.tar.gz` 里有 11 个
+    仓库内镜像（`CLAUDE.md → AGENTS.md`、`.claude/skills`、`snapshots/*`）。复制一份内容
+    效果相同且不需要任何权限；指向解压目录之外的链接不做。
+    """
+    done: list[str] = []
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            members = list(tf.getmembers())
+    except (OSError, tarfile.TarError):
+        return done
+    root = project.resolve()
+    for m in members:
+        if not m.issym():
+            continue
+        dst = project / m.name
+        if dst.exists():
+            continue
+        src = (dst.parent / m.linkname).resolve()
+        if not src.exists() or (src != root and root not in src.parents):
+            continue
+        try:
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        except OSError:
+            continue
+        done.append(m.name)
+    return done
+
+
+def extract_source_archive(project: Path, archive: Path, log) -> list[str]:
+    """解压离线源码包；返回用复制补齐的镜像链接列表。
+
+    tar 的返回码不能直接当结论：`source.tar.gz` 里有 11 个仓库内镜像链接，非管理员且未开
+    开发者模式的 Windows 上 bsdtar 一律建不了它们（`Can't create …: Invalid argument`），
+    但源码内容本身是完整的——只看返回码会让「一键完整安装」的默认路径（自动→离线）整条走
+    不通。所以按**内容是否完整**判断，再把这些链接复制一份补上。
+    """
+    project.mkdir(parents=True, exist_ok=True)
+    log("  解压随包源码 …")
+    proc = run(["tar", "-xzf", str(archive), "-C", str(project)])
+    if proc.returncode == 0:
+        return []
+    detail = decode_proc(proc).strip()
+    tops = _archive_top_names(archive)
+    missing = sorted(n for n in tops if not (project / n).exists())
+    if not tops or missing:
+        why = ("源码包列不出内容（包可能损坏或不完整）" if not tops
+               else "缺少顶层内容：" + "、".join(missing[:6]))
+        raise InstallError(f"源码解压失败（{why}）：\n{detail}")
+    log("  ⚠ 解压报了错（Windows 建不了符号链接），源码内容完整，继续")
+    fixed = fill_missing_links(project, archive)
+    if fixed:
+        log(f"  已用复制补齐 {len(fixed)} 个镜像链接："
+            + "、".join(fixed[:3]) + ("…" if len(fixed) > 3 else ""))
+    if detail:
+        log("  tar 原话：" + detail.splitlines()[0])
+    return fixed
+
+
 def _shallow_dirs(root: Path, limit: int = SHALLOW_LIMIT) -> list[Path]:
     """一层子目录（跳系统目录、限量）——只用于有限探测，不遍历整盘。"""
     skip = {"$recycle.bin", "system volume information", "windows", "program files",
@@ -878,17 +997,17 @@ class Engine:
             SOURCE_ARCHIVE.exists() or STORE_DIR.exists(),
             "源码包/依赖缓存")
         if offline and SOURCE_ARCHIVE.exists():
-            self.log("  解压随包源码 …")
-            project.mkdir(parents=True, exist_ok=True)
-            proc = run(["tar", "-xzf", str(SOURCE_ARCHIVE), "-C", str(project)])
-            if proc.returncode != 0:
-                raise InstallError(f"源码解压失败：\n{decode_proc(proc)}")
+            # 与在线分支同等的前置检查：非空、又没有 DSH 身份的目录一律不碰。
+            # 以前这里没有检查，解压会直接铺进用户选中的目录并覆盖同名文件
+            # （实测：用户自己的 README.md 被改成官方 README，随后该目录还会通过
+            # `is_checkout`，于是 pnpm install/build 就在用户目录里跑起来）。
+            if _nonempty_dir(project):
+                raise _nonempty_target_error(project, offline=True)
+            extract_source_archive(project, SOURCE_ARCHIVE, self.log)
             mode = "offline"
         else:
             if _nonempty_dir(project):
-                raise InstallError(
-                    f"{project} 不是空目录，git clone 无法写入。\n"
-                    "请换一个空目录，或指向已装好的 DeepSeek Harness 目录。")
+                raise _nonempty_target_error(project, offline=False)
             git = find_git()
             if git is None:
                 raise InstallError(

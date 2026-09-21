@@ -10,11 +10,13 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -602,6 +604,43 @@ class VerifyInstallDirTest(unittest.TestCase):
         self.assertFalse(ident.ok)
 
 
+def _tree_state(root: Path) -> dict[str, str]:
+    """目录的完整快照（相对路径 → 内容 hash），用来证明「零改动」。"""
+    out: dict[str, str] = {}
+    for p in sorted(root.rglob("*")):
+        rel = str(p.relative_to(root))
+        out[rel] = ("<dir>" if p.is_dir()
+                    else hashlib.sha256(p.read_bytes()).hexdigest())
+    return out
+
+
+class _FakeTar:
+    """模拟「Windows 上建不了符号链接」的 tar：解压除符号链接外的成员，返回码 1。
+
+    `-tzf`（列内容）仍走真 tar，其余调用按 `extract` 决定是否真的落地文件。
+    """
+
+    def __init__(self, *, extract: bool = True) -> None:
+        self.extract = extract
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, cwd=None, env=None):
+        self.calls.append(list(argv))
+        if not self.extract:
+            return subprocess.CompletedProcess(argv, 1, b"",
+                                               b"tar: boom: write error")
+        dest = Path(argv[argv.index("-C") + 1])
+        with tarfile.open(argv[2], "r:gz") as tf:
+            keep = [m for m in tf.getmembers() if not m.issym()]
+            try:
+                tf.extractall(dest, members=keep, filter="data")
+            except TypeError:               # Python < 3.12 没有 filter 参数
+                tf.extractall(dest, members=keep)
+        return subprocess.CompletedProcess(
+            argv, 1, b"",
+            b"tar: vendor/CLAUDE.md: Can't create 'x': Invalid argument\n")
+
+
 class PrepareSourceTest(unittest.TestCase):
     """安装前的最后一道闸：绝不在「无关项目」里跑 pnpm install/build。
 
@@ -662,6 +701,76 @@ class PrepareSourceTest(unittest.TestCase):
         self.assertEqual(installer.checkout_identity(project),
                          "本助手安装标记（offline）")
 
+    def test_offline_refuses_nonempty_dir_without_identity(self):
+        """离线分支同样要拦：解压会覆盖同名文件（实测过 README.md 被改成官方 README）。"""
+        archive = self.tmp / "source.tar.gz"
+        self._make_tiny_archive(archive)
+        target = self.tmp / "我的文件夹"
+        target.mkdir()
+        (target / "我的资料.txt").write_text("别动我\n", encoding="utf-8")
+        (target / "README.md").write_text("用户自己的说明\n", encoding="utf-8")
+        before = _tree_state(target)
+        installer.set_active_dir(target)
+        with mock.patch.object(installer, "SOURCE_ARCHIVE", archive):
+            with self.assertRaises(installer.InstallError) as ctx:
+                self._engine("offline").prepare_source()
+        text = str(ctx.exception)
+        self.assertIn("这个目录不是空的", text)
+        self.assertIn("我的资料.txt", text, "提示里要写出目录现有内容")
+        self.assertNotIn("试跑", text, "外部目录不该引导用户去【运行】试跑")
+        self.assertEqual(_tree_state(target), before, "必须零改动")
+
+    def test_offline_tolerates_symlink_failure_when_content_is_complete(self):
+        """Windows 建不了符号链接时 tar 返回 1：内容完整就继续，镜像用复制补上。"""
+        archive = self.tmp / "source.tar.gz"
+        self._make_archive_with_link(archive)
+        project = self.tmp / "out"
+        installer.set_active_dir(project)
+        with mock.patch.object(installer, "SOURCE_ARCHIVE", archive), \
+                mock.patch.object(installer, "run", _FakeTar()):
+            self.assertEqual(self._engine("offline").prepare_source(), project)
+        self.assertTrue(any("符号链接" in m for m in self.logs), self.logs)
+        link = project / "CLAUDE.md"
+        self.assertTrue(link.exists(), "镜像链接要用复制补上")
+        self.assertEqual(link.read_text(encoding="utf-8"),
+                         (project / "AGENTS.md").read_text(encoding="utf-8"))
+
+    def test_offline_aborts_when_extraction_is_incomplete(self):
+        """内容不完整时不能放过：tar 的返回码仍以「顶层内容是否齐」为准。"""
+        archive = self.tmp / "source.tar.gz"
+        self._make_tiny_archive(archive)
+        project = self.tmp / "out2"
+        installer.set_active_dir(project)
+        with mock.patch.object(installer, "SOURCE_ARCHIVE", archive), \
+                mock.patch.object(installer, "run", _FakeTar(extract=False)):
+            with self.assertRaises(installer.InstallError) as ctx:
+                self._engine("offline").prepare_source()
+        self.assertIn("源码解压失败", str(ctx.exception))
+        self.assertIn("缺少顶层内容", str(ctx.exception))
+        self.assertFalse((project / installer.INSTALL_MARKER).exists(),
+                         "没装成功就不能留下安装标记")
+
+    @staticmethod
+    def _make_archive_with_link(path: Path) -> None:
+        """源码包 + 一个仓库内镜像链接（模拟真包里的 CLAUDE.md → AGENTS.md）。"""
+        import io
+        import tarfile
+        files = {
+            "package.json": json.dumps({"name": "@deepseek-ai/dsh-root"}),
+            "pnpm-workspace.yaml": "packages: []\n",
+            "AGENTS.md": "# 说明\n",
+        }
+        with tarfile.open(path, "w:gz") as tf:
+            for name, text in files.items():
+                data = text.encode("utf-8")
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            link = tarfile.TarInfo("CLAUDE.md")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "AGENTS.md"
+            tf.addfile(link)
+
     @staticmethod
     def _make_tiny_archive(path: Path) -> None:
         """造一个只含最小 DSH 结构的源码包（模拟 assets/source.tar.gz）。"""
@@ -684,6 +793,89 @@ class PrepareSourceTest(unittest.TestCase):
                                            encoding="utf-8")
         (root / "pnpm-workspace.yaml").write_text("packages: []\n", encoding="utf-8")
         return root
+
+
+class ArchiveTopNamesTest(unittest.TestCase):
+    """列归档顶层名字：点开头的条目不能被剥掉点（`lstrip("./")` 会，实测踩过）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-tops-"))
+        self.archive = self.tmp / "a.tar.gz"
+        import io
+        with tarfile.open(self.archive, "w:gz") as tf:
+            for name, text in ((".agents/notes/AGENTS.md", "x\n"),
+                               (".gitignore", "node_modules\n"),
+                               ("package.json", "{}\n")):
+                data = text.encode("utf-8")
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            link = tarfile.TarInfo("CLAUDE.md")     # 符号链接不算「应有内容」
+            link.type = tarfile.SYMTYPE
+            link.linkname = ".agents/notes/AGENTS.md"
+            tf.addfile(link)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_dot_entries_keep_their_dots_and_links_are_skipped(self):
+        self.assertEqual(installer._archive_top_names(self.archive),
+                         {".agents", ".gitignore", "package.json"})
+
+    def test_unreadable_archive_reports_nothing(self):
+        broken = self.tmp / "broken.tar.gz"
+        broken.write_bytes(b"not a tar")
+        self.assertEqual(installer._archive_top_names(broken), set())
+
+
+class FillMissingLinksTest(unittest.TestCase):
+    """符号链接补齐：文件镜像复制内容、目录镜像复制整棵树、越界链接不做。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-links-"))
+        self.archive = self.tmp / "source.tar.gz"
+        self._make_archive(self.archive)
+        (self.tmp / "outside.txt").write_text("外面的文件\n", encoding="utf-8")
+        self.project = self.tmp / "out"
+        (self.project / "skills").mkdir(parents=True)
+        (self.project / "a.md").write_text("内容 A\n", encoding="utf-8")
+        (self.project / "skills" / "x.md").write_text("技能\n", encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_fills_file_and_dir_links_and_skips_outside(self):
+        done = installer.fill_missing_links(self.project, self.archive)
+        self.assertEqual(sorted(done), [".claude/skills", "CLAUDE.md"])
+        self.assertEqual((self.project / "CLAUDE.md").read_text(encoding="utf-8"),
+                         "内容 A\n")
+        self.assertEqual(
+            (self.project / ".claude" / "skills" / "x.md").read_text(encoding="utf-8"),
+            "技能\n")
+        self.assertFalse((self.project / "evil.txt").exists(),
+                         "指向解压目录之外的链接不做")
+
+    def test_second_call_is_a_no_op(self):
+        installer.fill_missing_links(self.project, self.archive)
+        self.assertEqual(installer.fill_missing_links(self.project, self.archive), [])
+
+    @staticmethod
+    def _make_archive(path: Path) -> None:
+        import io
+        import tarfile
+        with tarfile.open(path, "w:gz") as tf:
+            for name, text in (("a.md", "内容 A\n"), ("skills/x.md", "技能\n")):
+                data = text.encode("utf-8")
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            for name, target in (("CLAUDE.md", "a.md"),
+                                 (".claude/skills", "../skills"),
+                                 ("evil.txt", "../../outside.txt")):
+                link = tarfile.TarInfo(name)
+                link.type = tarfile.SYMTYPE
+                link.linkname = target
+                tf.addfile(link)
 
 
 class InterruptedInstallTest(unittest.TestCase):
