@@ -51,7 +51,7 @@ plugins/lsp-echo/
 └─ install/
    ├─ install.ps1          用 `dsh plugin` 装进 profile + 生成机器配置(幂等)
    ├─ uninstall.ps1        逆操作
-   └─ patch.example.yml    cordis.patch.yml 行示例
+   └─ patch.example.yml    profile 层覆盖行示例(projects 是机器本地信息)
 ```
 
 包根还有 `cordis.patch.yml` —— 本包作为 bundle 贡献给 profile 的配置层(见「安装」)。
@@ -71,7 +71,7 @@ powershell -ExecutionPolicy Bypass -File ...\install\uninstall.ps1
 
 install.ps1 会(幂等):
 1. 用 DSH 官方方式安装本包 —— `dsh plugin --profile web add <本包路径>`,在
-   `profiles\node_modules\@dsh-user\lsp-echo` 建立**指回本仓库的 junction**,并把它登记进该 profile 的
+   `profiles\web\node_modules\@dsh-user\lsp-echo` 建立**指回本仓库的 junction**,并把它登记进该 profile 的
    bundle 列表(层顺序由 `dsh.profile.bundles` 决定);
 2. 若缺引擎机器配置,自动探测并写入 `$DSH_HOME\lsp-echo\godot-lsp.config.json`
    (机器本地状态一律落在 `$DSH_HOME`,**不写进仓库**;可省略,桥会走 PATH 或 `--godot`);
@@ -91,7 +91,7 @@ install.ps1 会(幂等):
 
 ```powershell
 # ① 引擎自检(不需要编辑器窗口;真实 Godot 引擎编译)
-node "$env:DSH_HOME\profiles\node_modules\@dsh-user\lsp-echo\checkers\godot-lsp\godot-lsp.mjs" smoke E:\GodotProject\xu_world\Modules\Equipment\UI\equipment_panel_simple.gd
+node "$env:DSH_HOME\profiles\web\node_modules\@dsh-user\lsp-echo\checkers\godot-lsp\godot-lsp.mjs" smoke E:\GodotProject\xu_world\Modules\Equipment\UI\equipment_panel_simple.gd
 
 # ② 在会话里让 AI 改坏一个 .gd → 下一轮应自动出现 [lsp-echo] 错误清单
 # ③ 手动:模型工具 lsp_echo: host / status / check files=[...]
@@ -216,7 +216,7 @@ lib/locales/en.json     英文
 
 ## 安装自检
 
-`install/install.ps1` 复制完成后会跑四道检查,**任何一道失败都中止安装并以 exit 1 结束**,
+`install/install.ps1` 装好之后会跑四道检查,**任何一道失败都中止安装并以 exit 1 结束**,
 而不是等你重启 `dsh web` 才发现问题:
 
 1. **host 半可导入** —— 插件在模块顶层构造 schema,写错会让 `dsh web` 整个起不来;
@@ -227,8 +227,9 @@ lib/locales/en.json     英文
 4. **源码引用的每个 i18n 键都存在于词典** —— 从**源码树**检查(陈旧安装掩盖不了),并指出缺失键所在的文件与行号;
    同时报告**未被引用的死键**(不判失败,只提示清理)。
 
-复制规则只有 `lib/*.js` **加上** `lib/locales/`;新增其它运行期资源目录时要同步补上复制规则,
-否则文件不会进 profile。
+安装后 profile 通过 `link:` 指向本目录,**没有复制步骤**,源码改动直接生效。但 `package.json` 的
+`files` 必须列全运行期资源(`lib/`、`checkers/`、`cordis.patch.yml`、`README.md`)——那个清单决定的是
+**打包发布**时包里有什么,漏项会让别人装到的副本缺文件。
 
 ## 引擎桥(让运行中的 Godot 引擎发现新建脚本)
 

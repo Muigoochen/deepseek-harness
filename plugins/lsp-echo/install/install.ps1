@@ -1,4 +1,4 @@
-# install.ps1 — install lsp-echo into a DSH profile the supported way.
+# install.ps1 - install lsp-echo into a DSH profile the supported way.
 #
 # Installation is `dsh plugin --profile <name> add <package>`, which links the
 # package into the profile and records it as a bundle, so the profile owns the
@@ -23,6 +23,17 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# ---------- sanity: artifacts must be present before install (fail-loud guard) ----------
+if (-not (Test-Path (Join-Path $PluginSource 'lib\index.js'))) { throw "missing lib/index.js under $PluginSource" }
+if (-not (Test-Path (Join-Path $PluginSource 'lib\client.js'))) { throw "missing lib/client.js under $PluginSource (the web tree fails to start without it)" }
+if (-not (Test-Path (Join-Path $PluginSource 'cordis.patch.yml'))) { throw "missing cordis.patch.yml under $PluginSource (without it the bundle contributes no row)" }
+# A patch whose top level is not a list, or whose insert carries no id, is a FATAL
+# start-up error for the WHOLE profile - so check the shape now, not after a restart.
+$bundlePatch = Join-Path $PluginSource 'cordis.patch.yml'
+$bundlePatchText = [System.IO.File]::ReadAllText($bundlePatch)
+if ($bundlePatchText -notmatch '(?m)^-\s+insert:') { throw "cordis.patch.yml has no top-level '- insert:' operation: $bundlePatch" }
+if ($bundlePatchText -notmatch [regex]::Escape('- id: lsp-echo')) { throw "cordis.patch.yml does not insert the id 'lsp-echo': $bundlePatch" }
+
 # Write UTF-8 without BOM (PowerShell 5.1's Set-Content -Encoding UTF8 adds a BOM
 # that breaks JSON.parse/YAML consumers).
 function Write-TextNoBom([string]$Path, [string]$Text) {
@@ -37,7 +48,7 @@ $PluginSource = (Resolve-Path $PluginSource).Path
 $profileDir = Join-Path $ProfileRoot "profiles\$ProfileName"
 $patchFile = Join-Path $profileDir 'cordis.patch.yml'
 if (-not (Test-Path $patchFile)) { throw "profile patch not found: $patchFile (expected a DSH_HOME layout; is '$ProfileName' the right profile?)" }
-$dest = Join-Path $ProfileRoot "profiles\node_modules\@dsh-user\lsp-echo"
+$dest = Join-Path $ProfileRoot "profiles\$ProfileName\node_modules\@dsh-user\lsp-echo"
 
 # Machine config is shared by every profile and must not live inside the package:
 # the install is a link to this checkout, so writing there would put this
@@ -102,7 +113,7 @@ if ($existing) {
   if (-not $Project) {
     $localDev = Join-Path (Join-Path $PluginSource 'checkers\godot-lsp') 'godot-lsp.config.local-dev.json'
     # ReadAllText, not Get-Content: PowerShell 5.1 decodes with the ANSI code page
-    # by default, and this file carries non-ASCII text — the JSON would come back
+    # by default, and this file carries non-ASCII text - the JSON would come back
     # corrupted and ConvertFrom-Json would throw (the throw is caught below, so the
     # damage surfaces only as a silently empty defaultProject).
     if (Test-Path $localDev) {
@@ -135,7 +146,7 @@ if ($content -match [regex]::Escape($needle)) {
 } else {
   # Without a project path the row must not carry a `projects:` list: an empty
   # `path: ''` passes the plugin's schema, is dropped while seeding, and leaves
-  # the plugin running with zero projects — a silent no-op install.
+  # the plugin running with zero projects - a silent no-op install.
   # A single quote inside the path would close the YAML scalar early.
   $quoted = $Project.Replace("'", "''")
   $row = @"
@@ -151,12 +162,30 @@ if ($content -match [regex]::Escape($needle)) {
   Write-Host "appended the lsp-echo row to: $patchFile"
 }
 
+# ---------- 3b. dependency link ----------
+# The profile installs this package as a junction back to this checkout, and Node
+# resolves a junction to its REAL path by default. The plugin's dependencies
+# (@deepseek-ai/*, zod) live in the profile's node_modules, which is NOT on the
+# search path from the checkout - so without this link the profile fails to boot
+# with "Cannot find package '...' imported from <checkout>/lib/index.js".
+# The path is gitignored; it is a junction, not a copy.
+$depsLink = Join-Path $PluginSource 'node_modules'
+$profileModules = Join-Path $ProfileRoot 'profiles\node_modules'
+if (-not (Test-Path $depsLink)) {
+  if (Test-Path $profileModules) {
+    New-Item -ItemType Junction -Path $depsLink -Target $profileModules -ErrorAction Stop | Out-Null
+    Write-Host "linked plugin dependencies: $depsLink -> $profileModules"
+  } else {
+    Write-Warning "no dependency tree at $profileModules; the plugin will fail to boot if it imports a package the checkout does not provide"
+  }
+}
+
 # ---------- 4. load check ----------
 # The plugin builds its settings schema at module top level, so a schema mistake
 # throws on import and takes the whole `dsh web` boot down with it. Import the
 # installed copy here instead: a broken install then fails during install, with
 # the error in front of whoever just ran the script, instead of at the next GUI
-# restart. Schema edits are the likely culprit — this fork's schemastery has no
+# restart. Schema edits are the likely culprit - this fork's schemastery has no
 # `.optional()`; a field is optional unless marked `.required()`.
 $entry = Join-Path $dest 'lib/index.js'
 # A failing import writes its stack to stderr, which PowerShell surfaces as an
@@ -167,8 +196,19 @@ $prevEap = $ErrorActionPreference
 $prevOut = [Console]::OutputEncoding
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$loadCheck = (& node --input-type=module -e "await import('file:///' + process.argv[1].replace(/\\/g, '/')); console.log('LOADCHECK-OK')" $entry 2>&1 | Out-String)
+$probe = Join-Path $profileDir "_dsh-loadcheck-lsp-echo.mjs"
+$probeJs = @'
+import * as m from '@dsh-user/lsp-echo'
+if (typeof m.apply !== 'function') throw new Error('the package does not export apply()')
+if (m.inject !== undefined && !Array.isArray(m.inject)) throw new Error('inject must be an array when present')
+console.log('LOADCHECK-OK')
+'@
+[System.IO.File]::WriteAllText($probe, $probeJs, (New-Object System.Text.UTF8Encoding($false)))
+# No --preserve-symlinks on purpose: the real boot resolves the junction to this
+# checkout path, so this probe must not paper over a dependency that cannot be found.
+$loadCheck = (& node $probe 2>&1 | Out-String)
 $loadExit = $LASTEXITCODE
+Remove-Item $probe -Force -ErrorAction SilentlyContinue
 [Console]::OutputEncoding = $prevOut
 $ErrorActionPreference = $prevEap
 if ($loadExit -ne 0 -or -not ($loadCheck -match 'LOADCHECK-OK')) {
@@ -189,7 +229,7 @@ $localeDir = Join-Path $dest 'lib/locales'
 $checks = @()
 # The browser half is handed to the page verbatim and may only `require` the React
 # seed. Checking the installed .js with `node --check` would honour package.json's
-# "type": "module" and therefore ACCEPT an `import` — the one mistake that breaks
+# "type": "module" and therefore ACCEPT an `import` - the one mistake that breaks
 # the zero-build contract. Parse a .cjs copy instead, so ESM syntax fails here.
 $clientCjs = Join-Path ([System.IO.Path]::GetTempPath()) ("dsh-lsp-echo-client-$PID.cjs")
 Copy-Item $clientEntry $clientCjs -Force
@@ -249,7 +289,7 @@ Write-Host ("client.js and dictionaries OK (" + $dictCheck.Trim() + ")")
 
 # ---------- 6. every referenced i18n key exists ----------
 # A key used in code but absent from a dictionary degrades to displaying the raw
-# key in the GUI — silently, and only on the language that lacks it. Checked from
+# key in the GUI - silently, and only on the language that lacks it. Checked from
 # the SOURCE tree, not the installed copy, so a stale install cannot mask it.
 $keyCheckScript = Join-Path ([System.IO.Path]::GetTempPath()) "dsh-lsp-echo-key-check-$PID.mjs"
 $keyCheckSource = @'
@@ -261,7 +301,7 @@ const en = JSON.parse(fs.readFileSync(path.join(src, 'lib/locales/en.json'), 'ut
 const used = new Map()
 const CALL = /\b(?:t|T|tLine|tParts|renderParts|noteOf)\(\s*['"]([^'"]+)['"]/g
 // A concatenated key (`t('a.' + x)`) is not a literal and must not be reported as
-// missing — the key set it resolves to is not knowable here.
+// missing - the key set it resolves to is not knowable here.
 const CONCAT = /\b(?:t|T|tLine|tParts|renderParts|noteOf)\(\s*['"][^'"]+['"]\s*\+/
 // addon.js is included because its error strings travel to the GUI as JSON and are
 // shown verbatim; it was outside this scan when its text was still hardcoded.
@@ -285,7 +325,7 @@ for (const k of used.keys()) {
 const unused = Object.keys(zh).filter((k) => !used.has(k))
 if (bad.length) { console.log(bad.join('\n')); process.exit(1) }
 console.log('referenced=' + used.size + ' zh=' + Object.keys(zh).length + ' en=' + Object.keys(en).length)
-// Dead keys and name/content mismatches are not failures — they are cleanup
+// Dead keys and name/content mismatches are not failures - they are cleanup
 // signals, so they are reported without failing the install.
 if (unused.length) console.log('UNUSED (' + unused.length + ', consider removing): ' + unused.join(', '))
 '@
@@ -308,4 +348,17 @@ $unusedLine = ($keyCheck -split "`n" | Where-Object { $_ -match '^UNUSED' })
 if ($unusedLine) { Write-Warning $unusedLine.Trim() }
 
 Write-Host ''
+# The pre-junction installer copied the package into profiles\node_modules\@dsh-user\<name>.
+# That copy is no longer used - the profile resolves the package from its own tree - and for
+# dsh-godot-bridge it contains an uninstaller that deletes recursively. Report it instead of
+# removing it: the path is outside this package, and it may hold a version somebody wants.
+$legacy = Join-Path $ProfileRoot "profiles\node_modules\@dsh-user\lsp-echo"
+if (Test-Path $legacy) {
+  $legacyIsLink = [bool]((Get-Item $legacy -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+  if (-not $legacyIsLink) {
+    Write-Host ''
+    Write-Host "note: a legacy copy of this package is still on disk: $legacy" -ForegroundColor Yellow
+    Write-Host '      nothing resolves through it any more; delete it by hand when convenient.'
+  }
+}
 Write-Host 'installed. Restart `dsh web` to activate (a running instance keeps its host rows).'

@@ -356,7 +356,8 @@ pid/启动时间/项目路径,读方据此校验),只有身份不可得时才退
 
 ### 9.3 部署闭环(容易漏)
 
-改 `plugin.gd` 或桥之后要生效,需要四步:`install/install.ps1`(`:42-62` 删目录重拷)→ 重启
+改 `plugin.gd` 或桥之后要生效,需要三步:改源码即可(profile 里是指回仓库的 junction,junction
+本身不用重装;只有新增文件才需重跑 `install/install.ps1`)→ 重启
 `dsh web`(`:110`)→ 对每个项目重跑"安装引擎桥"(`lib/addon.js:130-145` 把 addon 拷进工程)→
 重启 Godot 编辑器(`lib/addon.js:9-11` 说明运行中的编辑器要等插件重载或重启)。`docs/` 不随安装复制。
 

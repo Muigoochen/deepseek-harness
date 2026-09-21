@@ -3,9 +3,13 @@
 # `projects` is deliberately absent. Which projects a machine checks is local to
 # that machine, so the bundle ships no project list and the plugin discovers the
 # projects of the workspace it runs in. A user who needs to pin extra paths — or
-# override any other key — writes their own row in
-# $DSH_HOME/profiles/<name>/cordis.patch.yml, which is applied after every
-# bundle layer and wins by row.
+# override any other key — writes a `- id: lsp-echo` entry in the profile layer
+# ($DSH_HOME/profiles/<name>/cordis.patch.yml), which patches this row. A patched
+# `config` replaces the whole object, so such an entry restates every key it wants
+# to keep.
+#
+# Do NOT write a second `- insert:` for this id there: two inserts of the same id
+# are a fatal `duplicate loader entry id` at boot.
 #
 # Keys here must exist in the plugin's Config schema; that schema also supplies
 # the same defaults, so this row only states them explicitly for a reader.

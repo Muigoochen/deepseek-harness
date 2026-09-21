@@ -1,8 +1,12 @@
-# Append this to C:\Users\<you>\.dsh\profiles\web\cordis.patch.yml
-# (install.ps1 does this automatically and idempotently).
-- insert:
-    - id: lsp-echo
-      name: '@dsh-user/lsp-echo'
-      config:
-        projects:
-          - path: 'E:/GodotProject/xu_world'
+# A profile-layer entry for $DSH_HOME/profiles/<name>/cordis.patch.yml.
+#
+# Do NOT write a second `- insert:` for this id: the row already comes from the
+# package's own cordis.patch.yml (a bundle layer), and two inserts of the same id
+# are a fatal `duplicate loader entry id` at boot.
+#
+# `projects` is machine-local, which is why the bundle's row carries no config.
+# install.ps1 writes this entry only when you pass -Project.
+- id: lsp-echo
+  config:
+    projects:
+      - path: 'E:/GodotProject/xu_world'
