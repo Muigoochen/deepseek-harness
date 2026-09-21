@@ -1,0 +1,36 @@
+# Append this to C:\Users\<you>\.dsh\profiles\web\cordis.patch.yml
+# (install.ps1 does this automatically and idempotently with the defaults below).
+- insert:
+    - id: conversation-summary
+      name: '@dsh-user/conversation-summary'
+      config:
+        # 绝对 token 预算: 只统计"对话本体"(checkpoint 总结 + 未总结历史), 不含系统提示/工具/动态注入
+        absoluteBudgetTokens: 200000
+        # 压缩后保留的最近尾部(对话内容 tokens), 必须小于预算
+        retainTokens: 30000
+        # conversation=对话本体(推荐); envelope=完整请求信封(含系统提示/动态注入)
+        budgetScope: conversation
+        # 处理方式(对所有触发时机统一生效): hint=先询问用户, 同意才压; auto=直接压
+        mode: hint
+        # hint 时是否注入"询问用户"提醒(每轮至多一条)
+        hintEnabled: true
+        # plan 模式结束(批准/驳回/关闭)时也触发压缩; 对话量未到预算也会触发
+        planExit: false
+        # 自由讨论收尾时也触发压缩(agent 判断该时刻); 未到预算也能压
+        freeform: false
+        # 是否注册 compact_conversation 工具(estimate/auto/ask)
+        toolEnabled: true
+        # 是否注入常驻策略提示词(启用中的触发时机 + mode 处理方式)
+        promptEnabled: true
+        # 常驻提示词排序值(默认靠后)
+        promptOrder: 9000
+        # 整段自定义策略文案; 一旦填写就完全替代下方文案的自动拼装。占位符: {budget} {retain} {mode} {planExit} {freeform}
+        # policyText: '你的自定义策略……'
+        # ---- 可编辑文案(共 4 条, 都是 agent 参与的时机; 留空/缺省 = 用默认文案) ----
+        # auto 下"超过预算 / plan 模式结束"由插件直接压(不经 AI, 引擎自行产出 checkpoint), 没有文案
+        # hint 下 超预算 / plan 结束 到点注入(agent 询问你)
+        # askOverBudget: '……'
+        # askPlanExit: '……'
+        # 自由讨论收尾: hint=先问你, auto=已授权直接压(两种都要 agent 判断收尾时刻)
+        # askFreeform: '……'
+        # autoFreeform: '……'

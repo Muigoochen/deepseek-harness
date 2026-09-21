@@ -1,12 +1,10 @@
-# install.ps1 - install repeat-stream-guard into the DSH user profile.
+# install.ps1 — install the conversation-summary plugin into the DSH user profile.
 # Idempotent: copies the package and appends the cordis.patch.yml row exactly once.
-# ASCII-only on purpose: Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI,
-# so non-ASCII text in this file would be mangled into a parse error.
 #
 # Examples:
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 param(
-  [string]$PluginSource = (Join-Path $PSScriptRoot '..'),   # plugins/repeat-stream-guard
+  [string]$PluginSource = (Join-Path $PSScriptRoot '..'),   # plugins/conversation-summary
   [string]$ProfileRoot   = ''                               # defaults to $env:DSH_HOME or ~\.dsh
 )
 
@@ -28,12 +26,12 @@ if (-not $ProfileRoot) {
 }
 $patchFile = Join-Path $ProfileRoot 'profiles\web\cordis.patch.yml'
 if (-not (Test-Path $patchFile)) { throw "profile patch not found: $patchFile (expected DSH_HOME layout profiles\web\cordis.patch.yml)" }
-$dest = Join-Path $ProfileRoot 'profiles\node_modules\@dsh-user\repeat-stream-guard'
+$dest = Join-Path $ProfileRoot 'profiles\node_modules\@dsh-user\conversation-summary'
 
 Write-Host "source : $PluginSource"
 Write-Host "target : $dest"
 
-# ---------- 1. copy the package (lib + manifest + readme) ----------
+# ---------- 1. copy the package (manifest + host half + readme) ----------
 if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
 New-Item -ItemType Directory -Force -Path (Join-Path $dest 'lib') | Out-Null
 Copy-Item (Join-Path $PluginSource 'package.json') (Join-Path $dest 'package.json') -Force
@@ -41,21 +39,30 @@ Copy-Item (Join-Path $PluginSource 'README.md') (Join-Path $dest 'README.md') -F
 Copy-Item (Join-Path $PluginSource 'lib\*.js') (Join-Path $dest 'lib\') -Force
 
 # ---------- 2. cordis.patch.yml row (append exactly once) ----------
-$needle = 'name: ''@dsh-user/repeat-stream-guard'''
+$needle = 'name: ''@dsh-user/conversation-summary'''
 $content = Get-Content $patchFile -Raw
 if ($content -match [regex]::Escape($needle)) {
   Write-Host "patch row already present: $patchFile"
 } else {
   $row = @"
 - insert:
-    - id: repeat-stream-guard
-      name: '@dsh-user/repeat-stream-guard'
+    - id: conversation-summary
+      name: '@dsh-user/conversation-summary'
+      config:
+        absoluteBudgetTokens: 200000
+        retainTokens: 30000
+        mode: hint
+        hintEnabled: true
+        planExit: false
+        freeform: false
 "@
   $content = $content.TrimEnd() + "`r`n" + $row + "`r`n"
   Write-TextNoBom -Path $patchFile -Text $content
-  Write-Host "appended repeat-stream-guard row to: $patchFile"
+  Write-Host "appended conversation-summary row to: $patchFile"
 }
 
 Write-Host ''
-Write-Host 'installed. Restart `dsh web` to activate (a running instance keeps its host rows).'
-Write-Host 'verify: Settings > General shows the loop-behaviour row (Stop / Continue).'
+Write-Host 'installed. Host config hot-applies on web (live); a running instance keeps loaded host'
+Write-Host 'code, so after upgrading lib/*.js restart `dsh web` (and refresh the browser for the GUI).'
+Write-Host 'verify: settings > 会话压缩 shows the cockpit; hint sessions get one ask reminder per epoch'
+Write-Host 'when a scenario is due; the model toolset includes compact_conversation (estimate/auto/ask).'

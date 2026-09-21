@@ -1,12 +1,10 @@
-# install.ps1 - install repeat-stream-guard into the DSH user profile.
+# install.ps1 — install the toast plugin into the DSH user profile.
 # Idempotent: copies the package and appends the cordis.patch.yml row exactly once.
-# ASCII-only on purpose: Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI,
-# so non-ASCII text in this file would be mangled into a parse error.
 #
 # Examples:
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 param(
-  [string]$PluginSource = (Join-Path $PSScriptRoot '..'),   # plugins/repeat-stream-guard
+  [string]$PluginSource = (Join-Path $PSScriptRoot '..'),   # plugins/toast
   [string]$ProfileRoot   = ''                               # defaults to $env:DSH_HOME or ~\.dsh
 )
 
@@ -28,7 +26,7 @@ if (-not $ProfileRoot) {
 }
 $patchFile = Join-Path $ProfileRoot 'profiles\web\cordis.patch.yml'
 if (-not (Test-Path $patchFile)) { throw "profile patch not found: $patchFile (expected DSH_HOME layout profiles\web\cordis.patch.yml)" }
-$dest = Join-Path $ProfileRoot 'profiles\node_modules\@dsh-user\repeat-stream-guard'
+$dest = Join-Path $ProfileRoot 'profiles\node_modules\@dsh-user\toast'
 
 Write-Host "source : $PluginSource"
 Write-Host "target : $dest"
@@ -41,21 +39,21 @@ Copy-Item (Join-Path $PluginSource 'README.md') (Join-Path $dest 'README.md') -F
 Copy-Item (Join-Path $PluginSource 'lib\*.js') (Join-Path $dest 'lib\') -Force
 
 # ---------- 2. cordis.patch.yml row (append exactly once) ----------
-$needle = 'name: ''@dsh-user/repeat-stream-guard'''
+$needle = 'name: ''@dsh-user/toast'''
 $content = Get-Content $patchFile -Raw
 if ($content -match [regex]::Escape($needle)) {
   Write-Host "patch row already present: $patchFile"
 } else {
   $row = @"
 - insert:
-    - id: repeat-stream-guard
-      name: '@dsh-user/repeat-stream-guard'
+    - id: toast
+      name: '@dsh-user/toast'
 "@
   $content = $content.TrimEnd() + "`r`n" + $row + "`r`n"
   Write-TextNoBom -Path $patchFile -Text $content
-  Write-Host "appended repeat-stream-guard row to: $patchFile"
+  Write-Host "appended toast row to: $patchFile"
 }
 
 Write-Host ''
 Write-Host 'installed. Restart `dsh web` to activate (a running instance keeps its host rows).'
-Write-Host 'verify: Settings > General shows the loop-behaviour row (Stop / Continue).'
+Write-Host 'verify: open a workspace page (no startup errors), then any host plugin calling ctx.toast.show(...) floats a toast top-right.'

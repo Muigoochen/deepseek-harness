@@ -1,0 +1,31 @@
+{
+  "name": "@dsh-user/conversation-summary",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Flexible conversation summarization/compaction driven by a scenario x authorization model: scenarios (over-budget, plan-mode exit, free-form finalization) x mode (hint=ask the user first, auto=compress directly), an agent-callable compact_conversation tool (estimate/auto/ask), a resident policy prompt (enabled scenarios + single mode authorization), and a settings-page GUI (设置→会话压缩) for reviewing/tuning the config surface. Drives the built-in durable compaction engine; the checkpoint template stays the engine's built-in one in v0.",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "license": "UNLICENSED",
+  "dependencies": {
+    "zod": "^4.4.3",
+    "@deepseek-ai/dsh-llm": "0.1.2-alpha.3",
+    "@deepseek-ai/dsh-compaction": "0.1.2-alpha.3"
+  },
+  "scripts": {
+    "selfcheck": "node --check lib/index.js && node --check lib/client.js && echo host+client ok"
+  }
+}

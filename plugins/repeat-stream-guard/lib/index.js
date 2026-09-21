@@ -1,32 +1,58 @@
-// repeat-stream-guard — Host 半（无浏览器半）。拦截模型流式输出陷入周期性复读。
+// repeat-stream-guard — Host 半。拦截模型流式输出陷入周期性复读，并按开关决定"停"还是"续"。
 //
 // 背景：模型流式生成时会卡进机械复读（思维链里尤其常见：同一个短句重复几百遍），
 // 而 harness 会一直读到 max_tokens 才收手，白白烧掉大量 token。
 //
-// 做法：监听 waterfall 事件 `llm/stream`，把 provider 的异步流包一层，对增量文本实时
-// 做尾部周期性检测。确认复读后停止产出并跳出循环，于是：
+// 检测：监听 waterfall 事件 `llm/stream`，把 provider 的异步流包一层，对增量文本实时做
+// 尾部周期性检测。确认复读后停止产出并跳出循环，于是：
 //   1. 生成器提前 return，provider adapter 的 finally 会 abort 自己的 HTTP 消费者
 //      （见 packages/llm/llm-deepseek/src/adapter.ts 的 streamWithConnection）——
 //      是真的掐断请求、立即停止计费，而不是把剩余内容读完再丢掉；
-//   2. 流里没有 finish chunk 时 BlockAssembler 兜底为 {kind:'stop'}——本次 turn 正常
-//      结束，已生成的内容保留，不报错、不留下半个工具调用。
+//   2. 流里没有 finish chunk 时 BlockAssembler 兜底为 {kind:'stop'}——那一步不报错，
+//      已生成的内容保留。
 //
-// 纯插件守则：不修改仓库任何产品/底层源码；检测状态只存在于当前进程的当前流上。
+// 切断后做什么，由开关（设置 → 通用页，值存 settings 命名空间）决定：
+//   stop     —— 那一步正常结束；提醒消息留到该 agent 下一次 pre-step 注入，模型下一轮
+//               就知道自己是被复读打断的，不会接着复读。
+//   continue —— 切断瞬间把提醒 append 进 agent 的 next-step 收件箱；agent 循环看到
+//               `inbox.nextStep.length !== 0` 就不结束本轮，于是带着提醒自动再发一次请求。
+//               同一 turn 内最多连续续跑 maxContinues 次，到顶即降级为 stop。
+//
+// 纯插件守则：不修改仓库任何产品/底层源码；每个流各自持有检测状态，只在进程内存里。
 
 import z from '@deepseek-ai/schemastery'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
 /** Cordis 插件名（loader 诊断用）。 */
 export const name = 'repeat-stream-guard'
 
-// 默认值集中在这里，schema 与运行时兜底读同一份常量，避免两处各写一遍。
+/** settings 命名空间，也是浏览器半读写开关用的 key（必须是小写连字符标识）。 */
+const SETTINGS_NS = 'repeat-stream-guard'
+
+// 默认值集中在这里，schema、settings base 与运行时兜底读同一份常量。
 const DEFAULT_MAX_PERIOD = 64
 const DEFAULT_MIN_COPIES = 5
 const DEFAULT_MIN_PERIODIC_CHARS = 120
 const DEFAULT_CHECK_EVERY_CHARS = 32
 const DEFAULT_RETAIN_CHARS = 4000
+const DEFAULT_MODE = 'stop'
+const DEFAULT_MAX_CONTINUES = 2
+
+/** 开关的两个取值。 */
+const MODES = ['stop', 'continue']
 
 /**
- * 配置。全部是部署可调项：改 cordis.patch.yml 里这一行的 config 即可生效。
+ * 模型面向的提醒文本：只讲"下一步该怎么做"，不提插件、流、截断这类实现词汇。
+ * 想改文案只改这一处。
+ */
+const REMINDER_TEXT =
+  'The previous response was stopped early because it began repeating the same '
+  + 'content in a loop. Do not repeat any of it: continue with new content, '
+  + 'state your conclusion, or finish the task.'
+
+/**
+ * 配置。全部是部署可调项：改 cordis.patch.yml 里这一行的 config 即可生效，并作为
+ * settings 命名空间的 base 层（设置页里的用户选择覆盖它）。
  * 注意本仓库 schemastery fork 没有 `.optional()`：字段默认可选，`.default()` 给默认值。
  */
 export const Config = z.object({
@@ -44,6 +70,20 @@ export const Config = z.object({
   watchReasoning: z.boolean().default(true),
   /** 命中时是否用 toast 插件给用户一条悬浮提示（toast 未装载时自动跳过）。 */
   notify: z.boolean().default(true),
+  /** 切断后：`stop` 结束本轮等用户，`continue` 带着提醒自动再跑一轮。 */
+  mode: z.string().default(DEFAULT_MODE),
+  /** continue 模式下同一 turn 内最多连续续跑几次；`0` 表示从不续跑（等同 stop）。 */
+  maxContinues: z.number().default(DEFAULT_MAX_CONTINUES),
+})
+
+/**
+ * 设置命名空间的 schema。设置页那一行只写 `mode`；`maxContinues` 留给 YAML 或设置文件。
+ * 这里用 string + 运行时归一化（而不是 union/const），这样即使有人手改设置文件写入非法值，
+ * 也只会退回默认值并告警，不会让插件装载失败。
+ */
+const SettingsSchema = z.object({
+  mode: z.string().default(DEFAULT_MODE),
+  maxContinues: z.number().default(DEFAULT_MAX_CONTINUES),
 })
 
 /**
@@ -62,6 +102,14 @@ function validateConfig(config) {
     if (!Number.isInteger(value) || value < 1) {
       throw new Error(`repeat-stream-guard: \`${field}\` 必须是 >= 1 的整数，收到 ${String(value)}`)
     }
+  }
+  const maxContinues = config.maxContinues ?? DEFAULT_MAX_CONTINUES
+  if (!Number.isInteger(maxContinues) || maxContinues < 0) {
+    throw new Error(`repeat-stream-guard: \`maxContinues\` 必须是 >= 0 的整数，收到 ${String(maxContinues)}`)
+  }
+  const mode = config.mode ?? DEFAULT_MODE
+  if (!MODES.includes(mode)) {
+    throw new Error(`repeat-stream-guard: \`mode\` 只能是 ${MODES.join(' 或 ')}，收到 ${String(mode)}`)
   }
 }
 
@@ -88,7 +136,7 @@ function findRepeat(text, limits) {
 
 /**
  * 装载入口。
- * @param {import('@deepseek-ai/cordis').Context} ctx 插件上下文；监听器随 fiber 一起销毁
+ * @param {import('@deepseek-ai/cordis').Context} ctx 插件上下文；监听器与设置注册随 fiber 一起销毁
  * @param {object} [config] 见 {@link Config}
  */
 export function apply(ctx, config = {}) {
@@ -104,8 +152,33 @@ export function apply(ctx, config = {}) {
   const notifyEnabled = config.notify ?? true
   const logger = ctx.logger
 
+  // 运行时开关：初值来自 config（settings 的 base 层），设置页改动经 watch 热更新，
+  // 不需要重启。两个服务都是可选的——没有 settings 就是纯 YAML 配置，没有 agents
+  // 就只能切断、没法投递提醒。
+  let mode = config.mode ?? DEFAULT_MODE
+  let maxContinues = config.maxContinues ?? DEFAULT_MAX_CONTINUES
+  const agents = ctx.get('agents')
+
+  const settings = ctx.get('settings')
+  if (settings !== undefined) {
+    const scope = settings.register(SETTINGS_NS, SettingsSchema, {
+      base: { mode: mode, maxContinues: maxContinues },
+    })
+    const adopt = (value) => {
+      if (MODES.includes(value.mode)) mode = value.mode
+      else logger.warn('[repeat-stream-guard] 未知的 mode %o，继续用 %s', value.mode, mode)
+      if (Number.isInteger(value.maxContinues) && value.maxContinues >= 0) maxContinues = value.maxContinues
+    }
+    adopt(scope.get())
+    ctx.effect(() => scope.watch(adopt), `repeat-stream-guard settings(${SETTINGS_NS})`)
+  }
+
   /** 本进程累计切断次数，仅用于日志与提示文案。 */
   let cuts = 0
+  /** agent -> 最近一次 pre-step 的 turn（判断续跑预算属于哪一轮）。 */
+  const continues = new Map()
+  /** agent -> 待投递的提醒消息（stop 模式，或续跑到顶时的降级）。 */
+  const pending = new Map()
 
   /** 通过可选的 toast 服务给用户一条可见提示；toast 没装载就安静跳过。 */
   function notifyUser(text) {
@@ -119,12 +192,57 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /** 构造一条 plugin 来源的提醒消息（notice 形式，不会渲染成用户提问）。 */
+  function reminderMessage(repeat) {
+    const copies = Math.floor(repeat.span / repeat.period)
+    return createUserMessage({
+      content: [{ type: 'text', text: REMINDER_TEXT }],
+      source: {
+        kind: 'plugin',
+        plugin: 'repeat-stream-guard',
+        form: 'notice',
+        summary: `repeat loop cut (${repeat.period} chars × ${copies})`,
+      },
+    })
+  }
+
+  /**
+   * 决定这次切断之后怎么走：续跑就往 next-step 塞一条消息让本轮继续，否则留待该 agent
+   * 下一次 pre-step 注入。
+   * @param {object|undefined} agent 被切断的 agent（非 loop 调用可能没有）
+   * @param {{period:number,span:number}} repeat 命中的周期信息
+   * @returns {'continue'|'stop'} 实际采用的处置方式
+   */
+  function afterCut(agent, repeat) {
+    const message = reminderMessage(repeat)
+    if (agent === undefined) {
+      // 没有 agent 就没有收件箱可投递（例如手工构造的调用）；切断本身已经生效。
+      return 'stop'
+    }
+    const used = continues.get(agent)
+    if (mode === 'continue' && used !== undefined && used.count < maxContinues) {
+      // append 会持久写 agent/inbox/spliced 事件，属于"模型可见 ⟺ 已记录"的正规路径。
+      // 这里必须兜住异常：抛出去会把一次干净的切断变成一次 error turn。
+      try {
+        agent.inbox.append('next-step', message)
+        continues.set(agent, { turn: used.turn, count: used.count + 1 })
+        return 'continue'
+      } catch (error) {
+        logger.warn('[repeat-stream-guard] 续跑入队失败，降级为停止：%o', error)
+      }
+    }
+    pending.set(agent, message)
+    return 'stop'
+  }
+
   /**
    * 包装一条 provider 流：逐块转发，同时盯着文本增量有没有变成机械复读。
    * @param {AsyncIterable<object>} upstream provider 侧的分块流
+   * @param {object} options 本次请求（loop 构造的请求带 sessionId）
    * @returns {AsyncIterable<object>} 原样转发（可能提前结束）的流
    */
-  function guard(upstream) {
+  function guard(upstream, options) {
+    const sessionId = options === null || typeof options !== 'object' ? undefined : options.sessionId
     return (async function* guarded() {
       let raw = ''
       let sinceCheck = 0
@@ -156,13 +274,18 @@ export function apply(ctx, config = {}) {
             cut = true
             cuts += 1
             const copies = Math.floor(repeat.span / repeat.period)
+            const agent = sessionId === undefined || agents === undefined ? undefined : agents.get(sessionId)
+            const action = afterCut(agent, repeat)
             logger.info(
-              '[repeat-stream-guard] 中断复读输出：周期 %d 字符，尾部已重复约 %d 次（累计 %d 次）',
+              '[repeat-stream-guard] 中断复读输出：周期 %d 字符，尾部约 %d 次重复，处置 %s（累计 %d 次）',
               repeat.period,
               copies,
+              action,
               cuts,
             )
-            notifyUser(`检测到周期 ${repeat.period} 字符的重复段（约 ${copies} 次），已提前结束本次生成。`)
+            notifyUser(action === 'continue'
+              ? `检测到周期 ${repeat.period} 字符的重复段（约 ${copies} 次），已中断并自动继续。`
+              : `检测到周期 ${repeat.period} 字符的重复段（约 ${copies} 次），已提前结束本轮。`)
           }
         }
 
@@ -172,6 +295,19 @@ export function apply(ctx, config = {}) {
     })()
   }
 
+  // 记录每个 agent 当前的 turn（供续跑预算判断），并在轮次边界清零预算；同时把 stop
+  // 模式攒下的提醒投递给下一步。
+  ctx.on('agent/pre-step', async ({ agent, turn }, next) => {
+    const used = continues.get(agent)
+    if (used === undefined || used.turn !== turn) continues.set(agent, { turn, count: 0 })
+    const decision = await next()
+    const reminder = pending.get(agent)
+    if (reminder === undefined || decision.kind !== 'enter') return decision
+    // 只有真的进入下一步时才消费提醒；被下游 reject 掉就留到下一次。
+    pending.delete(agent)
+    return { ...decision, messages: [reminder, ...decision.messages] }
+  })
+
   // waterfall：先向下游要真正的 provider 流，再把包装后的流交回去。
-  ctx.on('llm/stream', (_options, next) => guard(next()))
+  ctx.on('llm/stream', (options, next) => guard(next(), options))
 }

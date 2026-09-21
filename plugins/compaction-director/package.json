@@ -1,0 +1,19 @@
+{
+  "name": "@dsh-user/compaction-director",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Engine director for conversation-summary: occupies the ctx.compaction seat and dispatches per-session to the official basic engine or the instant (VCC) engine, auto disabled on children.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "license": "MIT"
+}

@@ -1,6 +1,8 @@
 # 追加到 C:\Users\<you>\.dsh\profiles\web\cordis.patch.yml
 # （install.ps1 会自动且幂等地追加这一行；本文件只是行示例。）
-# 本插件只有 Host 半，config 全部可省（省略即用默认阈值）。
+# 这一行同时带起 Host 半（lib/index.js）与浏览器半（lib/client.js）。
+# config 是可选的：省略即用全部默认值；这里列出的字段是 base 层，
+# 设置页「复读时」开关选出的 mode 会覆盖它。
 - insert:
     - id: repeat-stream-guard
       name: '@dsh-user/repeat-stream-guard'
@@ -8,3 +10,5 @@
         minPeriodicChars: 120
         minCopies: 5
         maxPeriod: 64
+        mode: stop
+        maxContinues: 2

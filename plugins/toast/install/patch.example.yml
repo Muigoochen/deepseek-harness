@@ -1,0 +1,7 @@
+# Append this to C:\Users\<you>\.dsh\profiles\web\cordis.patch.yml
+# (install.ps1 does this automatically and idempotently).
+# This single row loads both halves: the Host half (lib/index.js) and the
+# browser half (lib/client.js via the dsh.client module scan).
+- insert:
+    - id: toast
+      name: '@dsh-user/toast'

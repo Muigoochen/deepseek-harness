@@ -1,0 +1,25 @@
+{
+  "name": "@dsh-user/toast",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "仓库级可复用的浮动提示(toast)静态插件:Host 半提供 toast.show/dismiss 服务与事件长询路由,浏览器半在 shell.overlay 渲染浮窗。",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "scripts": {
+    "selfcheck": "node --check lib/client.js && node -e \"import('file:///' + process.cwd().replaceAll('\\\\', '/') + '/lib/index.js').then(m => { if (typeof m.apply !== 'function' || !Array.isArray(m.inject)) throw new Error('bad host exports'); console.log('host half ok') }).catch(e => { console.error(e); process.exit(1) })\""
+  }
+}

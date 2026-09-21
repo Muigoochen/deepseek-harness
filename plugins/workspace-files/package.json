@@ -1,0 +1,26 @@
+{
+  "name": "@dsh-user/workspace-files",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Web sidebar workspace file tree + drag-to-reference plugin (pure plugin, no product-source changes). Host half serves per-workspace directory listings over a same-origin HTTP route; browser half renders a drawer with per-workspace file tree / conversations and drops '@relative' references into the composer.",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "license": "UNLICENSED",
+  "scripts": {
+    "selfcheck": "node --check lib/index.js && node --check lib/client.js && echo host+client ok"
+  }
+}

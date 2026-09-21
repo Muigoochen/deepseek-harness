@@ -1,13 +1,19 @@
 {
   "name": "@dsh-user/repeat-stream-guard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "repeat-stream-guard: 拦截模型流式输出（含思维链）陷入周期性复读，提前收流止损，不再空烧到 max_tokens。Host 单半，零构建。",
+  "description": "repeat-stream-guard: 拦截模型流式输出（含思维链）陷入周期性复读，提前收流止损；切断后按设置页开关选择「停止」或「带着提醒自动续跑」。零构建。",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
   },
   "files": [
     "lib",
@@ -15,6 +21,6 @@
   ],
   "license": "MIT",
   "scripts": {
-    "selfcheck": "node --check lib/index.js && echo host half syntax ok"
+    "selfcheck": "node --check lib/index.js && node --check lib/client.js && echo halves syntax ok"
   }
 }

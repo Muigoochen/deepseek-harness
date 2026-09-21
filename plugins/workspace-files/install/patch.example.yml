@@ -1,0 +1,5 @@
+# workspace-files — cordis.patch.yml row (install.ps1 appends this automatically).
+# Add to $DSH_HOME/profiles/web/cordis.patch.yml:
+- insert:
+    - id: workspace-files
+      name: '@dsh-user/workspace-files'
