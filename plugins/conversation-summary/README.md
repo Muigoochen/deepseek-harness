@@ -58,9 +58,16 @@
 powershell -ExecutionPolicy Bypass -File install\install.ps1
 ```
 
-脚本把包复制到 `$env:DSH_HOME 或 ~\.dsh` 的 `profiles\node_modules\@dsh-user\conversation-summary`，并向 `profiles\web\cordis.patch.yml` 幂等追加插件行。web profile 组合是 **live 热应用**：web 正在运行时保存即生效（宿主半），无需为宿主逻辑重启；若此前从未启用（或改动了宿主代码 `lib/*.js`）、或要看到设置页等客户端界面，需**重启 `dsh web` / 刷新页面**做确定性验证。
+脚本用 DSH 官方方式安装本包：`dsh plugin --profile web add <本包路径>`，由它把包链入 profile 并登记为
+依赖与 bundle，随后自检宿主半能否导入、浏览器半是否合法。**不再复制文件**，安装后 profile 通过 `link:`
+指向本目录，改完源码直接生效。web profile 组合是 **live 热应用**：web 正在运行时保存即生效（宿主半），
+无需为宿主逻辑重启；要看到设置页等客户端界面，需**刷新页面**做确定性验证。
 
-卸载：从 `cordis.patch.yml` 删掉该行、删除 `@dsh-user/conversation-summary` 目录；运行中保存即停用（删除节点后建议刷新/重启确认）。
+本包贡献的配置层在包根的 `cordis.patch.yml`（只有 id 与 name）；profile 自己那份
+`$DSH_HOME\profiles\web\cordis.patch.yml` 在同 id 上后应用、会覆盖它，所以预算与触发设置写在那里。
+
+卸载：`dsh plugin --profile web remove @dsh-user/conversation-summary`（或 `install\uninstall.ps1`），
+它同时从 profile 的 bundle 列表里摘掉本包；运行中保存即停用（建议刷新确认）。
 
 ## GUI（设置页「会话压缩」）
 

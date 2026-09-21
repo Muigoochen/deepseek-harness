@@ -80,7 +80,7 @@ preset 压缩组（每 preset 一个 standing isolate realm，实例跨该 prese
 
 ## 4. 部署与接入步骤
 
-1. 安装引擎包：instant（受管安装或复制到本人命名空间做测试）与 recall 工具（可选）。
+1. 安装引擎包：instant（受管安装，即 `dsh plugin add`）与 recall 工具（可选）。
 2. 把目标 preset 压缩组引擎行换成 director 行（`name: '@dsh-user/compaction-director'`），保留 `toolResultPruner` 同行、保留 isolate。
 3. director/策略行配置 `defaultEngine`；GUI 设置会话覆盖。
 4. **重启一次 dsh web**（待实测，见 P0-h）：现有会话恢复时是否按新行重挂 director 未获直接证据（standing 世代机制主要服务后续会话）；若证实不重挂，现有会话需新开或进一步验证。

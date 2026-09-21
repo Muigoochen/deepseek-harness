@@ -1,9 +1,11 @@
-# Append this to C:\Users\<you>\.dsh\profiles\web\cordis.patch.yml
-# (install.ps1 does this automatically and idempotently with the defaults below).
-- insert:
-    - id: conversation-summary
-      name: '@dsh-user/conversation-summary'
-      config:
+# A profile-layer entry for $DSH_HOME/profiles/<name>/cordis.patch.yml.
+#
+# Do NOT write a second `- insert:` for this id: the row already comes from the
+# package's own cordis.patch.yml (a bundle layer), and two inserts of the same id
+# are a fatal `duplicate loader entry id` at boot. An entry carrying only `- id:`
+# patches the row the bundle inserted, which is what the choices below are for.
+- id: conversation-summary
+  config:
         # 绝对 token 预算: 只统计"对话本体"(checkpoint 总结 + 未总结历史), 不含系统提示/工具/动态注入
         absoluteBudgetTokens: 200000
         # 压缩后保留的最近尾部(对话内容 tokens), 必须小于预算
