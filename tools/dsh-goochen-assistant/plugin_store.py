@@ -311,6 +311,19 @@ def render_segment(rows: Iterable[ManagedRow]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _ensure_patch_content(text: str) -> str:
+    """补丁不能只剩注释/空行——那样 dsh 冷启动会硬失败。
+
+    助手把**最后一条**管理行去掉时正好落到这个形态，所以这里补一个 `[]`（空数组本身
+    就是合法的顶层数组；已装的 dsh-market 用同一招做占位恢复），而不是拒绝写盘。
+    """
+    for raw in _raw_lines(text):
+        line = raw.rstrip("\r\n")
+        if line.strip() and not line.lstrip().startswith("#"):
+            return text
+    return "[]\n"
+
+
 def apply_managed(text: str, rows: Sequence[ManagedRow],
                   expect: Optional[Sequence[ManagedRow]] = None) -> str:
     """返回写盘文本：替换/追加管理段。
@@ -342,14 +355,14 @@ def apply_managed(text: str, rows: Sequence[ManagedRow],
                 and {r.id for r in existing} != {r.id for r in rows}:
             raise ProtectedShapeError(
                 "管理段内容与目标台账不一致，为避免误覆盖本次拒改。")
-        return "".join(lines[:s]) + block + "".join(lines[e + 1:])
+        return _ensure_patch_content("".join(lines[:s]) + block + "".join(lines[e + 1:]))
     if expect and list(expect):
         raise ProtectedShapeError("台账有受管行但补丁里没有管理段（不一致）。")
     if not rows:
         return text
     if lines and not lines[-1].endswith(("\n", "\r")):
         lines.append("\n")
-    return "".join(lines) + block
+    return _ensure_patch_content("".join(lines) + block)
 
 
 # ---------------------------------------------------------------- 发现与校验
@@ -770,6 +783,7 @@ def backup_patch(patch: Path) -> Optional[Path]:
 
 def commit_patch(home: Path, patch_text: str) -> Path:
     """原子落盘补丁（调用前必须已过结构门）。返回补丁路径。"""
+    ensure_top_level_array(patch_text)      # 最后一次闸：文件必须是顶层数组
     patch = web_patch(home)
     patch.parent.mkdir(parents=True, exist_ok=True)
     backup_patch(patch)
@@ -825,8 +839,13 @@ def install(home: Path, source: PluginSource, *, project: Optional[Path] = None,
 
 def set_enabled(home: Path, slug: str, enabled: bool, *, project: Optional[Path] = None,
                 run_dump: Optional[Callable[[Path], DumpResult]] = None,
-                dsh_command: Optional[Sequence[str]] = None) -> Ledger:
-    """启用/停用：改台账 disabled → 自有段重写 → 结构门 → 落盘。"""
+                dsh_command: Optional[Sequence[str]] = None,
+                gate: bool = True) -> Ledger:
+    """启用/停用：改台账 disabled → 自有段重写 → 结构门 → 落盘。
+
+    `gate=False` 是**应急路径**：不跑 dsh（插件冲突导致 dsh 起不来时正好跑不了），
+    改为本地形状自检——管理段仍须能按受限方言解析回来，否则拒写。
+    """
     if not is_valid_slug(slug):
         raise PluginError(f"非法 slug：{slug!r}")
     ledger = ledger_load(home)
@@ -837,10 +856,26 @@ def set_enabled(home: Path, slug: str, enabled: bool, *, project: Optional[Path]
         return ledger                       # 已是目标状态，幂等
     new_ledger = ledger.upsert(ManagedRow(id=slug, disabled=not enabled))
     text = apply_managed(_read_patch(home), new_ledger.rows, expect=ledger.rows)
-    structure_gate(home, text, run_dump=run_dump, project=project,
-                   dsh_command=dsh_command)
+    if gate:
+        structure_gate(home, text, run_dump=run_dump, project=project,
+                       dsh_command=dsh_command)
+    else:
+        local_shape_check(text)
     _save_ledger_and_patch(home, new_ledger, text)
     return new_ledger
+
+
+def local_shape_check(text: str) -> None:
+    """不跑 dsh 时的本地自检：管理段仍能按受限方言原样解析回来。
+
+    应急路径（`gate=False`）用它兜底：dsh 起不来时无法用 dump 验证，但至少保证
+    自己写出去的补丁形状没坏——坏了就抛 ProtectedShapeError，绝不落盘。
+    """
+    span = find_managed_span(text)
+    if span is None:
+        return
+    lines = _raw_lines(text)
+    _parse_segment_lines(lines[span[0] + 1:span[1]], None)
 
 
 def _strip_managed(text: str) -> str:
@@ -1061,6 +1096,239 @@ def adopt(home: Path, slug: str, *, project: Optional[Path] = None,
     return new_ledger
 
 
+# ------------------------------------------------- 本地解析补丁行（dsh 起不来也能用）
+
+@dataclass(frozen=True)
+class PatchRow:
+    """补丁里的一个插件行——直接读文件得来，**不依赖 dsh 的 dump**。"""
+    id: str
+    name: str
+    disabled: bool
+    managed: bool          # 在小助手自有管理段内（那种行要改台账，不走文件级开关）
+
+
+_PATCH_ID_RE = re.compile(r"^    - id: (\S+)\s*$")
+_PATCH_NAME_RE = re.compile(r"^      name: ['\"]([^'\"]+)['\"]\s*$")
+_PATCH_FLAG_RE = re.compile(r"^      disabled:\s*(\S+)\s*$")
+#: 顶层的 id 覆盖行（`- id: X` + 两空格的 disabled）—— 同一文件里**靠后的层胜**。
+_TOP_ID_RE = re.compile(r"^- id: (\S+)\s*$")
+_TOP_FLAG_RE = re.compile(r"^  disabled:\s*(\S+)\s*$")
+
+
+def parse_patch_rows(text: str) -> list[PatchRow]:
+    """宽容解析补丁里的插件行（id/name/disabled，含顶层 id 覆盖行的影响）。
+
+    认不出的行直接跳过、绝不抛错：它的用途是在 **dsh 起不来**（结构门跑不了）时
+    仍把用户的插件行列出来。列表宁可少一行，也不能因此打不开。
+    """
+    lines = _raw_lines(text)
+    try:
+        span = find_managed_span(text)
+    except ProtectedShapeError:
+        span = None
+    found: list[tuple[int, str, str, bool, bool]] = []      # (行号, id, name, disabled, managed)
+    overrides: list[tuple[int, str, bool]] = []             # (行号, id, disabled)
+    element_start: Optional[int] = None
+    for i, raw in enumerate(lines):
+        line = raw.rstrip("\r\n")
+        if line.strip() and not line[0].isspace():
+            if line.lstrip().startswith("#"):
+                continue
+            element_start = i                     # 新的顶层元素
+            top = _TOP_ID_RE.match(line)
+            if top:
+                over_id = top.group(1).strip("'\"")
+                for j in range(i + 1, len(lines)):
+                    nxt = lines[j].rstrip("\r\n")
+                    if not nxt.strip() or not nxt[0].isspace():
+                        break
+                    fl = _TOP_FLAG_RE.match(nxt)
+                    if fl:
+                        overrides.append((i, over_id, fl.group(1).lower() == "true"))
+            continue
+        m = _PATCH_ID_RE.match(line)
+        if not m or element_start is None:
+            continue
+        row_id = m.group(1).strip("'\"")
+        name = row_id
+        disabled = False
+        for j in range(i + 1, len(lines)):
+            nxt = lines[j].rstrip("\r\n")
+            if not nxt.strip() or _PATCH_ID_RE.match(nxt) or not nxt[0].isspace():
+                break
+            nm = _PATCH_NAME_RE.match(nxt)
+            if nm and name == row_id:
+                name = nm.group(1)
+                continue
+            fl = _PATCH_FLAG_RE.match(nxt)
+            if fl:
+                disabled = fl.group(1).lower() == "true"
+        found.append((i, row_id, name, disabled,
+                      span is not None and span[0] < i < span[1]))
+    rows: list[PatchRow] = []
+    for at, row_id, name, disabled, managed in found:
+        for over_at, over_id, over_disabled in overrides:
+            if over_id == row_id and over_at > at:      # 同文件里靠后的覆盖行胜出
+                disabled = over_disabled
+        rows.append(PatchRow(id=row_id, name=name, disabled=disabled, managed=managed))
+    return rows
+
+
+def patch_rows(home: Path) -> list[PatchRow]:
+    """列出 web 补丁里的插件行（含 disabled 状态）；补丁不存在返回空列表。"""
+    return parse_patch_rows(_read_patch(home))
+
+
+# ------------------------------------------------- 应急开关段（顶层 id 覆盖行）
+
+#: 小助手自己追加的「应急开关」段：用官方的顶层 id 覆盖行写法停用/放行某一行
+#: （`- id: X` + `disabled: true|false`，与 web-app 与 dsh-market 的写法一致）。
+#: 不碰用户原有的任何一行——只在自己这一小块里增删，最容易回滚。
+SWITCH_START = "# --- dsh-offline-installer switch: start ---"
+SWITCH_END = "# --- dsh-offline-installer switch: end ---"
+
+
+def switch_state(home: Path) -> dict[str, bool]:
+    """读小助手应急开关段：id → 是否停用。段不在就返回空。"""
+    text = _read_patch(home)
+    lines = _raw_lines(text)
+    start = end = None
+    for i, raw in enumerate(lines):
+        s = raw.rstrip("\r\n").strip()
+        if s == SWITCH_START:
+            start = i
+        elif s == SWITCH_END:
+            end = i
+            break
+    if start is None or end is None:
+        return {}
+    out: dict[str, bool] = {}
+    cur: Optional[str] = None
+    for raw in lines[start + 1:end]:
+        line = raw.rstrip("\r\n")
+        m = _TOP_ID_RE.match(line)
+        if m:
+            cur = m.group(1).strip("'\"")
+            out.setdefault(cur, False)
+            continue
+        fl = _TOP_FLAG_RE.match(line)
+        if fl and cur:
+            out[cur] = fl.group(1).lower() == "true"
+    return out
+
+
+def _render_switch(state: dict[str, bool]) -> str:
+    lines = [SWITCH_START]
+    for row_id, disabled in state.items():
+        lines.append(f"- id: {row_id}")
+        lines.append(f"  disabled: {'true' if disabled else 'false'}")
+    lines.append(SWITCH_END)
+    return "\n".join(lines) + "\n"
+
+
+def _with_switch(text: str, state: dict[str, bool]) -> str:
+    """把应急开关段写进文本；段空则整段删掉。
+
+    段必须落在**管理段之前**：管理段被要求位于文件末尾（见 `find_managed_span`），
+    把开关段追加到它后面会被判成「管理段之后有非助手内容」而拒改。
+    """
+    lines = _raw_lines(text)
+    start = end = None
+    for i, raw in enumerate(lines):
+        s = raw.rstrip("\r\n").strip()
+        if s == SWITCH_START and start is None:
+            start = i
+        elif s == SWITCH_END and start is not None:
+            end = i
+            break
+    body = "".join(lines[:start] if start is not None else lines)
+    tail = "".join(lines[end + 1:] if end is not None else [])
+    if not state:
+        return body + tail
+    block = _render_switch(state)
+    body_lines = _raw_lines(body)
+    anchor = next((i for i, raw in enumerate(body_lines)
+                   if raw.rstrip("\r\n").strip() == MANAGED_START), None)
+    if anchor is None:
+        if body and not body.endswith(("\n", "\r")):
+            body += "\n"
+        return body + block + tail
+    head = "".join(body_lines[:anchor])
+    if head and not head.endswith(("\n", "\r")):
+        head += "\n"
+    return head + block + "".join(body_lines[anchor:]) + tail
+
+
+def ensure_top_level_array(text: str) -> None:
+    """写盘前最后一道闸：补丁不能只剩注释/空行。
+
+    最容易踩的坑：把最后一条记录去掉后文件只剩注释——那不是「顶层数组」，dsh 冷启动
+    直接硬失败（已装的 dsh-market 专门为此做了 `[]` 占位恢复）。
+    """
+    for raw in _raw_lines(text):
+        line = raw.rstrip("\r\n")
+        if line.strip() and not line.lstrip().startswith("#"):
+            return
+    raise ProtectedShapeError(
+        "补丁被写成了空的（只剩注释/空行）：dsh 要求顶层是数组，空文件应写 `[]`。")
+
+
+def _switch_row_after(text: str, row_id: str) -> list[PatchRow]:
+    return [r for r in parse_patch_rows(text) if r.id == row_id]
+
+
+def set_row_enabled(home: Path, row_id: str, enabled: bool, *,
+                    project: Optional[Path] = None,
+                    run_dump: Optional[Callable[[Path], DumpResult]] = None,
+                    dsh_command: Optional[Sequence[str]] = None,
+                    gate: bool = False) -> None:
+    """**外部行 / 首方行**（用户自己写的补丁行）禁用/启用：追加官方的顶层 id 覆盖行。
+
+    写成
+        - id: <row_id>
+          disabled: true
+    追加在小助手自己的「应急开关」段里，**一个字都不改用户原有的行**（含 config）。
+    启用时先把段里那条删掉；若该行仍被更低层（它自己元素里的 `disabled: true`）停用，
+    再写 `disabled: false` 强制放行——这是官方语义里唯一能压过低层的写法。
+
+    默认**不跑结构门**：这个开关的用途正是「插件冲突导致 dsh 起不来」时救急，
+    那时结构门（`dsh --dump-config`）也跑不了。用文件级自检 + `.bak` 备份兜底。
+    """
+    if not is_valid_slug(row_id):
+        raise PluginError(f"非法插件 id：{row_id!r}（只允许小写字母/数字/连字符）")
+    text = _read_patch(home)
+    if not text:
+        raise PluginError("web 补丁不存在，无法禁用/启用。")
+    hit = _switch_row_after(text, row_id)
+    if not hit:
+        raise PluginError(f"补丁里没有 id 为 {row_id} 的插件行。")
+    if hit[0].managed:
+        raise PluginError(f"{row_id} 在助手自有管理段内：请在插件页对它点『停用』。")
+
+    state = switch_state(home)
+    if enabled:
+        state.pop(row_id, None)
+        new_text = _with_switch(text, state)
+        if [r for r in parse_patch_rows(new_text) if r.id == row_id][0].disabled:
+            # 它自己在元素里写了 disabled: true → 用 disabled: false 压过去
+            state[row_id] = False
+            new_text = _with_switch(text, state)
+    else:
+        if hit[0].disabled and row_id not in state:
+            return                              # 已经是停用状态（用户自己停的）
+        state[row_id] = True
+        new_text = _with_switch(text, state)
+
+    after = [r for r in parse_patch_rows(new_text) if r.id == row_id]
+    if len(after) != 1 or after[0].disabled == enabled:
+        raise ProtectedShapeError(f"{row_id} 改写后自检未通过，已放弃（原文件未改动）。")
+    ensure_top_level_array(new_text)
+    if gate:
+        structure_gate(home, new_text, run_dump=run_dump, project=project,
+                       dsh_command=dsh_command)
+    commit_patch(home, new_text)                # 内含 .bak 备份 + 原子替换
+
+
 def list_archive_plugins(archive: Path) -> list[tuple[str, Validation]]:
     """列出离线包（assets/plugins.tar.gz）里按规范打包的插件。
 
@@ -1163,10 +1431,15 @@ def profile_manifest(home: Path) -> dict:
 
 
 def profile_manifest_write(home: Path, data: dict) -> None:
+    """原子写 profile 的 package.json（先备份 .bak，再 tmp + replace）。"""
     p = _web_pkg_json(home)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-                 encoding="utf-8")
+    if p.exists():
+        shutil.copy2(p, p.with_name(p.name + ".bak"))
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, p)
 
 
 def bundle_installed(home: Path) -> list[tuple[str, bool]]:
@@ -1502,6 +1775,84 @@ def bundle_remove(home: Path, name: str, *, project: Optional[Path] = None,
         raise PluginError(f"移除后仍在 dsh.profile.bundles：{name}")
 
 
+# ---------------------------------------------------------------- bundle 禁用/启用（不跑 dsh）
+
+#: 记着哪些 bundle 被禁用过（名字 → 原来在 dsh.profile.bundles 里的位置）。
+#: 用独立小文件，不动既有台账格式；包文件与 dependencies 全部保留，启用是瞬时的。
+BUNDLE_STATE_FILE = ".dsh-assistant-bundles.json"
+
+
+def bundle_state_path(home: Path) -> Path:
+    return home / "profiles" / "web" / BUNDLE_STATE_FILE
+
+
+def bundle_disabled(home: Path) -> dict[str, int]:
+    """被禁用的 bundle：名字 → 原位置（重新启用时插回原处）。读不出来就当作没有。"""
+    path = bundle_state_path(home)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    out: dict[str, int] = {}
+    for name, index in (data.get("disabled") or {}).items():
+        if isinstance(name, str) and name:
+            out[name] = index if isinstance(index, int) else 0
+    return out
+
+
+def _bundle_state_write(home: Path, disabled: dict[str, int]) -> None:
+    path = bundle_state_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"disabled": disabled}, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def bundle_set_enabled(home: Path, name: str, enabled: bool) -> None:
+    """禁用/启用一个 bundle：只改 `dsh.profile.bundles`，包文件与依赖声明原样保留。
+
+    这就是「dsh 起不来时的排查开关」：profiles/web/cordis.yml 的注释写明组合顺序是
+    「package.json 的 dsh.profile.bundles → cordis.patch.yml → --patch 覆盖层」，
+    所以从 bundles 里拿掉 = 该 bundle 不再参与组合。文件仍在 node_modules 里，
+    重新启用立即生效——不用重装、不需要 pnpm、更不需要 dsh 能跑起来。
+    """
+    if name in BUNDLE_BUILTIN:
+        raise PluginError(f"{name} 是内置模板 bundle，不可禁用")
+    data = profile_manifest(home)          # package.json 损坏会抛 PluginError，绝不覆盖
+    dsh = data.get("dsh")
+    if not isinstance(dsh, dict):
+        raise PluginError("profile package.json 里没有 dsh 段")
+    profile = dsh.get("profile")
+    if not isinstance(profile, dict):
+        raise PluginError("profile package.json 里没有 dsh.profile")
+    bundles = profile.get("bundles")
+    if not isinstance(bundles, list):
+        raise PluginError("profile package.json 里没有 dsh.profile.bundles 列表")
+    state = bundle_disabled(home)
+    if enabled:
+        if name in bundles:
+            if name in state:               # 状态文件残留：清掉即可
+                state.pop(name, None)
+                _bundle_state_write(home, state)
+            return                          # 已启用，幂等
+        if name not in (data.get("dependencies") or {}):
+            raise PluginError(f"{name} 已不在 profile 依赖里（包文件可能被删），请重新安装")
+        at = min(max(0, state.get(name, len(bundles))), len(bundles))
+        bundles.insert(at, name)            # 插回原位置，保持组合顺序不变
+        state.pop(name, None)
+    else:
+        if name not in bundles:
+            return                          # 已禁用，幂等
+        state[name] = bundles.index(name)
+        bundles.remove(name)
+    profile["bundles"] = bundles
+    profile_manifest_write(home, data)
+    _bundle_state_write(home, state)
+
+
 # ---------------------------------------------------------------- 插件市场（收录 + 本地 + 已装）
 
 @dataclass(frozen=True)
@@ -1716,8 +2067,13 @@ def web_patch_declared_ids(home: Path) -> set[str]:
     return ids
 
 
-def status_view(home: Path, sources: Sequence[PluginSource],
-                dump: DumpResult) -> list[PluginCard]:
+def status_view(home: Path, sources: Sequence[PluginSource], dump: DumpResult,
+                local_rows: Optional[Sequence[PatchRow]] = None) -> list[PluginCard]:
+    """合成插件页行：台账(意图) + dump(有效) [+ 文件级兜底]。
+
+    `local_rows` 只在结构门跑不了（dsh 起不来）时传进来：dump 为空的话插件页会
+    一行都不显示，用户就没法用禁用来排查了。
+    """
     ledger = ledger_load(home)
     by_slug = {s.slug: s for s in sources}
     declared = web_patch_declared_ids(home)
@@ -1772,6 +2128,29 @@ def status_view(home: Path, sources: Sequence[PluginSource],
                 description=s.description, origin=s.origin,
                 installed_dir=None, source=s.path,
                 first_party=False, validation_errors=s.validation.errors))
+    # 结构门跑不了（dsh 起不来）时的文件级兜底：至少把用户补丁里的插件行列出来，
+    # 否则插件页一片空白，用户就没有「禁用它试试」的入口了
+    if local_rows:
+        seen = {c.slug for c in cards} | {c.name for c in cards}
+        for row in local_rows:
+            m = NAME_RE.match(row.name)
+            slug = m.group(1) if m else row.id
+            if slug in seen or row.name in seen:
+                continue
+            seen.add(slug)
+            src = by_slug.get(slug)
+            if ledger.row(slug) is not None:
+                state = "disabled" if row.disabled else "enabled"
+            else:
+                state = "external-disabled" if row.disabled else "external"
+            cards.append(PluginCard(
+                slug=slug, name=row.name, state=state,
+                description=src.description if src else "",
+                origin=(src.origin if src else "external"),
+                installed_dir=anchor_dir(home, slug) if anchor_dir(home, slug).exists() else None,
+                source=src.path if src else None,
+                first_party=False,
+                validation_errors=src.validation.errors if src else ()))
     cards.sort(key=lambda c: (c.state not in ("enabled",), c.name))
     return cards
 

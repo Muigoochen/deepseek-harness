@@ -2080,6 +2080,10 @@ class App(tk.Tk):
                    width=9).pack(side="left", padx=4)
         self.plugin_hint_lbl = ttk.Label(bar, text="扫描中…", foreground="#666")
         self.plugin_hint_lbl.pack(side="left", padx=6)
+        # dsh 起不来（结构门跑不了）时亮起来：这时列表来自直接读补丁，禁用照样可用
+        self.plugin_offline_lbl = ttk.Label(
+            bar, text="", foreground="#a05a00", font=("Microsoft YaHei UI", 8))
+        self.plugin_offline_lbl.pack(side="left")
         # 远程下载一行
         dl = ttk.Frame(box)
         dl.pack(fill="x", pady=(4, 0))
@@ -2116,7 +2120,10 @@ class App(tk.Tk):
             box,
             text="一行一个插件，安装/卸载/启用/停用按类型自动处理；"
                  "本地插件为草稿，点「全部保存并重启网页版」落盘；"
-                 "在线插件真实安装到 profile，需重启网页版生效。",
+                 "在线插件真实安装到 profile，需重启网页版生效。\n"
+                 "排查启动冲突：「禁用」只把那一行停掉（写成官方的 disabled: true）或把 bundle "
+                 "从 dsh.profile.bundles 摘掉，文件与依赖都留着，点「启用」立刻还原；"
+                 "原生「外部」行也能这样禁停，不必先接管。",
             foreground="#888", font=("Microsoft YaHei UI", 8), justify="left")
         self.plugin_note.pack(anchor="w", pady=(4, 0))
         self.btn_save = ttk.Button(box, text="全部保存并重启网页版",
@@ -2175,24 +2182,37 @@ class App(tk.Tk):
             patch = pstore.web_patch(home)
             if patch.exists():
                 patch_text = patch.read_text(encoding="utf-8")
+            local_rows = None
             try:
                 dump = pstore.structure_gate(home, patch_text, project=project)
-            except pstore.GateError as exc:
-                self._append(f"[插件] 当前补丁结构门未过：{exc}")
+            except Exception as exc:  # noqa: BLE001  GateError / 找不到 dsh / dump 超时
+                # **降级**：结构门跑不了（多半是某个插件把 dsh 搞得起不来）时，
+                # 改为直接读补丁把行列出来——否则插件页一片空白，用户就没有
+                # 「禁用它试试」的入口了。禁用/启用本来就不需要 dsh 能跑。
+                self._append(f"[插件] 结构门未过（{exc}）")
+                self._append("[插件] 已改为直接读补丁列出插件行；禁用/启用仍可用（免校验）")
                 dump = pstore.parse_dump("")
-            cards = pstore.status_view(home, sources, dump)
+                local_rows = pstore.patch_rows(home)
+            cards = pstore.status_view(home, sources, dump, local_rows=local_rows)
             entries = pstore.market_entries(home, project, ASSETS)
             catalog = pstore.catalog_entries(home)
-            self._post(self._apply_plugins, cards, entries, home, project, catalog)
+            self._post(self._apply_plugins, cards, entries, home, project, catalog,
+                       local_rows is not None)
         except Exception as exc:  # noqa: BLE001
             self._append(f"[插件] 刷新失败：{exc}")
 
     def _apply_plugins(self, cards, entries, home: Path, project: Path,
-                       catalog=()) -> None:
+                       catalog=(), offline: bool = False) -> None:
         self.plugin_cards = cards
         self.plugin_home_dir, self.plugin_project = home, project
         self.plugin_catalog = {c["slug"]: c for c in catalog}
-        items = self._merge_plugins(cards, entries, catalog)
+        try:
+            self.plugin_offline_lbl.configure(
+                text="⚠ dsh 当前起不来（结构门未过）：列表直接读自补丁，"
+                     "禁用/启用免校验、立即写盘" if offline else "")
+        except Exception:  # noqa: BLE001  窗口销毁后忽略
+            pass
+        items = self._merge_plugins(cards, entries, catalog, home)
         self.plugin_items = items
         for child in self.plugin_rows.winfo_children():
             child.destroy()
@@ -2293,10 +2313,21 @@ class App(tk.Tk):
                 self._status(f"已安装 {name}（需重启网页版生效）")
             elif action == "uninstall":
                 name = pstore._spec_pkg_name(value)
+                if name in pstore.bundle_disabled(home):
+                    # 被禁用时它不在 bundles 里，dsh plugin remove 会认为「未安装」
+                    pstore.bundle_set_enabled(home, name, enabled=True)
                 pstore.bundle_remove(home, name, project=project,
                                      env=self._bundle_env())
                 self._plog(f"[市场] ✓ 已卸载 {name}（重启生效）")
                 self._status(f"已卸载 {name}")
+            elif action in ("bundle_off", "bundle_on"):
+                name = pstore._spec_pkg_name(value)
+                on = action == "bundle_on"
+                pstore.bundle_set_enabled(home, name, enabled=on)
+                self._plog(f"[市场] ✓ 已{'启用' if on else '禁用'} {name}："
+                           f"{'放回' if on else '摘出'} dsh.profile.bundles"
+                           f"（包文件与依赖都留着，重启网页版生效）")
+                self._status(f"已{'启用' if on else '禁用'} {name}（需重启网页版生效）")
             elif action == "check":
                 local = self._market_local(value, project)
                 if local is None:
@@ -2381,7 +2412,7 @@ class App(tk.Tk):
             env["PATH"] = str(Path(pnpm).parent) + os.pathsep + env.get("PATH", "")
         return env
 
-    def _merge_plugins(self, cards, entries, catalog=()) -> list[dict]:
+    def _merge_plugins(self, cards, entries, catalog=(), home: Path | None = None) -> list[dict]:
         items: list[dict] = []
         known: set[str] = set()
         for card in cards:
@@ -2391,6 +2422,7 @@ class App(tk.Tk):
                 "state": card.state, "desc": (card.description or "")[:40],
                 "warning": card.validation_errors[0][:24] if card.validation_errors else "",
                 "value": card.slug, "spec": card.slug,
+                "full_name": getattr(card, "name", card.slug),
             })
         # 内置清单里尚未下载（未克隆）的插件
         for c in catalog:
@@ -2400,13 +2432,20 @@ class App(tk.Tk):
                 "kind": "catalog", "name": c["slug"], "version": "",
                 "state": "nodl", "desc": (c["description"] or "")[:24],
                 "warning": "", "value": c["slug"], "spec": c["repo"],
+                "full_name": c["slug"],
             })
+        # bundle：禁用的判据是「名字不在 dsh.profile.bundles 里但包还在」——
+        # 这正是禁用后的样子，不能混成「已下载」（那样用户看不出自己关过什么）
+        off = pstore.bundle_disabled(home) if home is not None else {}
         for e in entries:
             st = "installed" if e.installed else ("downloaded" if e.downloaded else "nodl")
+            if e.name in off and not e.installed:
+                st = "bundle-off"
             items.append({
                 "kind": "bundle", "name": e.name, "version": e.version, "state": st,
                 "desc": (e.description or "")[:22], "warning": "",
                 "value": str(e.local) if e.local else e.spec, "spec": e.spec,
+                "full_name": e.name,
             })
         items.sort(key=lambda it: (self._plugin_rank(it), it["name"]))
         return items
@@ -2414,7 +2453,7 @@ class App(tk.Tk):
     @staticmethod
     def _plugin_rank(it: dict) -> int:
         return {"enabled": 0, "installed": 0, "disabled": 1, "downloaded": 1,
-                "external": 2, "external-disabled": 2, "nodl": 3,
+                "bundle-off": 1, "external": 2, "external-disabled": 2, "nodl": 3,
                 "first_party": 4, "first_party-disabled": 4}.get(it["state"], 5)
 
     def _render_plugin_row(self, row, it) -> None:
@@ -2442,6 +2481,7 @@ class App(tk.Tk):
         if it["kind"] == "catalog":
             return {"nodl": ("未下载", "#999")}.get(s, (s, "#000"))
         return {"installed": ("已安装", "#2a6b2a"),
+                "bundle-off": ("已禁用", "#a05a00"),
                 "downloaded": ("已下载", "#1a6bb0"),
                 "nodl": ("可下载", "#999")}.get(s, (s, "#000"))
 
@@ -2461,7 +2501,12 @@ class App(tk.Tk):
         if st == "disabled":
             return [("启用", "set_on", slug), ("卸载", "uninstall", slug)]
         if st in ("external", "external-disabled"):
-            return [("接管", "adopt", slug)]
+            # 外部行照样能禁停（排查启动冲突时最需要）：写成官方 disabled，不碰原文
+            acts = [("禁用", "row_off", slug)] if st == "external" \
+                else [("启用", "row_on", slug)]
+            if str(it.get("full_name", "")).startswith("@dsh-user/"):
+                acts.append(("接管", "adopt", slug))     # 只有 @dsh-user/* 才谈得上接管
+            return acts
         return []
 
     def _bundle_actions(self, it) -> list[tuple[str, str, str]]:
@@ -2474,6 +2519,7 @@ class App(tk.Tk):
         if s in ("nodl", "downloaded"):
             acts.append(("校验", "check", local))
         if s == "installed":
+            acts.append(("禁用", "bundle_off", spec))
             acts.append(("卸载", "uninstall", spec))
             acts.append(("校验", "check", local))
             upd = self.market_updates.get(spec, "unknown")
@@ -2482,6 +2528,9 @@ class App(tk.Tk):
             act = {"unknown": "check_update", "outdated": "update",
                    "current": "check_update"}.get(upd, "check_update")
             acts.append((label, act, spec))
+        elif s == "bundle-off":
+            acts.append(("启用", "bundle_on", spec))
+            acts.append(("卸载", "uninstall", spec))
         return acts
 
     def _act(self, kind: str, value: str, action: str) -> None:
@@ -2560,6 +2609,7 @@ class App(tk.Tk):
         home, project = self.plugin_home_dir, self.plugin_project
         ok_all = True
         fail_msgs: list[str] = []
+        gate_failed: list[tuple[str, str, str]] = []
         was_running = self.web_proc is not None and self.web_proc.poll() is None
         try:
             if home is None or project is None:
@@ -2585,11 +2635,20 @@ class App(tk.Tk):
                         pstore.set_enabled(home, slug, enabled=(act == "set_on"),
                                            project=project)
                         self._plog(f"[插件] ✓ {'启用' if act == 'set_on' else '停用'} {slug}")
+                    elif act in ("row_off", "row_on"):
+                        # 外部行：只写官方的顶层 disabled 覆盖行，一个字都不改用户原文
+                        pstore.set_row_enabled(home, slug, enabled=(act == "row_on"))
+                        self._plog(f"[插件] ✓ {'启用' if act == 'row_on' else '禁用'} {slug}"
+                                   f"（免结构门，只改补丁里那一行）")
                     elif act == "adopt":
                         pstore.adopt(home, slug, project=project)
                         self._plog(f"[插件] ✓ 已接管 {slug}（转为助手管理）")
-                except (pstore.PluginError, pstore.ProtectedShapeError,
-                        pstore.GateError) as exc:
+                except pstore.GateError as exc:
+                    # 结构门没过：多半是某个插件把 dsh 搞得起不来。先留着，等界面问
+                    # 用户要不要「免校验直接写」——不然 dsh 起不来时一个都禁不掉。
+                    gate_failed.append((slug, act, str(exc)))
+                    self._plog(f"[插件] ⚠ {slug}：结构门未过（{exc}）")
+                except (pstore.PluginError, pstore.ProtectedShapeError) as exc:
                     ok_all = False
                     fail_msgs.append(f"{slug}：{exc}")
                     self._plog(f"[插件] ✗ {slug}：{exc}")
@@ -2601,17 +2660,24 @@ class App(tk.Tk):
             fail_msgs.append(str(exc))
             self._plog(f"[插件] ✗ 保存失败：{exc}")
         finally:
-            self._post(self._plugin_save_done, ok_all, was_running, fail_msgs)
+            self._post(self._plugin_save_done, ok_all, was_running, fail_msgs, gate_failed)
 
     def _plugin_save_done(self, ok_all: bool, was_running: bool,
-                          fail_msgs: list[str]) -> None:
+                          fail_msgs: list[str],
+                          gate_failed: list[tuple[str, str, str]] = ()) -> None:
         self.plugin_pending.clear()
         self._set_plugin_busy(False)
+        if gate_failed and self._offer_emergency(gate_failed):
+            return                        # 交给应急流程，别再报一遍失败
         if not ok_all:
             self._status("插件保存失败", "#b00000")
             messagebox.showerror(
                 "插件保存失败",
                 "\n".join(fail_msgs) + "\n\n详情见 installer.log 与「安装与启动」页日志区。")
+            self._refresh_plugins()
+            return
+        if gate_failed:
+            self._status("结构门未过，改动未落盘", "#b00000")
             self._refresh_plugins()
             return
         if was_running or self.rollback_armed:
@@ -2627,6 +2693,44 @@ class App(tk.Tk):
             self._status("已保存（补丁已热应用；未运行服务，下次启动生效）")
             self._plog("[插件] 已保存：改动已热应用；下次启动生效。")
         self._refresh_plugins()
+
+    def _offer_emergency(self, gate_failed: list[tuple[str, str, str]]) -> bool:
+        """结构门没过（多半是插件冲突把 dsh 搞得起不来）：问一句要不要免校验直接写。
+
+        这是「从外部禁用/启用」这条能力的关键一步：dsh 起不来时结构门
+        （`dsh --profile web --dump-config`）也跑不了，没有这条路就一个也禁不掉。
+        """
+        names = "、".join(f"{slug}（{'启用' if act == 'set_on' else '停用'}）"
+                          for slug, act, _ in gate_failed)
+        if not messagebox.askyesno(
+                "结构门未通过：要免校验直接写吗？",
+                f"dsh 现在跑不起来，无法用结构门校验补丁。\n\n"
+                f"受影响：{names}\n\n"
+                f"原因：{gate_failed[0][2][:400]}\n\n"
+                "要以**应急方式**直接写盘吗？写前会备份补丁 `.bak`，随时可回滚；"
+                "改的是「停用/启用」，写完请重启 dsh 验证。", parent=self):
+            return False
+        self._set_plugin_busy(True)
+        threading.Thread(target=self._emergency_worker, args=(gate_failed,),
+                         daemon=True).start()
+        return True
+
+    def _emergency_worker(self, ops: list[tuple[str, str, str]]) -> None:
+        home = self.plugin_home_dir
+        try:
+            if home is None:
+                raise pstore.PluginError("插件环境未就绪（先点「重新扫描」）。")
+            for slug, act, _ in ops:
+                pstore.set_enabled(home, slug, enabled=(act == "set_on"), gate=False)
+                self._plog(f"[插件] ✓ 应急{'启用' if act == 'set_on' else '停用'} {slug}"
+                           f"（未做结构校验）")
+            self._post(self._status, "已按应急方式写盘（未校验），请重启 dsh 验证", "#a05a00")
+        except Exception as exc:  # noqa: BLE001
+            self._plog(f"[插件] ✗ 应急写盘失败：{exc}")
+            self._post(messagebox.showerror, "应急写盘失败", str(exc))
+        finally:
+            self._post(self._set_plugin_busy, False)
+            self._post(self._refresh_plugins)
 
     def _activation_poll(self) -> None:
         """激活门健康检查：启动日志无 loader 失败即视为生效；失败回滚 .bak 重启一次。"""
