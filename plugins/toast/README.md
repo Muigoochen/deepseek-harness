@@ -35,10 +35,12 @@ plugins/toast/
 │  ├─ index.js             Host 半(逻辑脚本):toast 服务 + 队列 + /toast/events 长询路由
 │  └─ client.js            浏览器半(GUI 脚本):closure-factory,shell.overlay 浮窗 + fetch 长询
 └─ install/
-   ├─ install.ps1          装入 profile + 幂等加 patch 行
+   ├─ install.ps1          用 DSH 官方方式装入 profile + 自检
    ├─ uninstall.ps1        逆操作
-   └─ patch.example.yml    行示例
+   └─ patch.example.yml    profile 层覆盖行示例(本机设置写这里)
 ```
+
+包根的 `cordis.patch.yml` 是本包作为 bundle 贡献给 profile 的配置层(见「安装」)。
 
 ## 安装(每台机器一次)
 
@@ -49,10 +51,17 @@ powershell -ExecutionPolicy Bypass -File E:\Deepseek\deepseek_harness\plugins\to
 powershell -ExecutionPolicy Bypass -File E:\Deepseek\deepseek_harness\plugins\toast\install\uninstall.ps1
 ```
 
-install.ps1 会:
-1. 把包复制到 `$DSH_HOME\profiles\node_modules\@dsh-user\toast\`;
-2. 在 `$DSH_HOME\profiles\web\cordis.patch.yml` 幂等追加一行
-   `- id: toast / name: '@dsh-user/toast'`(该行同时带起 Host 半与 GUI 半)。
+install.ps1 会(幂等):
+
+1. 用 DSH 官方方式安装本包 —— `dsh plugin --profile web add <本包路径>`,由它把包链入
+   profile 并登记为依赖与 bundle。**不再复制文件**:安装后 profile 通过 `link:` 指向本目录,
+   改完源码直接生效;
+2. 自检:导入宿主半(`lib/index.js`),并按浏览器半的规则解析 `lib/client.js`
+   (浏览器半只能是脚本,`node --check` 直接检查 `.js` 会被 `"type": "module"` 放过)。
+
+`uninstall.ps1` 走 `dsh plugin --profile web remove @dsh-user/toast`。**它不会递归删除
+profile 的 `node_modules` 目录** —— 那个路径可能是指回本 checkout 的链接,递归删除会连带删掉
+源码。
 
 ## 验证
 

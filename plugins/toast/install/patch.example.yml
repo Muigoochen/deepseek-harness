@@ -1,7 +1,10 @@
-# Append this to C:\Users\<you>\.dsh\profiles\web\cordis.patch.yml
-# (install.ps1 does this automatically and idempotently).
-# This single row loads both halves: the Host half (lib/index.js) and the
-# browser half (lib/client.js via the dsh.client module scan).
-- insert:
-    - id: toast
-      name: '@dsh-user/toast'
+# A profile-layer entry for $DSH_HOME/profiles/<name>/cordis.patch.yml.
+#
+# Do NOT write a second `- insert:` for this id. The row already comes from the
+# package's own cordis.patch.yml, which the profile applies as a bundle layer, and
+# two inserts of the same id are a fatal `duplicate loader entry id` at boot.
+# An entry carrying only `- id:` patches the row the bundle inserted.
+#
+# toast has no config, so the useful override is to turn it off for this profile:
+- id: toast
+  disabled: true

@@ -106,9 +106,9 @@ plugins/toast/
 │  └─ client.js            浏览器半:closure-factory(window.__ModuleLoader__.load({id:'@dsh-user/toast',factory}))
 │                          inject=['slots'] → shell.overlay 注册 + fetch 长询 + 渲染
 └─ install/
-   ├─ install.ps1          复制到 $DSH_HOME/profiles/node_modules + 幂等加 patch 行
+   ├─ install.ps1          用 `dsh plugin` 链入 profile + 自检
    ├─ uninstall.ps1        逆操作
-   └─ patch.example.yml    行示例
+   └─ patch.example.yml    profile 层覆盖行示例
 ```
 
 浏览器半规则(已核实):`load({id})` 的 id **必须等于包名**;运行时只 `require('react')`
@@ -122,10 +122,11 @@ powershell -ExecutionPolicy Bypass -File ...\plugins\toast\install\install.ps1
 # 重启 dsh web 生效
 ```
 
-install.ps1 做两件事:① 复制包到 `$DSH_HOME\profiles\node_modules\@dsh-user\toast\`
-(父级 walk 可达、heal 不清理手工目录);② 在 `$DSH_HOME\profiles\web\cordis.patch.yml`
-幂等追加一行 insert(`- id: toast / name: '@dsh-user/toast'`)。一行同时带来 Host 半与
-client 模块(dsh.client 扫描同一行)。
+install.ps1 只有一步:`dsh plugin --profile web add <本包路径>` 把包链到
+`$DSH_HOME\profiles\web\node_modules\@dsh-user\toast`(指回本仓库的 junction),并把包登记进
+profile 的 `dsh.profile.bundles`。插件行由包根的 `cordis.patch.yml` 作为 bundle 层提供,
+一行同时带来 Host 半与 client 模块(dsh.client 扫描同一行);机器本地覆盖写
+`$DSH_HOME\profiles\web\cordis.patch.yml`(同 id 后应用、覆盖 bundle 层)。
 
 **先本地验证再上 patch 行**:client.js 格式/缺包会 fail-loud(整棵 Web 树启动失败),故
 先在本机 profile 外手动核对产物与包名,确认无误再执行安装/重启。

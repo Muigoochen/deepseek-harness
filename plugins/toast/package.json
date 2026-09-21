@@ -8,17 +8,31 @@
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "dsh": {
     "client": {
       "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
     }
   },
   "files": [
     "lib",
+    "cordis.patch.yml",
     "README.md"
   ],
+  "license": "UNLICENSED",
   "scripts": {
     "selfcheck": "node --check lib/client.js && node -e \"import('file:///' + process.cwd().replaceAll('\\\\', '/') + '/lib/index.js').then(m => { if (typeof m.apply !== 'function' || !Array.isArray(m.inject)) throw new Error('bad host exports'); console.log('host half ok') }).catch(e => { console.error(e); process.exit(1) })\""
   }
