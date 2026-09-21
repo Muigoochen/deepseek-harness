@@ -478,5 +478,36 @@ class AdoptReportTest(unittest.TestCase):
         self.assertEqual(ps.adopt_report(self.tmp / "nohome"), {})
 
 
+class RollbackTest(unittest.TestCase):
+    """回滚：补丁与台账必须**一起**退，否则自有段与台账不一致、下次写盘会被拒。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-rollback-"))
+        self.home = self.tmp / "home"
+        ps.web_patch(self.home).parent.mkdir(parents=True)
+        ps.web_patch(self.home).write_text("v1\n", encoding="utf-8")
+        ps.ledger_save(self.home, ps.Ledger(rows=(ps.ManagedRow(id="a"),)))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_rollback_restores_patch_and_ledger_together(self):
+        ps.commit_patch(self.home, "v2\n")          # 写盘 → .bak 里留下 v1
+        ps.ledger_save(self.home, ps.Ledger(rows=(ps.ManagedRow(id="a", disabled=True),)))
+        self.assertTrue(ps.patch_backup_path(self.home).exists())
+        self.assertTrue(ps.ledger_backup_path(self.home).exists())
+        self.assertTrue(ps.rollback_patch(self.home))
+        self.assertEqual(ps.web_patch(self.home).read_text(encoding="utf-8"), "v1\n")
+        self.assertFalse(ps.ledger_load(self.home).rows[0].disabled)
+        # 用拷贝实现：备份留着，用户还能再点一次【回滚到上次保存】
+        self.assertTrue(ps.rollback_patch(self.home))
+
+    def test_no_backup_means_no_rollback(self):
+        empty = self.tmp / "nohome"
+        self.assertFalse(ps.rollback_patch(empty))
+        self.assertFalse(ps.patch_backup_path(empty).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

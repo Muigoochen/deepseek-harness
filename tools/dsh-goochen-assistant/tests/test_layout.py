@@ -222,5 +222,77 @@ class InstallDirBoxTest(unittest.TestCase):
                             "又跳回 C 盘默认值了")
 
 
+@unittest.skipUnless(TK_OK, "没有可用的 Tk（无图形环境）")
+class PluginUndoTest(unittest.TestCase):
+    """插件页的"反悔"两个按钮：撤销待办只清草稿；回滚才动文件（补丁+台账一起退）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-undo-"))
+        self._old = (installer.CONFIG_DIR, installer.CONFIG_PATH, installer._ACTIVE_DIR)
+        installer.CONFIG_DIR = self.tmp
+        installer.CONFIG_PATH = self.tmp / "config.json"
+        self.answers: list[bool] = []
+        for name in ("showinfo", "showwarning", "showerror"):
+            patcher = mock.patch.object(installer.messagebox, name, lambda *a, **k: True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(
+            installer.messagebox, "askyesno",
+            lambda *a, **k: self.answers.pop(0) if self.answers else False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.app = installer.App()
+        for handle in self.app.tk.call("after", "info"):
+            try:
+                self.app.after_cancel(handle)
+            except Exception:  # noqa: BLE001  已经跑掉的排期不用管
+                pass
+        self.app.withdraw()
+
+    def tearDown(self):
+        try:
+            self.app.destroy()
+        except Exception:  # noqa: BLE001  销毁途中出错不影响断言结果
+            pass
+        installer.CONFIG_DIR, installer.CONFIG_PATH, installer._ACTIVE_DIR = self._old
+
+    def _home_with_backup(self) -> Path:
+        home = self.tmp / "home"
+        patch = installer.pstore.web_patch(home)
+        patch.parent.mkdir(parents=True, exist_ok=True)
+        patch.write_text("v1\n", encoding="utf-8")
+        installer.pstore.commit_patch(home, "v2\n")          # 写盘 → 留下 v1 的 .bak
+        return home
+
+    def test_undo_clears_queued_drafts_without_touching_files(self):
+        self.app.plugin_pending["toast"] = "set_off"
+        self.app._render_pending_only("toast")
+        self.assertIn("1 项待保存", str(self.app.btn_save.cget("text")))
+        self.assertEqual(str(self.app.btn_undo.cget("state")), "normal")
+        self.app._clear_pending()
+        self.assertEqual(self.app.plugin_pending, {})
+        self.assertNotIn("待保存", str(self.app.btn_save.cget("text")))
+        self.assertEqual(str(self.app.btn_undo.cget("state")), "disabled")
+
+    def test_rollback_restores_the_patch_and_clears_drafts(self):
+        home = self._home_with_backup()
+        self.app.plugin_home_dir = home
+        self.app.plugin_pending["toast"] = "set_off"
+        self.answers.append(True)                             # 确认回滚
+        with mock.patch.object(self.app, "_refresh_plugins"):
+            self.app._on_rollback()
+        self.assertEqual(
+            installer.pstore.web_patch(home).read_text(encoding="utf-8"), "v1\n")
+        self.assertEqual(self.app.plugin_pending, {})
+
+    def test_rollback_refuses_when_there_is_no_backup(self):
+        home = self.tmp / "fresh-home"
+        self.app.plugin_home_dir = home
+        self.answers.append(True)
+        with mock.patch.object(self.app, "_refresh_plugins") as refresh:
+            self.app._on_rollback()
+        refresh.assert_not_called()                           # 没备份就不该有任何动作
+
+
 if __name__ == "__main__":
     unittest.main()

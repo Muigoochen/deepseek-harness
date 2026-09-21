@@ -2232,9 +2232,18 @@ class App(tk.Tk):
                  "pnpm pack 出 tgz），只产出发行物，不发布、不动你的 profile。",
             foreground="#888", font=("Microsoft YaHei UI", 8), justify="left")
         self.plugin_note.pack(anchor="w", pady=(4, 0))
-        self.btn_save = ttk.Button(box, text="全部保存并重启网页版",
+        # 反悔的两条路：撤销待办＝清内存草稿（不碰文件）；回滚＝把已落盘的改动退回 .bak
+        save_row = ttk.Frame(box)
+        save_row.pack(fill="x", pady=(2, 0))
+        self.btn_rollback = ttk.Button(save_row, text="回滚到上次保存…",
+                                       command=self._on_rollback, state="disabled")
+        self.btn_rollback.pack(side="right")
+        self.btn_undo = ttk.Button(save_row, text="撤销待办", command=self._clear_pending,
+                                   state="disabled")
+        self.btn_undo.pack(side="right", padx=(0, 6))
+        self.btn_save = ttk.Button(save_row, text="全部保存并重启网页版",
                                    command=self.on_plugin_save, state="disabled")
-        self.btn_save.pack(anchor="e", pady=(2, 0))
+        self.btn_save.pack(side="right", padx=(0, 6))
         self._plugin_btns = self.plugin_btns
 
     def _set_plugin_busy(self, busy: bool) -> None:
@@ -2244,9 +2253,17 @@ class App(tk.Tk):
                 b.configure(state="disabled" if busy or self.busy else "normal")
             except Exception:  # noqa: BLE001
                 pass
-        try:
-            self.btn_save.configure(
-                state="disabled" if busy or not self.plugin_pending else "normal")
+        for b, ok in ((self.btn_save, bool(self.plugin_pending)), (self.btn_undo, False)):
+            try:
+                b.configure(state="normal" if ok and not busy and not self.busy
+                            else "disabled")
+            except Exception:  # noqa: BLE001
+                pass
+        try:                              # 回滚按钮：有备份且不忙时可用（刷新时也会重设）
+            has_bak = pstore.patch_backup_path(
+                self.plugin_home_dir or plugin_home()).exists()
+            self.btn_rollback.configure(state="normal" if has_bak and not busy
+                                        and not self.busy else "disabled")
         except Exception:  # noqa: BLE001
             pass
 
@@ -2880,9 +2897,76 @@ class App(tk.Tk):
         # 只刷新保存按钮（行内容在保存/刷新后重建）。按钮上带**待办条数**：
         # 以前待办只写一行日志，点完按钮看着"什么都没发生"就是这么来的（用户实测）。
         n = len(self.plugin_pending)
-        self.btn_save.configure(
-            state="normal",
-            text=f"全部保存并重启网页版（{n} 项待保存）" if n else "全部保存并重启网页版")
+        try:
+            self.btn_save.configure(
+                state="normal",
+                text=f"全部保存并重启网页版（{n} 项待保存）" if n
+                else "全部保存并重启网页版")
+            self.btn_undo.configure(state="normal" if n else "disabled")
+        except Exception:  # noqa: BLE001  窗口销毁后忽略
+            pass
+
+    def _clear_pending(self) -> None:
+        """撤销还没保存的改动——纯内存操作，**一个字节都不写盘**。
+
+        与【回滚到上次保存】分工：这个只清草稿（点错了、改主意了），那个才动文件。
+        """
+        n = len(self.plugin_pending)
+        self.plugin_pending.clear()
+        self._render_pending_only("")
+        if n:
+            self._plog(f"[插件] 已撤销 {n} 项未保存的改动（文件没被动过）")
+            self._status(f"已撤销 {n} 项待办（没写盘）")
+        else:
+            self._status("当前没有待保存的改动")
+
+    def _on_rollback(self) -> None:
+        """用 `.bak` 把补丁与台账退回到「上一次保存之前」。
+
+        【撤销待办】只清内存草稿；这个是真的把**已经落盘**的改动退回去，是"手滑了想反悔"
+        的兜底。补丁与台账必须一起退，否则自有段与台账不一致，下次写盘会被一致性检查拒掉。
+        """
+        home = self.plugin_home_dir or plugin_home()
+        bak = pstore.patch_backup_path(home)
+        try:
+            exists = bak.exists()
+        except OSError:
+            exists = False
+        if not exists:
+            messagebox.showinfo(
+                "没有可回滚的备份",
+                f"还没找到备份：\n{bak}\n\n"
+                "备份是每次写盘（保存 / 禁用 / 启用 / 接管 / 安装 / 卸载）之前自动留的，"
+                "所以要先有过一次成功的写盘。", parent=self)
+            return
+        try:
+            when = time.strftime("%Y-%m-%d %H:%M:%S",
+                                 time.localtime(bak.stat().st_mtime))
+        except OSError:
+            when = "时间未知"
+        if not messagebox.askyesno(
+                "回滚到上次保存之前？",
+                f"把补丁退回到这份备份：\n{bak}\n（{when}）\n\n"
+                "· 台账备份会一起退回，保持一致\n"
+                "· 备份本身保留，可以再点一次\n"
+                "· 正在跑的网页版要重启才看得到结果", parent=self):
+            return
+        try:
+            if not pstore.rollback_patch(home):
+                raise pstore.PluginError("回滚失败：备份不存在")
+        except Exception as exc:  # noqa: BLE001
+            self._plog(f"[插件] ✗ 回滚失败：{exc}")
+            messagebox.showerror("回滚失败", str(exc), parent=self)
+            return
+        self._clear_pending()
+        self._plog(f"[插件] ✓ 已回滚到 {bak}（{when}）")
+        self._status("已回滚补丁与台账到上次保存之前", "#a05a00")
+        self._refresh_plugins()
+        if self.web_proc is not None and self.web_proc.poll() is None and \
+                messagebox.askyesno("重启网页版？",
+                                    "回滚要重启网页版才生效，现在重启？", parent=self):
+            self._stop_web_internal(quiet=True)
+            self._launch_web()
 
     def on_plugin_save(self) -> None:
         if self.plugin_busy or not self.plugin_pending:

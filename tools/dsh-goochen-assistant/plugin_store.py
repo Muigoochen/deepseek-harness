@@ -210,7 +210,27 @@ def ledger_load(home: Path) -> Ledger:
     return Ledger(version=int(data.get("version", 1)), rows=tuple(rows))
 
 
+def ledger_backup_path(home: Path) -> Path:
+    """台账的 `.bak` 位置（与补丁的 `.bak` 成对：一起回滚才不会不一致）。"""
+    path = ledger_path(home)
+    return path.with_name(path.name + ".bak")
+
+
+def backup_ledger(home: Path) -> Optional[Path]:
+    path = ledger_path(home)
+    if not path.exists():
+        return None
+    bak = ledger_backup_path(home)
+    shutil.copy2(path, bak)
+    return bak
+
+
 def ledger_save(home: Path, ledger: Ledger) -> None:
+    backup_ledger(home)              # 先留备份：回滚时补丁与台账要一起退
+    _ledger_write(home, ledger)
+
+
+def _ledger_write(home: Path, ledger: Ledger) -> None:
     path = ledger_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
@@ -820,13 +840,26 @@ def commit_patch(home: Path, patch_text: str) -> Path:
     return patch
 
 
+def patch_backup_path(home: Path) -> Path:
+    """当前补丁的 `.bak` 位置（可能不存在）。界面用它判断有没有可回滚的备份。"""
+    return _backup_of(web_patch(home))
+
+
 def rollback_patch(home: Path) -> bool:
-    """从 .bak 回滚（rename 回 = 一次热应用）。成功返回 True。"""
+    """把补丁与台账一起退回 `.bak`（成功返回 True）。
+
+    台账必须跟着退：只把补丁退回去、台账留在新版本，会让「自有段内容与台账不一致」，
+    下一次写盘会被 `apply_managed` 的一致性检查直接拒掉。
+    用**拷贝**而不是 rename：备份留着，用户还能再点一次【回滚到上次保存】。
+    """
     patch = web_patch(home)
     bak = _backup_of(patch)
     if not bak.exists():
         return False
-    os.replace(bak, patch)
+    shutil.copy2(bak, patch)
+    ledger_bak = ledger_backup_path(home)
+    if ledger_bak.exists():
+        shutil.copy2(ledger_bak, ledger_path(home))
     return True
 
 
