@@ -16,11 +16,13 @@ exe 用 PyInstaller（未来阶段）。当前直接用解释器运行。
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -45,6 +47,39 @@ HARNESS_GIT_URL = "https://github.com/deepseek-ai/deepseek-harness.git"
 SOURCE_DIR_NAME = "deepseek-harness"
 BUILD_MARK = ".dsh-build/client-build-environment.json"
 WEB_URL = "http://127.0.0.1:3080"
+WEB_PORT = 3080                  # dsh web 默认端口；"有没有在跑"一律按它认定
+
+#: 连接**超时**的 errno（Windows 上是 WSAETIMEDOUT=10060）：对方在监听，只是 accept
+#: 队列满了。这不是"端口空闲"——真当成空闲再起一个，必然 EADDRINUSE。
+_CONNECT_TIMEOUT_CODES = {10060, getattr(errno, "ETIMEDOUT", 110)}
+
+
+def port_in_use(port: int = WEB_PORT, host: str = "127.0.0.1",
+                timeout: float = 0.4) -> bool:
+    """`host:port` 上是否已经有人在监听（不关心是谁）。
+
+    助手内部只记得"我启动过的那个进程"，而重启助手、pump 线程先结束等情况都会让这份记账
+    丢掉——**服务却还在跑**。那时再启动一个只会 EADDRINUSE。所以启动前一律以端口事实为准。
+    只有"连接被明确拒绝"才算空闲；超时算有人（见 `_CONNECT_TIMEOUT_CODES`）。
+    """
+    with socket.socket() as sock:
+        sock.settimeout(timeout)
+        try:
+            code = sock.connect_ex((host, port))
+        except OSError:              # 解析失败/被拒等：当作没人监听
+            return False
+    return code == 0 or code in _CONNECT_TIMEOUT_CODES
+
+
+def wait_port_free(port: int = WEB_PORT, host: str = "127.0.0.1",
+                   timeout: float = 5.0) -> bool:
+    """等端口真正空出来（结束进程后，内核还要一点时间回收监听）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not port_in_use(port, host):
+            return True
+        time.sleep(0.2)
+    return not port_in_use(port, host)
 
 HERE = Path(__file__).resolve().parent
 ASSETS = HERE / "assets"
@@ -1539,6 +1574,13 @@ class App(tk.Tk):
             messagebox.showinfo("有任务在进行",
                                 "正在进行的任务结束之后再开始安装。", parent=self)
             return
+        # 服务正跑着时也能点安装（以前直接放行）：安装会重装依赖、可能重新构建，两边
+        # 一起动会撞文件锁；而且安装末尾会自动启动服务，原来那个还在跑就必然 EADDRINUSE。
+        if port_in_use() and not self.ensure_port_free("一键完整安装会重装依赖并重新构建："):
+            messagebox.showinfo("已取消安装",
+                                f"127.0.0.1:{WEB_PORT} 仍被占用。可以先『停止服务』，再安装。",
+                                parent=self)
+            return
         target = self._current_dir()
         errors, warns = check_install_dir(target)
         if errors:
@@ -1903,10 +1945,7 @@ class App(tk.Tk):
             # （pnpm dsh web 会一直跑到服务结束），在这里调它会让 busy 一直为真——
             # 停止按钮全程不可用，而且成功的安装还会被关窗逻辑记成「被打断」。
             eng.run_full(headless=False, start=False)
-            self._status("完成 ✓ 正在启动网页版…", "#1a6b1a")
-            self._post(self._launch_web)          # 输出照样实时进日志区
-            self._post(messagebox.showinfo, "完成",
-                       "安装完成！\n网页服务正在启动，点【打开登录页】即可进入。")
+            self._post(self._after_install_start)
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             self._append(f"\n✗ 失败：{msg}")
@@ -1916,6 +1955,27 @@ class App(tk.Tk):
             self._op_target = None                # 长任务结束，关窗不再算它
             self.busy = False                     # 立刻生效，按钮不用多禁用一会儿
             self._post(self._set_busy, False)     # 界面线程侧刷新按钮
+
+    def _after_install_start(self) -> None:
+        """安装完成后的收尾（界面线程）：该启动就启动，已经在跑就直说。
+
+        以前这里无条件调 `_launch_web()`：服务若一直在跑，就会起第二个 → EADDRINUSE，
+        提示还写着"网页服务正在启动"，把人往错方向带。
+        """
+        if port_in_use():
+            self._status("完成 ✓ 网页服务本来就在运行", "#1a6b1a")
+            messagebox.showinfo("完成",
+                                "安装完成！\n网页服务已经在运行，点【打开登录页】即可进入。",
+                                parent=self)
+            return
+        if self._launch_web():
+            self._status("完成 ✓ 网页服务已启动", "#1a6b1a")
+            messagebox.showinfo("完成",
+                                "安装完成！\n网页服务正在启动，点【打开登录页】即可进入。",
+                                parent=self)
+            return
+        self._status("安装完成，但服务没能启动（见日志）", "#b36b00")
+        messagebox.showinfo("完成", "安装完成！\n网页服务没能启动——原因见日志区。", parent=self)
 
     def _resolve_web_project(self) -> Path | None:
         """可运行的项目目录：界面当前选择/配置/自动检测到的已安装位。
@@ -1940,10 +2000,55 @@ class App(tk.Tk):
             messagebox.showinfo("已在运行",
                                 "dsh web 已在本窗口运行；可用「打开登录页」再次打开。")
             return
+        # 记账之外还要看端口事实：助手重启过、或上次的服务没关干净时 web_proc 是空的，
+        # 但 3080 有人占着——那时候硬启动只会 EADDRINUSE。
+        if port_in_use() and not self.ensure_port_free("准备启动 dsh web："):
+            self._append(f"[终端] ✗ 已取消：127.0.0.1:{WEB_PORT} 仍被占用，"
+                         "再启动只会报 EADDRINUSE。")
+            self._status(f"端口 {WEB_PORT} 被占用", "#b00000")
+            return
         self._launch_web()
 
+    def ensure_port_free(self, purpose: str) -> bool:
+        """确认真实端口是空的；被占就先问用户，同意则结束占用者。返回能否继续。
+
+        `self.web_proc` 只是"我启动过什么"的记账，端口才是"现在到底有没有人在跑"的事实；
+        两者不一致时（重启助手、上次没关干净、pump 线程先结束）以端口为准。
+        """
+        if not port_in_use():
+            return True
+        pids = childproc.port_owner_pids(WEB_PORT)
+        mine = self.web_proc is not None and self.web_proc.poll() is None
+        who = ("本窗口启动的服务" if mine
+               else ("、".join(f"PID {p}" for p in pids) if pids else "未知进程"))
+        if not messagebox.askyesno(
+                f"端口 {WEB_PORT} 已被占用",
+                f"{purpose}\n\n127.0.0.1:{WEB_PORT} 正被{who}占用；再启动一个只会报 "
+                "EADDRINUSE。\n\n要先结束它再继续吗？（结束它会连它的子进程一起结束）",
+                parent=self):
+            return False
+        if mine:
+            self._stop_web_internal(quiet=False)
+        for pid in pids:                 # 记账之外还活着的，按 pid 收掉
+            childproc.kill_pid_tree(pid)
+        if wait_port_free():
+            self._append(f"[终端] 端口 {WEB_PORT} 已空出来，继续。")
+            return True
+        self._append(f"[终端] ✗ 端口 {WEB_PORT} 仍被占用，请手动结束占用它的进程。")
+        return False
+
     def _launch_web(self) -> bool:
-        """启动内嵌 dsh web（stdout 流式进日志）。返回是否成功启动。"""
+        """启动内嵌 dsh web（stdout 流式进日志）。返回是否成功启动。
+
+        启动前按**端口事实**再确认一次：安装完成后会自动调这里，而安装期间原来的服务
+        可能一直在跑——那时再起一个只会 EADDRINUSE，还会把 web_proc 覆盖成一个死进程，
+        让界面从此以为"没在跑"（连『停止服务』都点不动）。
+        """
+        if port_in_use():
+            self._append(f"[终端] ✗ 127.0.0.1:{WEB_PORT} 已被占用：已经有一个 dsh web 在跑，"
+                         "不再启动第二个。（可用『停止服务』，或先结束占用它的进程）")
+            self._status(f"端口 {WEB_PORT} 已被占用：服务已在运行", "#b36b00")
+            return False
         project = self._resolve_web_project()
         if project is None:
             project = self._offer_unconfirmed_run()
@@ -1991,6 +2096,10 @@ class App(tk.Tk):
         if self.busy:
             return
         running = self.web_proc is not None and self.web_proc.poll() is None
+        if not running and port_in_use() and not self.ensure_port_free("准备打开登录页："):
+            self._append(f"[终端] ✗ 已取消：127.0.0.1:{WEB_PORT} 仍被占用。")
+            self._status(f"端口 {WEB_PORT} 被占用", "#b00000")
+            return
         if not running and not self._launch_web():
             return
         self._open_pending = True
@@ -2130,6 +2239,10 @@ class App(tk.Tk):
                 if text:
                     self.web_tail.append(text)
                     self._append("[终端] " + text)
+                    if "EADDRINUSE" in text:
+                        self._append(f"[终端] ⚠ 端口 {WEB_PORT} 已被占用：已经有一个 dsh web "
+                                     "在跑，这个新进程起不来。用『停止服务』，或先结束占用 "
+                                     f"{WEB_PORT} 的进程，再点『运行』。")
                     m = re.search(r"dsh web: (\S+)", text)
                     if m is not None and self.web_auth_url is None:
                         self._on_auth_url(m.group(1))

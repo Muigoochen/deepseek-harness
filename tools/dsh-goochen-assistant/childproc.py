@@ -149,6 +149,55 @@ def assign(proc: subprocess.Popen) -> bool:
         return False
 
 
+def _parse_netstat_pids(text: str, port: int) -> list[int]:
+    """从 `netstat -ano` 输出里挑出**正在监听** `port` 的 pid（去重、保持出现顺序）。
+
+    状态列在中文系统上也是英文 `LISTENING`，所以按它筛；IPv6 行（`[::]:3080`）同样以
+    `TCP` 开头，取最后一个冒号后的数字即可。`ESTABLISHED` 行必须排除，否则会把连上来的
+    一方（浏览器）也算成占用者。
+    """
+    pids: list[int] = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        if parts[3].upper() != "LISTENING":
+            continue
+        if parts[1].rsplit(":", 1)[-1] != str(port):
+            continue
+        if parts[4].isdigit() and int(parts[4]) not in pids:
+            pids.append(int(parts[4]))
+    return pids
+
+
+def port_owner_pids(port: int, *, timeout: int = 10) -> list[int]:
+    """正在监听 `port` 的进程 pid 列表；查不到（netstat 不可用等）返回空表。"""
+    try:
+        done = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                              stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, errors="replace", timeout=timeout)
+    except Exception:        # noqa: BLE001  netstat 缺失/卡住：当作查不到
+        return []
+    return _parse_netstat_pids(done.stdout or "", port)
+
+
+def kill_pid_tree(pid: int, *, timeout: int = KILL_TIMEOUT) -> bool:
+    """按 pid 结束整棵进程树。
+
+    给"手上没有 Popen 对象"的场合用：端口被上一次没关干净的 dsh web 占着时，我们只有
+    netstat 报出来的 pid。非 Windows 一律返回 False（本工具只服务 Windows）。
+    """
+    if pid <= 0 or os.name != "nt":
+        return False
+    try:
+        done = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                              stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, errors="replace", timeout=timeout)
+    except Exception:        # noqa: BLE001  taskkill 缺失/卡住
+        return False
+    return done.returncode == 0
+
+
 def track(proc: subprocess.Popen) -> None:
     """登记一个子进程：关窗时它会被 `kill_all()` 结束，并被 Job 兜住。"""
     assign(proc)
