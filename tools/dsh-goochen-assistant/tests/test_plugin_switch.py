@@ -425,5 +425,58 @@ class PluginRowActionsTest(unittest.TestCase):
         self.assertEqual([a[0] for a in app._actions_for(items[0])], ["启用", "校验"])
 
 
+class AdoptReportTest(unittest.TestCase):
+    """能不能接管要**事先**算清楚：带 config 的行接不了，按钮就不该给。
+
+    用户实测过：点了【接管】像"什么都没发生"——一半原因是按钮先给了、点下去才报错，
+    另一半原因是待办只写日志、界面上没有任何提示。
+    """
+
+    PATCH = (
+        "- insert:\n"
+        "    - id: toast\n"
+        "      name: '@dsh-user/toast'\n"
+        "- insert:\n"
+        "    - id: lsp-echo\n"
+        "      name: '@dsh-user/lsp-echo'\n"
+        "      config:\n"
+        "        projects:\n"
+        "          - path: 'E:\\GodotProject\\xu_world'\n"
+    )
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-adopt-"))
+        self.home = self.tmp / "home"
+        ps.web_patch(self.home).parent.mkdir(parents=True)
+        ps.web_patch(self.home).write_text(self.PATCH, encoding="utf-8")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_clean_row_can_be_adopted_but_config_row_cannot(self):
+        report = ps.adopt_report(self.home)
+        self.assertEqual(report.get("toast"), "")
+        self.assertIn("config", report.get("lsp-echo", ""))    # 原因要点明是 config
+        self.assertTrue(report.get("lsp-echo"))
+
+    def test_actions_hide_adopt_when_it_would_fail(self):
+        app = PluginRowActionsTest._app()
+        app.plugin_adoptable = {"lsp-echo": "元素含未知内容：'      config:'"}
+        card = PluginRowActionsTest._card("lsp-echo", "@dsh-user/lsp-echo", "external")
+        items = app._merge_plugins([card], [])
+        self.assertEqual([a[0] for a in app._actions_for(items[0])], ["禁用", "校验"])
+
+    def test_actions_keep_adopt_for_a_clean_row(self):
+        app = PluginRowActionsTest._app()
+        app.plugin_adoptable = {"toast": ""}
+        card = PluginRowActionsTest._card("toast", "@dsh-user/toast", "external")
+        items = app._merge_plugins([card], [])
+        self.assertIn("接管", [a[0] for a in app._actions_for(items[0])])
+
+    def test_missing_patch_reports_nothing_instead_of_raising(self):
+        self.assertEqual(ps.adopt_report(self.tmp / "nohome"), {})
+
+
 if __name__ == "__main__":
     unittest.main()

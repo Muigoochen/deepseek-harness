@@ -2312,6 +2312,8 @@ class App(tk.Tk):
         self.plugin_cards = cards
         self.plugin_home_dir, self.plugin_project = home, project
         self.plugin_catalog = {c["slug"]: c for c in catalog}
+        # 哪些外部行真的能接管（带 config 的接不了）——决定要不要给【接管】按钮
+        self.plugin_adoptable = pstore.adopt_report(home)
         try:
             self.plugin_offline_lbl.configure(
                 text="⚠ dsh 当前起不来（结构门未过）：列表直接读自补丁，"
@@ -2616,8 +2618,11 @@ class App(tk.Tk):
             acts = [("禁用", "row_off", slug)] if st == "external" \
                 else [("启用", "row_on", slug)]
             acts.append(("校验", "check_local", slug))
-            if str(it.get("full_name", "")).startswith("@dsh-user/"):
-                acts.append(("接管", "adopt", slug))     # 只有 @dsh-user/* 才谈得上接管
+            # 【接管】只在**真的能接管**时才给：带 config / 多条目 / 上方有注释的行
+            # 接不了，点了才报错最烦人（实测 7 行里 4 行属于这种）
+            if str(it.get("full_name", "")).startswith("@dsh-user/") \
+                    and not getattr(self, "plugin_adoptable", {}).get(slug):
+                acts.append(("接管", "adopt", slug))
             return acts + release
         if st in ("first_party", "first_party-disabled"):
             # 官方插件（如 time-context）也在用户补丁里，一样能禁停——排查冲突时要的正是它
@@ -2835,6 +2840,18 @@ class App(tk.Tk):
             threading.Thread(target=self._local_check_worker, args=(slug,),
                              daemon=True).start()
             return
+        if action == "adopt":
+            reason = getattr(self, "plugin_adoptable", {}).get(slug)
+            if reason:
+                messagebox.showinfo(
+                    "这一行不能接管",
+                    f"{slug} 不能接管：\n\n{reason}\n\n"
+                    "只有「单个独立的 - insert: 元素、单条子记录、没有 config、"
+                    "没有注释」的行才接管得了——带 config 的行助手不碰你的配置。\n"
+                    "（只是要禁停它的话，直接点【禁用】就行，不需要接管。）",
+                    parent=self)
+                self._plog(f"[插件] 接管 {slug} 被拒：{reason}")
+                return
         if self.plugin_busy or action == "none":
             if action == "none":
                 card = next((c for c in getattr(self, "plugin_cards", [])
@@ -2856,10 +2873,16 @@ class App(tk.Tk):
         self._set_plugin_busy(self.plugin_busy)
         self._render_pending_only(slug)
         self._append(f"[插件] 已加入待办：{slug} → {action}（点『全部保存并重启网页版』生效）")
+        self._status(f"已加入待办 {len(self.plugin_pending)} 项 —— "
+                     "点【全部保存并重启网页版】才落盘", "#a05a00")
 
     def _render_pending_only(self, _slug: str) -> None:
-        # 只刷新保存按钮可用性（行内容在保存/刷新后重建）
-        self.btn_save.configure(state="normal")
+        # 只刷新保存按钮（行内容在保存/刷新后重建）。按钮上带**待办条数**：
+        # 以前待办只写一行日志，点完按钮看着"什么都没发生"就是这么来的（用户实测）。
+        n = len(self.plugin_pending)
+        self.btn_save.configure(
+            state="normal",
+            text=f"全部保存并重启网页版（{n} 项待保存）" if n else "全部保存并重启网页版")
 
     def on_plugin_save(self) -> None:
         if self.plugin_busy or not self.plugin_pending:
@@ -2929,6 +2952,10 @@ class App(tk.Tk):
                           gate_failed: list[tuple[str, str, str]] = ()) -> None:
         self.plugin_pending.clear()
         self._set_plugin_busy(False)
+        try:                              # 待办清空 → 按钮文字还原
+            self.btn_save.configure(text="全部保存并重启网页版")
+        except Exception:  # noqa: BLE001  窗口销毁后忽略
+            pass
         if gate_failed and self._offer_emergency(gate_failed):
             return                        # 交给应急流程，别再报一遍失败
         if not ok_all:

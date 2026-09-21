@@ -1098,6 +1098,29 @@ def _parse_standalone_block(lines: Sequence[str]) -> list[ManagedRow]:
     return rows
 
 
+def adopt_report(home: Path) -> dict[str, str]:
+    """每个补丁里的插件行「能不能接管」：能 → `""`；不能 → 原因。
+
+    一次读补丁算清楚，界面据此决定要不要给【接管】按钮。理由：**按钮点下去才发现
+    不行是最糟的交互**——实测用户那 7 行里有 4 行带 `config:`，一律接不了。
+    """
+    out: dict[str, str] = {}
+    try:
+        text = _read_patch(home)
+    except (PluginError, OSError):
+        return out
+    for m in re.finditer(r"^    - id: ([A-Za-z0-9-]+)\s*$", text, re.M):
+        slug = m.group(1)
+        if slug in out:
+            continue
+        try:
+            find_standalone_element(text, slug)
+            out[slug] = ""
+        except ProtectedShapeError as exc:
+            out[slug] = str(exc)
+    return out
+
+
 def adopt(home: Path, slug: str, *, project: Optional[Path] = None,
           run_dump: Optional[Callable[[Path], DumpResult]] = None,
           dsh_command: Optional[Sequence[str]] = None) -> Ledger:
