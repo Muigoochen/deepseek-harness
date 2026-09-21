@@ -262,11 +262,14 @@ def run(argv: Any, *, cwd: Optional[Any] = None, env: Optional[dict] = None,
     ③ 超时抛出的 `TimeoutExpired` **不带**已读到的部分输出（那种情况下本来也没读全）。
     返回值（args/returncode/stdout/stderr）与老写法一致，调用方无需改动。
     字符串命令加 `shell=True`（Windows 上跑 `pnpm.cmd` 这类批处理需要）。
+    `env=None` 就是**继承**（交给 `Popen` 自己的语义），不要改写成 `dict(os.environ)`：
+    实测在 Windows 上这份拷贝会漏掉进程真实持有的变量（本机漏过 `npm_execpath`），
+    于是"明明有、子进程却看不到"，构建因此报 `npm_execpath is unavailable` 退出 1。
     """
     proc = subprocess.Popen(
         argv,
         cwd=str(cwd) if cwd is not None else None,
-        env=env if env is not None else dict(os.environ),
+        env=env,                          # None = 原样继承父进程的环境块
         stdin=subprocess.DEVNULL,          # 子进程别去抢界面的键盘输入
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         shell=shell, text=text, encoding=encoding,

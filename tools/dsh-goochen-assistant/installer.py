@@ -34,6 +34,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import childproc               # 子进程登记（关窗时连子孙一起结束）
+import fetch as fetcher        # 取件层：离线包 → 国内镜像 → 官方源
+from contextlib import contextmanager
 import plugin_store as pstore  # 插件管理原语（同目录模块）
 import gitinfo as ginfo        # 真 git 命令层（识别/校验/版本/更新）
 
@@ -42,12 +44,40 @@ __version__ = "0.1.0"
 APP_TITLE = "DSH-孤辰小助手 v0.1"
 REGISTRY_MIRROR = "https://registry.npmmirror.com"
 REGISTRY_OFFICIAL = "https://registry.npmjs.org"
-NODE_MSI_URL = "https://nodejs.org/dist/v24.20.0/node-v24.20.0-x64.msi"
+#: Node 安装包：官方源 + 国内镜像（npmmirror 的 node 二进制镜像，路径与官方一致）
+NODE_VERSION = "24.20.0"
+NODE_MSI_URL = f"https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-x64.msi"
+NODE_MSI_MIRROR = (f"https://registry.npmmirror.com/-/binary/node/v{NODE_VERSION}/"
+                   f"node-v{NODE_VERSION}-x64.msi")
+#: pnpm：官方/镜像的 tgz（随包 assets/pnpm.tgz 是它的离线副本）
+PNPM_VERSION = "11.7.0"
+PNPM_TGZ_URL = f"https://registry.npmjs.org/pnpm/-/pnpm-{PNPM_VERSION}.tgz"
+PNPM_TGZ_MIRROR = f"https://registry.npmmirror.com/pnpm/-/pnpm-{PNPM_VERSION}.tgz"
 HARNESS_GIT_URL = "https://github.com/deepseek-ai/deepseek-harness.git"
 SOURCE_DIR_NAME = "deepseek-harness"
 BUILD_MARK = ".dsh-build/client-build-environment.json"
 WEB_URL = "http://127.0.0.1:3080"
 WEB_PORT = 3080                  # dsh web 默认端口；"有没有在跑"一律按它认定
+
+def git_mirrors() -> list[tuple[str, str]]:
+    """用户自己配的 git 镜像（可留空）：环境变量 `DSH_GIT_MIRROR` 优先，其次配置项。
+
+    值可以是分号分隔的多个镜像，写法与 `url.<base>.insteadOf` 的 base 一致，例如
+    `https://gitclone.com/github.com/deepseek-ai/deepseek-harness.git`。
+    配了就**先走镜像**、失败再回落官方源——和取件层同一套规矩。
+    """
+    raw = os.environ.get("DSH_GIT_MIRROR", "").strip()
+    if not raw:
+        try:
+            raw = str(load_config().get("gitMirror", "") or "").strip()
+        except Exception:            # noqa: BLE001  配置读不出来就当没配
+            raw = ""
+    out: list[tuple[str, str]] = []
+    for index, item in enumerate(part.strip() for part in raw.split(";")):
+        if item:
+            out.append((f"国内镜像{'' if index == 0 else index + 1}", item))
+    return out
+
 
 #: 连接**超时**的 errno（Windows 上是 WSAETIMEDOUT=10060）：对方在监听，只是 accept
 #: 队列满了。这不是"端口空闲"——真当成空闲再起一个，必然 EADDRINUSE。
@@ -134,6 +164,86 @@ def version_ok(version: str) -> bool:
         return False
     major, minor = int(m.group(1)), int(m.group(2))
     return (major == 22 and minor >= 19) or major >= 24
+
+
+def pnpm_execpath() -> str:
+    """pnpm 的 JS 入口路径（就是 `npm_execpath` 该有的值）。
+
+    构建脚本要拿它再调 `pnpm run build:lib` / `build:web`：`scripts/build.ts` 把
+    `pnpmInvocation()` 的结果交给 `spawnSync`，而这个值**只有 pnpm 自己跑脚本时才注入**。
+    小助手是用 `pnpm run build` 起的没错，但进程环境里未必有（干净机器上就没有，
+    实测构建直接报 "npm_execpath is unavailable" 退出 1）。所以缺了就在这里补：
+    全局装的 pnpm，入口在 `<npm root -g>/pnpm/bin/pnpm.mjs`（老版本是 pnpm.cjs）。
+    取不到就返回空串，交给上层如常报错。
+    """
+    npm = find_npm()
+    if npm is None:
+        return ""
+    try:
+        root = run_text([npm, "root", "-g"]).strip()
+    except Exception:                # noqa: BLE001  查不到就当作补不了
+        return ""
+    for name in ("pnpm.mjs", "pnpm.cjs"):
+        candidate = Path(root) / "pnpm" / "bin" / name
+        if candidate.exists():
+            return str(candidate)
+    return ""
+
+
+def build_variables(project: Path, log=log_line,
+                    commit_marker: Path | None = None,
+                    base: dict | None = None) -> dict[str, str]:
+    """`pnpm run build` 缺的**那几项**环境变量（只返回要补的，不返回整份环境）。
+
+    构建脚本有两处依赖"外面给的东西"，而在小助手安装出来的目录里两者都可能没有：
+      · `DSH_CLIENT_COMMIT_HASH`——`repositoryCommitHash()` 优先读它，没有再
+        `git rev-parse HEAD`；而**离线解压的源码没有 `.git`**（实测构建因此退出 1）。
+        取值：`assets/source-commit.txt` 里记了真提交号就用真的，没有就用全 0 占位并说明。
+      · `npm_execpath`——`pnpmInvocation()` 拿它再调 pnpm 子脚本，缺失同样是致命错误。
+    只补缺的、已有的一律不动，也不整份替换环境：实测 `dict(os.environ)` 可能漏掉
+    进程真实持有的变量（Windows 上就漏过 `npm_execpath`），整份替换会把变量悄悄弄丢。
+    `base` 只给测试用；不传就看进程环境。
+    """
+    current = os.environ if base is None else base
+    extras: dict[str, str] = {}
+    entry = current.get("npm_execpath", "")
+    # 没有、或者指向一个已经不存在的文件（pnpm 装在别处、store 被清过），都补成
+    # 这台机器上现在这个 pnpm 的真实入口——构建脚本拿它去调 pnpm 子脚本。
+    if not entry or not Path(entry).exists():
+        resolved = pnpm_execpath()
+        if resolved and resolved != entry:
+            extras["npm_execpath"] = resolved
+            log(f"  补齐 npm_execpath = {resolved}"
+                + (f"（原值不可用：{entry}）" if entry else ""))
+    if not (project / ".git").exists():
+        marker = commit_marker or (SOURCE_ARCHIVE.parent / "source-commit.txt")
+        raw = ""
+        try:
+            raw = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            raw = ""
+        if re.fullmatch(r"[0-9a-fA-F]{7,40}", raw):
+            commit, origin = raw, f"取自 {marker.name}"
+        else:
+            commit, origin = "0" * 7, "占位值（离线源码包没有记录提交号）"
+        extras["DSH_CLIENT_COMMIT_HASH"] = commit
+        log(f"  离线源码没有 .git：构建用的提交号 = {commit}（{origin}）")
+    return extras
+
+
+@contextmanager
+def temporary_environment(extras: dict[str, str]):
+    """临时把 `extras` 放进进程环境，退出时逐项还原；子进程靠继承拿到它们。"""
+    saved = {name: os.environ.get(name) for name in extras}
+    os.environ.update(extras)
+    try:
+        yield
+    finally:
+        for name, old in saved.items():
+            if old is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
 
 
 def run(argv: list[str], cwd: Path | None = None,
@@ -947,12 +1057,32 @@ class Engine:
     """核心安装流程：由 worker 线程执行，log 回调发回 UI。"""
 
     def __init__(self, mode: str, use_mirror: bool, log=log_line,
-                 force: bool = False):
+                 force: bool = False, progress=None):
         self.mode = mode                # "auto" | "offline" | "online"
         self.use_mirror = use_mirror
         self.log = log
         self.force = force              # 上次被打断过：不再看「已存在就跳过」，重做依赖与构建
+        self.progress = progress        # GUI 传"替换日志最后一行"的回调；None = 控制台用 \r
         self.registry = REGISTRY_MIRROR if use_mirror else REGISTRY_OFFICIAL
+
+    def registries(self) -> list[tuple[str, str]]:
+        """依赖下载的来源顺序：国内镜像优先、官方兜底；界面上选的那个排最前。"""
+        mirror = ("国内镜像", REGISTRY_MIRROR)
+        official = ("官方源", REGISTRY_OFFICIAL)
+        return [mirror, official] if self.use_mirror else [official, mirror]
+
+    def _report(self) -> fetcher.Reporter:
+        """每一步取件都用同一个 Reporter：日志写文件、进度只刷一行。"""
+        return fetcher.Reporter(self.log, self.progress)
+
+    def sources(self, asset: Path, mirror_url: str, official_url: str,
+                *, asset_name: str) -> list[fetcher.Source]:
+        """按"离线包 → 镜像 → 官方"组装来源；『离线安装』模式下只有离线包（不联网）。"""
+        sources = [fetcher.Source(f"随包离线数据（{asset_name}）", path=asset)]
+        if self.mode != "offline":
+            sources += [fetcher.Source("国内镜像", mirror_url),
+                        fetcher.Source("官方源", official_url)]
+        return sources
 
     @staticmethod
     def describe_assets() -> list[tuple[str, Path, bool]]:
@@ -1000,20 +1130,17 @@ class Engine:
             self.log(f"② Node.js 已就绪：{node} ({ver})，跳过安装")
             return None
         self.log("② 安装 Node.js …")
-        offline = self.use_offline(NODE_MSI_ASSET.exists(), "Node 安装包")
-        msi: Path
-        if offline:
-            msi = NODE_MSI_ASSET
-        else:
-            self.log("  下载官方 Node.js（约 35MB）…")
-            import urllib.request
-            dload = HERE / "downloads"
-            dload.mkdir(exist_ok=True)
-            msi = dload / "node-v24-x64.msi"
-            try:
-                urllib.request.urlretrieve(NODE_MSI_URL, str(msi))
-            except Exception as exc:  # noqa: BLE001
-                raise InstallError(f"Node 下载失败：{exc}") from exc
+        dload = HERE / "downloads"
+        try:
+            msi = fetcher.fetch(
+                dload / f"node-v{NODE_VERSION}-x64.msi",
+                self.sources(NODE_MSI_ASSET, NODE_MSI_MIRROR, NODE_MSI_URL,
+                             asset_name="Node 安装包"),
+                report=self._report(), timeout=30.0)
+        except fetcher.FetchError as exc:
+            raise InstallError(f"Node 安装包获取失败：\n{exc}\n\n"
+                               "可改用『自动选择』或『在线安装』（允许联网），"
+                               "或把安装包放进 assets/。") from exc
         self.log("  静默安装（如弹出系统权限确认，请点【是】）…")
         # 故意**不**走 childproc：MSI 的真正安装动作由 Windows Installer 服务完成
         # （那不是我们的子进程），客户端被中途杀掉只会让它回滚或留下半装的 Node；
@@ -1048,10 +1175,36 @@ class Engine:
                 "找不到 npm，无法安装 pnpm。\n"
                 "请先安装 Node.js（本流程的第 ② 步会自动装），再重试。")
         offline = self.use_offline(PNPM_TGZ_ASSET.exists(), "pnpm 离线包")
-        spec = str(PNPM_TGZ_ASSET) if offline else "pnpm@11.7.0"
-        proc = run([npm, "install", "-g", spec])
-        if proc.returncode != 0:
-            raise InstallError(f"pnpm 安装失败：\n{decode_proc(proc)}")
+        spec = f"pnpm@{PNPM_VERSION}"
+        # 离线包优先；没有就按"镜像 → 官方"各试一次 npm 全局安装
+        attempts: list[tuple[str, list[str]]] = []
+        if offline:
+            attempts.append((f"随包离线数据（{PNPM_TGZ_ASSET.name}）",
+                             [npm, "install", "-g", str(PNPM_TGZ_ASSET)]))
+        if self.mode != "offline":
+            for name, registry in self.registries():
+                attempts.append((name, [npm, "install", "-g", spec,
+                                        "--registry", registry]))
+        if not attempts:
+            raise InstallError(
+                f"没有可用的 pnpm 来源：随包 {PNPM_TGZ_ASSET.name} 不存在，"
+                "而当前是『离线安装』。\n"
+                "请把 assets/ 一起拷过来，或改用『自动选择』（允许联网）。")
+        problems: list[str] = []
+        for index, (name, argv) in enumerate(attempts):
+            last = index == len(attempts) - 1
+            self.log(f"  → 尝试{name}：npm install -g "
+                     f"{spec if spec in argv else PNPM_TGZ_ASSET.name}")
+            proc = run(argv)
+            if proc.returncode == 0:
+                self.log(f"  ✓ {name} 装好了 pnpm")
+                break
+            detail = " ".join(decode_proc(proc).split())[:200]
+            problems.append(f"{name}：{detail}")
+            self.log(f"  ✗ {name} 失败（{detail}）" + ("。" if last else "，换下一个来源…"))
+        else:
+            raise InstallError("pnpm 安装失败（所有来源都试过了）：\n  "
+                               + "\n  ".join(problems))
         corepack = shutil.which("corepack")
         if corepack:
             done = run([corepack, "enable"])
@@ -1101,9 +1254,32 @@ class Engine:
                     "或改用『离线安装』（需随包 source.tar.gz）。")
             self.log(f"  git clone 官方源码（取决于网络）…（git: {git}）")
             project.parent.mkdir(parents=True, exist_ok=True)
-            proc = run([git, "clone", "--depth", "1", HARNESS_GIT_URL, str(project)])
-            if proc.returncode != 0:
-                raise InstallError(f"git clone 失败：\n{decode_proc(proc)}")
+            # 与取件层同一套规矩：镜像（如果配了）→ 官方；每个来源失败都说清原因
+            attempts = [(name, url) for name, url in git_mirrors()
+                        if name] + [("官方源", HARNESS_GIT_URL)]
+            problems: list[str] = []
+            for index, (name, url) in enumerate(attempts):
+                last = index == len(attempts) - 1
+                self.log(f"  → 尝试{name} clone：{url}")
+                proc = run([git, "clone", "--depth", "1", url, str(project)])
+                if proc.returncode == 0:
+                    self.log(f"  ✓ {name} clone 完成")
+                    break
+                detail = " ".join(decode_proc(proc).split())[:200]
+                problems.append(f"{name}：{detail}")
+                if last:
+                    self.log(f"  ✗ {name} clone 失败（{detail}）")
+                else:
+                    self.log(f"  ✗ {name} clone 失败（{detail}），换下一个来源…")
+                # 失败的 clone 会留下半个目录，不清掉下一次必然报"目录非空"
+                if project.exists() and (project / ".git").exists() and not is_checkout(project):
+                    shutil.rmtree(project, ignore_errors=True)
+            else:
+                raise InstallError(
+                    "git clone 失败（所有来源都试过了）：\n  " + "\n  ".join(problems) +
+                    "\n\n可以：① 用『离线安装』（需随包 source.tar.gz）；"
+                    "② 在 git 里配镜像（git config --global url.<镜像>.insteadOf "
+                    "https://github.com/）——配好后这里会先走镜像。")
             mode = "online"
         if not is_checkout(project):
             raise InstallError("源码就绪但不是 DSH 检出（缺 package.json/"
@@ -1118,24 +1294,50 @@ class Engine:
             self.log("⑤ node_modules 已存在，跳过依赖安装")
             return
         self.log("⑤ 安装项目依赖 …")
-        offline = self.use_offline(STORE_DIR.exists(), "依赖缓存")
-        argv: list[str] = ["pnpm", "install", "--frozen-lockfile"]
-        if offline:
-            argv += ["--offline", "--store-dir", str(STORE_DIR)]
-        else:
-            argv += ["--registry", self.registry]
-        self.log("  执行：" + " ".join(argv))
-        proc = run_cli(argv, cwd=project)
-        if proc.returncode != 0:
-            raise InstallError(f"依赖安装失败：\n{decode_proc(proc)}")
-        self.log("  依赖安装完成（离线模式几十秒，在线模式视网速）")
+        store = str(STORE_DIR) if STORE_DIR.exists() else ""
+        attempts: list[tuple[str, list[str]]] = []
+        if store and self.mode != "online":
+            # 先纯离线：store-dir 指向随包缓存，数据够用时完全不联网
+            attempts.append(("随包离线缓存", ["pnpm", "install", "--frozen-lockfile",
+                                             "--offline", "--store-dir", store]))
+        if self.mode != "offline":
+            for name, registry in self.registries():
+                argv = ["pnpm", "install", "--frozen-lockfile"]
+                if store:
+                    # 同一份 store：离线缺的包由这次联网补齐，随包缓存越用越全
+                    argv += ["--store-dir", store]
+                argv += ["--registry", registry]
+                attempts.append((name, argv))
+        if not attempts:
+            raise InstallError(
+                "没有可用的依赖来源：随包缓存（assets/pnpm-store）不存在，"
+                "而当前是『离线安装』。\n"
+                "请把 assets/ 一起拷过来，或改用『自动选择』（允许联网补包）。")
+        problems: list[str] = []
+        for index, (name, argv) in enumerate(attempts):
+            last = index == len(attempts) - 1
+            self.log(f"  → 尝试{name}：{' '.join(argv)}")
+            proc = run_cli(argv, cwd=project)
+            if proc.returncode == 0:
+                self.log(f"  ✓ {name} 依赖安装完成")
+                return
+            lines = [line for line in decode_proc(proc).splitlines() if line.strip()]
+            detail = " / ".join(lines[-3:])[:300]
+            problems.append(f"{name}：{detail}")
+            if last:
+                self.log(f"  ✗ {name} 失败（{detail}）")
+            else:
+                self.log(f"  ✗ {name} 失败（{detail}），换下一个来源…")
+        raise InstallError("依赖安装失败（所有来源都试过了）：\n  "
+                           + "\n  ".join(problems))
 
     def build(self, project: Path, *, force: bool = False) -> None:
         if not force and (project / BUILD_MARK).exists():
             self.log("⑥ 构建产物已存在，跳过 pnpm run build")
             return
         self.log("⑥ 编译项目（本地编译、不联网；首次约 5–15 分钟）…")
-        proc = run_cli(["pnpm", "run", "build"], cwd=project)
+        with temporary_environment(build_variables(project, self.log)):
+            proc = run_cli(["pnpm", "run", "build"], cwd=project)
         if proc.returncode != 0:
             raise InstallError(f"构建失败：\n{decode_proc(proc)}")
         self.log("  构建完成 ✓")
@@ -1234,6 +1436,7 @@ class App(tk.Tk):
         self.custom_browser: str | None = None
         self._open_pending = False
         self._auto_opened = False
+        self._progress_open = False         # 日志区最后一行是不是"下载进度"那一行
         self._open_deadline = 0.0
         # --- 插件区（v0.1）状态 ---
         self.plugin_home_dir: Path | None = None
@@ -1487,8 +1690,29 @@ class App(tk.Tk):
             at_bottom = self.txt.yview()[1] > 0.999
             self.txt.configure(state="normal")
             self.txt.insert("end", str(msg) + "\n")
+            self._progress_open = False      # 后面来的进度要重新开一行，别吃掉这行
             if int(self.txt.index("end-1c").split(".")[0]) > LOG_MAX_LINES:
                 self.txt.delete("1.0", f"end-{LOG_MAX_LINES}lines")
+            self.txt.configure(state="disabled")
+            if at_bottom:
+                self.txt.see("end")
+        self._post(write)
+
+    def _progress_line(self, msg: str) -> None:
+        """把日志区**最后一行**换成 msg —— 下载进度专用。
+
+        进度每秒会来好几条，逐条追加会把日志刷屏、把真正的信息冲走；这里改成原地刷新
+        那一行。头一次调用先开一行，之后的调用替换它；中间一旦有正常日志插入，
+        `_append` 会把标记清掉，进度会重新开一行。
+        """
+        def write() -> None:
+            at_bottom = self.txt.yview()[1] > 0.999
+            self.txt.configure(state="normal")
+            if self._progress_open:
+                self.txt.delete("end-2l", "end-1l")
+            else:
+                self._progress_open = True
+            self.txt.insert("end", str(msg) + "\n")
             self.txt.configure(state="disabled")
             if at_bottom:
                 self.txt.see("end")
@@ -1625,7 +1849,7 @@ class App(tk.Tk):
         if retry:
             self._append("[安装位置] 上次安装被中途关窗打断过，这次重新装依赖并重新构建")
         eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
-                     log=self._append, force=retry)
+                     log=self._append, force=retry, progress=self._progress_line)
         threading.Thread(target=self._job, args=(eng,), daemon=True).start()
 
     def _current_dir(self) -> Path:
