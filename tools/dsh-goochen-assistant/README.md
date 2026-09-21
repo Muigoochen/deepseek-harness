@@ -125,6 +125,7 @@
      已启用→【禁用】+【卸载】+【校验】+【查看更新】、已停用→【启用】+【卸载】
    - **【禁用】/【启用】是排查插件冲突用的开关**（场景见下面「插件起冲突、dsh 打不开怎么办」）：
      外部行也能禁停、**不必先接管**；禁用只写官方支持的 `disabled: true`，**不改你写的任何一行**
+   - **【打包发行】＝ 把本地插件一键做成可发布的 npm 包（bundle）**（详见下面「要发行怎么办」）
    - 【查看更新】→ 查 registry 最新版；有更新变【可更新】→ 点升级；无更新/查不到显示【已最新】
    - 顶部「链接下载」行输入 URL / npm 包名 / git 源下载；「从文件夹导入…」把带 package.json 的目录拷进
      小助手自己的插件来源目录（`$DSH_HOME/plugins-src/`，不写进 dsh 检出）
@@ -149,6 +150,23 @@
      因为被删掉的行可能被 `--patch` 覆盖层重新挂回来
    - 两个前提要知道：① 若禁掉的是**服务提供者**，依赖它的插件会一直 pending、dsh 仍旧起不来
      （那就换一行再试）；② 带客户端界面的插件要刷新页面/重启才看得到变化
+
+   **要发行怎么办（一键打包，不用再让对话去跑脚本）**：DSH 官方认可的发行形态就是 **npm 包（bundle）**——
+   包里自带一个 `cordis.patch.yml` 配置层，用户一条命令 `dsh plugin add <你的包>` 就装上了，
+   升级/卸载/回滚都交给包管理器。点本地插件行的【打包发行】即可
+   （第一次让你填一次 npm 包名前缀，之后记住，所以之后就是真·一键）：
+   - 自动改造 manifest：加 `dsh.bundle.patch`、把 patch 加进 `files`、去掉 `private: true`、
+     补 `publishConfig.access`、把 `@deepseek-ai/*` 依赖从 `dependencies` 移到 `peerDependencies`
+     （官方包由用户的 dsh 安装提供，钉 registry 版本只会打架）；原有 `dsh.client`（浏览器半）原样保留
+   - 自动生成包内 `cordis.patch.yml`：**沿用你 `install/patch.example.yml` 里那几行**，只把包名换掉——
+     发行版的挂载方式和你现在本机跑的完全一致，只是从"profile 里的行"变成"包内的层"
+   - `pnpm pack` 出 tgz，并逐条自检：包里有没有配置层、manifest 有没有声明 `dsh.bundle.patch`、
+     入口与浏览器半在不在包里
+   - 产物落在 `$DSH_HOME/plugin-dist/<插件>-<版本>/`；**不改源目录、不装进你的 profile、不发布**
+   - 之后两条命令留给你手动执行（发布不可撤销、且需要 npm 登录，所以不自动化）：
+     本机试装 `dsh plugin --profile web add "<tgz>"`；发布 `cd <暂存目录> && pnpm publish`
+   - 不想发 registry 也行：把 tgz 直接发给别人，或 `dsh plugin add github:你/仓库#<sha>`（后者要处理构建授权）
+   - 没写 `license` 的包**不会替你猜一个**——授权是作者的决定，日志里只提示你补上
 
 9. 「会话迁移」页签：把**已开始的会话**迁到别的 preset（例：cordis-director 启用引擎热切）
    - 列表 = 扫描结果（会话 ID / header preset / 缓存 preset / 大小 / 工作区）

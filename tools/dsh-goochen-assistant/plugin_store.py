@@ -2229,6 +2229,243 @@ def status_view(home: Path, sources: Sequence[PluginSource], dump: DumpResult,
     return cards
 
 
+# ---------------------------------------------------------------- 发行（打包成 bundle）
+
+#: 打包产物的落点（相对 home）：**不写进 dsh 检出**，免得被 workspace/构建扫到
+BUNDLE_STAGE_DIR = "plugin-dist"
+#: 源 manifest 没有 files 时的默认发布内容
+DEFAULT_BUNDLE_FILES = ("lib", "cordis.patch.yml", "README.md")
+#: 复制插件目录时跳过的目录（构建产物/依赖/版本库）
+_BUNDLE_SKIP_DIRS = {".git", "node_modules", "dist", "__pycache__", ".runtime",
+                     "tmp", ".dsh", ".venv"}
+
+
+@dataclass(frozen=True)
+class BundlePlan:
+    """一次「打包成 bundle」的结果：暂存目录与元数据（**不联网、不发布**）。"""
+    slug: str
+    source: Path
+    out_dir: Path
+    package_name: str
+    version: str
+    patch_text: str
+    notes: tuple[str, ...] = ()
+    tarball: Optional[Path] = None
+
+
+def bundle_package_name(slug: str, scope: str = "") -> str:
+    """发布包名：给了 scope 就用它，否则沿用 `@dsh-user/<slug>`。
+
+    作用域包名必须是**发布者拥有的** npm scope；`@dsh-user` 不是任何人拥有的 scope，
+    所以只有发到 registry 才需要换成自己的；本地 tgz 分发沿用原名也能装
+    （row 的 name 与包名一致即可）。
+    """
+    scope = scope.strip().rstrip("/")
+    return f"{scope}/{slug}" if scope else f"@dsh-user/{slug}"
+
+
+def bundle_manifest(pkg: dict, package_name: str) -> tuple[dict, list[str]]:
+    """把插件自己的 manifest 改造成 bundle manifest；返回 (新 manifest, 改写说明)。
+
+    对应官方《打包与安装插件》对 bundle 的要求：声明 `dsh.bundle.patch`、
+    把 patch 放进 `files`、名字可发布。**保留**原 `dsh.client`（浏览器半照旧）。
+    `@deepseek-ai/*` 依赖移到 `peerDependencies`：官方包由用户的 dsh 安装提供
+    （profile 里的 `@deepseek-ai` 是 boot 自愈镜像），钉 registry 版本只会打架。
+    没写 license 时不替用户猜一个——授权是作者的决定，这里只提示。
+    """
+    out = json.loads(json.dumps(pkg))
+    notes: list[str] = []
+    dsh = out.get("dsh")
+    if not isinstance(dsh, dict):
+        dsh = {}
+        out["dsh"] = dsh
+    dsh["bundle"] = {"patch": "./cordis.patch.yml"}
+    notes.append("加了 dsh.bundle.patch（dsh 据此把这个包当作一个配置层）")
+    if dsh.get("client"):
+        notes.append("保留原有 dsh.client（浏览器半不变）")
+    files = out.get("files")
+    if not isinstance(files, list) or not files:
+        out["files"] = list(DEFAULT_BUNDLE_FILES)
+        notes.append("原 manifest 没有 files，按默认补上 lib / cordis.patch.yml / README.md")
+    elif "cordis.patch.yml" not in files:
+        out["files"] = files + ["cordis.patch.yml"]
+        notes.append("files 里加了 cordis.patch.yml（不加的话发出去的包里没有层）")
+    if out.pop("private", None):
+        notes.append("去掉了 private: true（留着 npm 会拒绝发布）")
+    if package_name.startswith("@"):
+        out["publishConfig"] = {"access": "public"}
+    if not out.get("license"):
+        notes.append("manifest 里没有 license：发布前请自己补一个（授权是你的决定）")
+    deps = out.get("dependencies")
+    if isinstance(deps, dict):
+        moved = {k: v for k, v in deps.items() if k.startswith("@deepseek-ai/")}
+        if moved:
+            for key in moved:
+                deps.pop(key)
+            peer = out.get("peerDependencies")
+            if not isinstance(peer, dict):
+                peer = {}
+                out["peerDependencies"] = peer
+            peer.update(moved)
+            if not deps:
+                out.pop("dependencies")
+            notes.append("把 " + "、".join(sorted(moved))
+                         + " 从 dependencies 移到 peerDependencies（由用户的 dsh 安装提供）")
+    out["name"] = package_name
+    notes.append(f"包名改成 {package_name}")
+    return out, notes
+
+
+_EXAMPLE_NAME_RE = re.compile(r"^(?P<indent>\s*name:\s*)['\"](?P<name>@dsh-user/[^'\"]+)['\"](?P<tail>.*)$")
+
+
+def bundle_patch_text(slug: str, package_name: str,
+                      source: Optional[Path] = None) -> str:
+    """生成本次发行的包内 `cordis.patch.yml`。
+
+    优先沿用插件自带的 `install/patch.example.yml`（那正是现在装它时写进
+    `cordis.patch.yml` 的那几行），只把 `name` 换成发布包名——这样发行版的挂载方式
+    与你现在本机跑的那套**逐字一致**，只是引用方式从"profile 里的行"变成"包内的层"。
+    找不到就按包名生成一条最小 insert。
+    """
+    if source is not None:
+        example = source / "install" / "patch.example.yml"
+        if example.is_file():
+            try:
+                text = example.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            if text.strip():
+                lines, hits = [], 0
+                for line in text.splitlines():
+                    m = _EXAMPLE_NAME_RE.match(line)
+                    if m:
+                        hits += 1
+                        lines.append(f"{m.group('indent')}'{package_name}'{m.group('tail')}")
+                    else:
+                        lines.append(line)
+                if hits and any(ln.strip().startswith("- ") for ln in lines):
+                    return "\n".join(lines).rstrip("\n") + "\n"
+    return f"- insert:\n    - id: {slug}\n      name: '{package_name}'\n"
+
+
+def find_plugin_source(home: Path, slug: str, *, project: Optional[Path] = None,
+                       extra: Optional[Path] = None) -> Optional[Path]:
+    """找一个插件的**源码目录**（打包发行、校验都靠它）。
+
+    顺序：调用方给的来源（离线资产/下载缓存）→ dsh 检出的 `plugins/<slug>`
+    （开发机上的正本，发行用的就是这份）→ `$DSH_HOME/plugins-src/<slug>`
+    → 共享锚目录（装好的那份拷贝）。后两个是兜底：也能打包，但少了
+    README/install 这类只在仓库里才有的东西。
+    """
+    candidates: list[Optional[Path]] = [extra]
+    if project is not None:
+        candidates.append(project / "plugins" / slug)
+    candidates += [plugin_cache_dir(home) / slug, anchor_dir(home, slug)]
+    for cand in candidates:
+        if cand is None:
+            continue
+        try:
+            if cand.is_dir() and (cand / "package.json").is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _copy_bundle_tree(src: Path, dst: Path) -> None:
+    """把插件目录整份拷到暂存位（跳过依赖/构建产物/版本库）。"""
+    for root, dirs, files in os.walk(src, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in _BUNDLE_SKIP_DIRS]
+        rel = Path(root).relative_to(src)
+        (dst / rel).mkdir(parents=True, exist_ok=True)
+        for name in files:
+            if name.endswith((".pyc", ".log")):
+                continue
+            try:
+                shutil.copy2(Path(root) / name, dst / rel / name)
+            except OSError:
+                continue
+
+
+def stage_bundle(source: Path, out_root: Path, *, scope: str = "",
+                 slug: Optional[str] = None) -> BundlePlan:
+    """把本地插件目录改造成**可发布的 bundle 目录**（纯文件操作）。
+
+    产出 `out_root/<slug>-<version>/`：改写过的 `package.json` + 包内
+    `cordis.patch.yml` + 原样代码。幂等：重跑覆盖同名目录。
+    **不做**的事同样重要：不联网、不发布、不改源目录、不写进 dsh 检出。
+    """
+    slug = slug or source.name
+    if not is_valid_slug(slug):
+        raise PluginError(f"{slug!r} 不是合法插件名（小写字母/数字/连字符）")
+    pkg = _pkg_json(source)
+    if pkg is None:
+        raise PluginError(f"{source} 里没有 package.json，不是插件包")
+    version = str(pkg.get("version") or "0.0.0")
+    package_name = bundle_package_name(slug, scope)
+    out_dir = out_root / f"{slug}-{version}"
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_root.mkdir(parents=True, exist_ok=True)
+    _copy_bundle_tree(source, out_dir)
+    patch_text = bundle_patch_text(slug, package_name, source)
+    (out_dir / "cordis.patch.yml").write_text(patch_text, encoding="utf-8")
+    manifest, notes = bundle_manifest(pkg, package_name)
+    (out_dir / "package.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return BundlePlan(slug=slug, source=source, out_dir=out_dir,
+                      package_name=package_name, version=version,
+                      patch_text=patch_text, notes=tuple(notes))
+
+
+def pack_bundle(plan: BundlePlan, *, pnpm: str, timeout: int = 300) -> Path:
+    """在暂存目录里跑 `pnpm pack`，返回 tgz 路径（失败抛 PluginError）。"""
+    if not plan.out_dir.is_dir():
+        raise PluginError(f"暂存目录不存在：{plan.out_dir}")
+    try:
+        proc = subprocess.run([pnpm, "pack"], cwd=str(plan.out_dir),
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise PluginError(f"pnpm pack 超时（{timeout} 秒）") from None
+    except OSError as exc:
+        raise PluginError(f"无法运行 pnpm：{exc}") from None
+    found = sorted(plan.out_dir.glob("*.tgz"), key=lambda p: p.stat().st_mtime)
+    if proc.returncode != 0 or not found:
+        detail = (proc.stderr or proc.stdout or "").strip()[-500:]
+        raise PluginError(f"pnpm pack 失败（退出码 {proc.returncode}）：{detail}")
+    return found[-1]
+
+
+def bundle_tgz_report(tgz: Path) -> list[str]:
+    """看一眼打出来的 tgz：bundle 的关键件在不在（发出去能不能装）。"""
+    try:
+        with tarfile.open(tgz, "r:gz") as tf:
+            names = [m.name for m in tf.getmembers()]
+            manifest = None
+            member = next((m for m in tf.getmembers()
+                           if m.name.endswith("package/package.json")), None)
+            if member is not None:
+                manifest = json.loads(tf.extractfile(member).read().decode("utf-8"))
+    except (OSError, ValueError, tarfile.TarError) as exc:
+        return [f"✗ 打不开 tgz：{exc}"]
+    out: list[str] = []
+    out.append(("✔" if "package/cordis.patch.yml" in names else "✗")
+               + " 包里带 cordis.patch.yml（配置层）")
+    has_bundle = isinstance(manifest, dict) and bool(
+        ((manifest.get("dsh") or {}).get("bundle") or {}).get("patch"))
+    out.append(("✔" if has_bundle else "✗")
+               + " manifest 声明了 dsh.bundle.patch（否则 dsh plugin add 只当普通依赖）")
+    main = str((manifest or {}).get("main") or "./lib/index.js").lstrip("./")
+    out.append(("✔" if f"package/{main}" in names else "✗") + f" 入口 {main} 在包里")
+    if isinstance(manifest, dict) and (manifest.get("dsh") or {}).get("client"):
+        out.append(("✔" if any(n.startswith("package/lib/client") for n in names) else "✗")
+                   + " 浏览器半 lib/client.js 在包里")
+    out.append(f"· 共 {len(names)} 个文件，{tgz.stat().st_size / 1024:.1f} KB")
+    return out
+
+
 # ---------------------------------------------------------------- 激活门（GUI 用）
 
 def health_ok(log_text: str) -> bool:

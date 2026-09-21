@@ -28,7 +28,7 @@ import time
 import tkinter as tk
 from collections import deque
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import childproc               # 子进程登记（关窗时连子孙一起结束）
 import plugin_store as pstore  # 插件管理原语（同目录模块）
@@ -975,6 +975,17 @@ def bind_wheel_tree(root: tk.Misc, handler) -> None:
             widget._wheel_bound = True
             widget.bind("<MouseWheel>", handler, add="+")
         stack.extend(widget.winfo_children())
+
+
+def plugin_source_dir(card, home: Path | None, project: Path | None) -> Path | None:
+    """插件行的源码目录（打包发行与校验都用它）。
+
+    官方插件行（`@deepseek-ai/*`）不给：那不是你的代码，谈不上重新发行。
+    """
+    if home is None or getattr(card, "first_party", False):
+        return None
+    return pstore.find_plugin_source(home, card.slug, project=project,
+                                     extra=getattr(card, "source", None))
 
 
 def plugin_src_label(kind: str, state: str) -> str:
@@ -2216,7 +2227,9 @@ class App(tk.Tk):
                  "在线插件即时生效，需重启网页版。两边都能【校验】。\n"
                  "排查启动冲突：【禁用】只把那一行停掉（写成官方 disabled: true）"
                  "或把 bundle 从 dsh.profile.bundles 摘掉，文件与依赖都留着，"
-                 "【启用】立刻还原；你手写的「外部」行也能直接禁用，不必先接管。",
+                 "【启用】立刻还原；你手写的「外部」行也能直接禁用，不必先接管。\n"
+                 "【打包发行】把本地插件做成可发布的 bundle（改 manifest、生成包内配置层、"
+                 "pnpm pack 出 tgz），只产出发行物，不发布、不动你的 profile。",
             foreground="#888", font=("Microsoft YaHei UI", 8), justify="left")
         self.plugin_note.pack(anchor="w", pady=(4, 0))
         self.btn_save = ttk.Button(box, text="全部保存并重启网页版",
@@ -2305,7 +2318,7 @@ class App(tk.Tk):
                      "禁用/启用免校验、立即写盘" if offline else "")
         except Exception:  # noqa: BLE001  窗口销毁后忽略
             pass
-        items = self._merge_plugins(cards, entries, catalog, home)
+        items = self._merge_plugins(cards, entries, catalog, home, self.plugin_project)
         self.plugin_items = items
         for child in self.plugin_rows.winfo_children():
             child.destroy()
@@ -2505,7 +2518,8 @@ class App(tk.Tk):
             env["PATH"] = str(Path(pnpm).parent) + os.pathsep + env.get("PATH", "")
         return env
 
-    def _merge_plugins(self, cards, entries, catalog=(), home: Path | None = None) -> list[dict]:
+    def _merge_plugins(self, cards, entries, catalog=(), home: Path | None = None,
+                       project: Path | None = None) -> list[dict]:
         items: list[dict] = []
         known: set[str] = set()
         for card in cards:
@@ -2518,6 +2532,8 @@ class App(tk.Tk):
                 "value": card.slug, "spec": card.slug,
                 "full_name": getattr(card, "name", card.slug),
                 "src_label": plugin_src_label("managed", card.state),
+                # 源码目录：打包发行/校验要用；开发机的正本是 dsh 检出里的 plugins/<slug>
+                "source_dir": str(plugin_source_dir(card, home, project) or ""),
             })
         # 内置清单里尚未下载（未克隆）的插件
         for c in catalog:
@@ -2585,14 +2601,16 @@ class App(tk.Tk):
 
     def _managed_actions(self, it) -> list[tuple[str, str, str]]:
         st, warn, slug = it["state"], it["warning"], it["value"]
+        # 有源码目录就多一个「打包发行」：把本地插件做成可发布的 bundle（见 _bundleize_worker）
+        release = [("打包发行", "bundleize", slug)] if it.get("source_dir") else []
         if st == "downloaded":
-            return [("看原因", "none", slug)] if warn else [("安装", "install", slug)]
+            return ([("看原因", "none", slug)] if warn else [("安装", "install", slug)]) + release
         if st == "enabled":
             return [("禁用", "set_off", slug), ("卸载", "uninstall", slug),
-                    ("校验", "check_local", slug)]
+                    ("校验", "check_local", slug)] + release
         if st == "disabled":
             return [("启用", "set_on", slug), ("卸载", "uninstall", slug),
-                    ("校验", "check_local", slug)]
+                    ("校验", "check_local", slug)] + release
         if st in ("external", "external-disabled"):
             # 外部行照样能禁停（排查启动冲突时最需要）：写成官方 disabled，不碰原文
             acts = [("禁用", "row_off", slug)] if st == "external" \
@@ -2600,7 +2618,7 @@ class App(tk.Tk):
             acts.append(("校验", "check_local", slug))
             if str(it.get("full_name", "")).startswith("@dsh-user/"):
                 acts.append(("接管", "adopt", slug))     # 只有 @dsh-user/* 才谈得上接管
-            return acts
+            return acts + release
         if st in ("first_party", "first_party-disabled"):
             # 官方插件（如 time-context）也在用户补丁里，一样能禁停——排查冲突时要的正是它
             acts = [("禁用", "row_off", slug)] if st == "first_party" \
@@ -2672,6 +2690,80 @@ class App(tk.Tk):
             self._post(self._set_plugin_busy, False)
             self._post(self._refresh_plugins)
 
+    def _ask_publish_scope(self) -> str | None:
+        """问一次发行用的 npm scope，记住答案；返回 None = 用户取消。
+
+        只需要问一次：之后每次点【打包发行】都是真正的一键（离线、确定性、同输入同输出）。
+        """
+        saved = str(load_config().get("publishScope", "")).strip()
+        if saved:
+            return saved
+        scope = simpledialog.askstring(
+            "打包成 bundle：发布用包名前缀",
+            "要发到 npm 的话，填你自己的 npm scope（形如 @yourname）。\n\n"
+            "· 留空 = 沿用 @dsh-user/<插件名>：能给自己或别人手动装 tgz，但发不进 registry\n"
+            "· 只想先打一个 tgz 试装，留空即可\n\n"
+            "包名前缀：", initialvalue="", parent=self)
+        if scope is None:
+            return None
+        scope = scope.strip()
+        if scope and not scope.startswith("@"):
+            messagebox.showwarning("前缀要以 @ 开头",
+                                   "npm scope 形如 @yourname；这次没有打包，改好再点一次。")
+            return None
+        save_config({"publishScope": scope})
+        self._plog(f"[发行] 已记住发布用包名前缀：{scope or '（空，沿用 @dsh-user/<插件名>）'}")
+        return scope
+
+    def _bundleize_worker(self, slug: str, scope: str) -> None:
+        """把本地插件打包成可发布的 bundle：改造 manifest + 生成包内层 + `pnpm pack`。
+
+        这套流程（加 `dsh.bundle.patch`、把 patch 放进 `files`、去掉 private、
+        官方依赖转 peer、生成包内 `cordis.patch.yml`）全是确定性文件变换，
+        以前每次都要在对话里手工做一遍；做成按钮后离线可用、可回归测试。
+        **只产出发行物**：不改源目录、不装进你的 profile、不发布。
+        """
+        try:
+            env = self._plugin_env()
+            if env is None:
+                return
+            home, project = env
+            extra = next((s.path for s in self._plugin_sources(home, project)
+                          if s.slug == slug), None)
+            src = pstore.find_plugin_source(home, slug, project=project, extra=extra)
+            if src is None:
+                raise pstore.PluginError(
+                    f"找不到 {slug} 的源码目录（plugins/、下载缓存、共享锚都没有）")
+            self._plog(f"[发行] 源目录：{src}")
+            plan = pstore.stage_bundle(src, home / pstore.BUNDLE_STAGE_DIR,
+                                       scope=scope, slug=slug)
+            for note in plan.notes:
+                self._plog(f"[发行] · {note}")
+            for line in plan.patch_text.splitlines():
+                self._plog(f"[发行]   层内容 | {line}")
+            pnpm = find_pnpm()
+            if pnpm is None:
+                raise pstore.PluginError("未检测到 pnpm，打不出 tgz（先装 Node/pnpm）")
+            tgz = pstore.pack_bundle(plan, pnpm=pnpm)
+            checks = pstore.bundle_tgz_report(tgz)
+            for line in checks:
+                self._plog(f"[发行] {line}")
+            self._plog(f"[发行] ✓ 已打出 {tgz}")
+            self._plog(f"[发行]   本机试装：dsh plugin --profile web add \"{tgz}\"")
+            self._plog(f"[发行]   发布到 npm：在 {plan.out_dir} 里跑 pnpm publish")
+            self._plog(f"[发行]   （发布不可撤销，且需要 npm 登录，所以留给你手动决定）")
+            body = (f"{plan.package_name} {plan.version}\n\n"
+                    f"暂存目录：{plan.out_dir}\n"
+                    f"tgz：{tgz}\n\n" + "\n".join(checks)
+                    + "\n\n下一步（手动）：\n"
+                      f"· 本机试装：dsh plugin --profile web add \"{tgz}\"\n"
+                      f"· 发布：cd \"{plan.out_dir}\" && pnpm publish")
+            self._post(lambda: messagebox.showinfo("打包成 bundle 完成", body, parent=self))
+            self._post(self._status, f"{slug} 已打包：{tgz.name}")
+        except Exception as exc:  # noqa: BLE001
+            self._plog(f"[发行] ✗ 打包 {slug} 失败：{exc}")
+            self._post(self._status, f"{slug} 打包失败 ✗（详情见日志）", "#b00000")
+
     def _local_check_worker(self, slug: str) -> None:
         """本地插件的【校验】：查共享锚目录/来源目录里的包是否自洽。
 
@@ -2687,10 +2779,13 @@ class App(tk.Tk):
             anchor = pstore.anchor_dir(home, slug)
             if anchor.exists():
                 targets.append(anchor)
-            src = next((s for s in self._plugin_sources(home, project) if s.slug == slug),
-                       None)
-            if src is not None and src.path.exists():
-                targets.append(src.path)
+            # 源码目录（含 dsh 检出里的 plugins/<slug>）也要查：那才是你正在改的那份
+            found = pstore.find_plugin_source(
+                home, slug, project=project,
+                extra=next((s.path for s in self._plugin_sources(home, project)
+                            if s.slug == slug), None))
+            if found is not None and found not in targets:
+                targets.append(found)
             # 官方/在线插件没有来源目录，包就在 profile 的 node_modules 里
             # （本地与官方在 profiles/node_modules，bundle 在 profiles/web/node_modules）
             full = next((str(it.get("full_name", "")) for it in
@@ -2729,6 +2824,13 @@ class App(tk.Tk):
             self._post(self._status, f"{slug} 校验失败 ✗", "#b00000")
 
     def _plugin_act(self, slug: str, action: str) -> None:
+        if action == "bundleize":                # 打包成 bundle：先问一次包名前缀（记住）
+            scope = self._ask_publish_scope()
+            if scope is None:
+                return
+            threading.Thread(target=self._bundleize_worker, args=(slug, scope),
+                             daemon=True).start()
+            return
         if action == "check_local":              # 只读校验：立即跑，不进待办
             threading.Thread(target=self._local_check_worker, args=(slug,),
                              daemon=True).start()
