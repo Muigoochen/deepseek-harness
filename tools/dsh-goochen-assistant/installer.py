@@ -190,6 +190,42 @@ def pnpm_execpath() -> str:
     return ""
 
 
+def official_is_newer(status) -> bool:
+    """官方版本是不是比本地新——核对成功且两边都有版本号时才敢下结论。"""
+    official = getattr(status, "official_status", None)
+    if not (official and official.ok and official.version and status.version):
+        return False
+    return ginfo.version_key(official.version) > ginfo.version_key(status.version)
+
+
+def update_summary(status) -> tuple[str, str]:
+    """把检查结果变成界面那一行字（结论 + 颜色）。
+
+    一条硬规矩：**只要官方比本地新，就绝不许出现"已是最新"**。分支自己"没落后"最容易
+    骗人——开发机上分支跟踪的是自己的 fork，`behind=0` 只说明"你的 fork 没有新东西"。
+    真机实测就是这么显示出"✓ 已是最新"的：本地 0.1.2-alpha.3，官方已经 0.1.6-alpha.2。
+    """
+    official = getattr(status, "official_status", None)
+    if status.behind:
+        extra = (f"（最新 {status.latest} {status.latest_subject}）"
+                 if status.latest else "")
+        text, color = f"⚠ 落后 {status.behind} 个提交{extra}", "#a05a00"
+    elif official_is_newer(status):
+        text = (f"⚠ 官方已到 {official.version}（本地 {status.version}）"
+                f"　·　你的分支无新提交")
+        color = "#a05a00"
+    else:
+        text, color = "✓ 已是最新", "#1a6b1a"
+    if status.ahead:
+        text += f"；本地领先 {status.ahead} 个提交"
+    where = status.upstream or status.remote
+    if where:
+        text += f"　·　{where}"
+        if not status.official:
+            text += "（非官方远端）"
+    return text, color
+
+
 def build_variables(project: Path, log=log_line,
                     commit_marker: Path | None = None,
                     base: dict | None = None) -> dict[str, str]:
@@ -2087,20 +2123,35 @@ class App(tk.Tk):
         if not status.ok:
             self._set_label(self.git_note, f"检查失败：{status.error}", "#b00000")
             return
-        if status.behind == 0:
-            text, color = "✓ 已是最新", "#1a6b1a"
-        else:
-            extra = (f"（最新 {status.latest} {status.latest_subject}）"
-                     if status.latest else "")
-            text, color = f"⚠ 落后 {status.behind} 个提交{extra}", "#a05a00"
-        if status.ahead:
-            text += f"；本地领先 {status.ahead} 个提交"
-        where = status.upstream or status.remote
-        if where:
-            text += f"　·　{where}"
-            if not status.official:
-                text += "（非官方远端）"
+        # 结论那行由 update_summary 统一算（含"官方更新时不许说已是最新"这条规矩），
+        # 细节写进日志——界面一行放不下 fork / 官方两套信息
+        text, color = update_summary(status)
         self._set_label(self.git_note, text, color)
+        self._log_update_detail(status, getattr(status, "official_status", None),
+                                official_is_newer(status))
+
+    def _log_update_detail(self, status, official, newer: bool) -> None:
+        """把"比的是谁、官方到哪、按钮能做什么"写进日志——界面那行只放结论。"""
+        self._append(f"[更新] 本目录分支 {status.branch}，跟踪远端 {status.remote}"
+                     f"（{'官方' if status.official else '非官方'}）；"
+                     f"相对它：落后 {status.behind}、领先 {status.ahead}")
+        if official is None:
+            return
+        if not official.ok:
+            self._append(f"[更新] 官方核对没成功：{official.error}")
+            return
+        self._append(f"[更新] 官方最新：{official.tag or official.version}"
+                     f"（{official.branch} {official.head}）"
+                     f"；本目录版本 {status.version or '读不到'}")
+        if not newer:
+            return
+        if status.official:
+            self._append("[更新] 『更新到最新』会把你带到官方最新（走快进）。")
+        else:
+            self._append("[更新] 注意：『更新到最新』只更新你 fork 跟踪的那个分支，"
+                         "不会把你带到官方版本。要跟官方，得自己把官方并进来，例如：\n"
+                         "        git fetch upstream && git rebase upstream/master\n"
+                         "       （有本地提交时不能快进，工具不会替你合并，避免覆盖你的东西）")
 
     def on_update_now(self) -> None:
         """把安装目录**快进**到远端最新，再重装依赖、重新构建。"""

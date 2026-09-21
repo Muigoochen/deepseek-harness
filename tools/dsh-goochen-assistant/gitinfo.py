@@ -30,6 +30,10 @@ GIT_MISSING = 127
 GIT_TIMEOUT = 124
 DEFAULT_TIMEOUT = 20
 FETCH_TIMEOUT = 120
+#: `ls-remote` 只取引用、不拉历史，几秒就能回来（实测官方 5.8 秒）。给足余量，但不让它拖住界面。
+LS_REMOTE_TIMEOUT = 45
+#: 官方发布 tag 的前缀：`dsh-v0.1.6-alpha.2` → 版本号 `0.1.6-alpha.2`。
+OFFICIAL_TAG_PREFIX = "dsh-v"
 _UNIT = "\x1f"          # git --format 的字段分隔符（正常文本里不会出现）
 
 
@@ -240,6 +244,86 @@ def verify_dsh_repo(path: Path, info: Optional[RepoInfo] = None) -> DshIdentity:
     return DshIdentity(False, "none", f"是 git 仓库根，但远端不是 DSH：{urls}")
 
 
+def official_remote_name(remotes: dict[str, str]) -> str:
+    """远端**名**里指向官方仓库的那个（没有则 ''）；判断标准与 `official_remote` 一致。
+
+    有多个官方远端时优先取字面叫 `upstream` 的那个——它是 git 自己的习惯叫法，最稳。
+    """
+    found = ""
+    for name, url in remotes.items():
+        owner, repo = split_remote(url)
+        if owner.lower() == OFFICIAL_OWNER and repo.lower() == REPO_SLUG.lower():
+            if name == "upstream":
+                return name
+            found = found or name
+    return found
+
+
+def version_key(text: str) -> tuple:
+    """把版本号排成可比较的键（越大越新）。
+
+    `0.1.6` > `0.1.6-rc.2` > `0.1.6-alpha.10` > `0.1.6-alpha.2`：正式版最大，
+    预发布里 rc > beta > alpha，同档比序号（所以 alpha.10 > alpha.2，不是按字符串比）。
+    """
+    core, _, pre = text.strip().partition("-")
+    nums = tuple(int(part) if part.isdigit() else 0 for part in core.split("."))
+    if not pre:
+        return (nums, 1, (0, 0))
+    rank = {"alpha": 0, "beta": 1, "rc": 2}
+    name, _, number = pre.partition(".")
+    return (nums, 0, (rank.get(name, 3), int(number) if number.isdigit() else 0))
+
+
+@dataclass(frozen=True)
+class OfficialStatus:
+    """官方仓库现在是什么版本——**只取引用，不拉历史**。
+
+    真机实测：直连官方 `git fetch` 十分钟都没返回（网络环境所致），而 `ls-remote`
+    5.8 秒就回来。检查更新不能让用户干等，更不能卡住界面，所以官方这一路只走 ls-remote：
+    标签告诉我们最新版本号，分支头告诉我们官方到哪个提交。
+    """
+    ok: bool = False
+    remote: str = ""
+    url: str = ""
+    version: str = ""          # 最新官方标签的版本号，如 0.1.6-alpha.2
+    tag: str = ""              # 原始标签名，如 dsh-v0.1.6-alpha.2
+    branch: str = ""           # 官方默认分支
+    head: str = ""             # 该分支头（短 hash）
+    error: str = ""
+
+
+def official_status(info: RepoInfo, *,
+                    timeout: int = LS_REMOTE_TIMEOUT) -> OfficialStatus:
+    """问官方远端"最新是什么版本"（`ls-remote`，廉价的只读探测）。"""
+    name = official_remote_name(info.remotes)
+    if not name:
+        return OfficialStatus(error="没有配置官方远端，无法核对官方版本")
+    url = info.remotes[name]
+    code, out, err = run_git(["ls-remote", "--tags", name], timeout=timeout)
+    if code != 0:
+        return OfficialStatus(remote=name, url=url,
+                              error=f"ls-remote 失败：{_first_line(err) or code}")
+    best_tag = best_version = ""
+    for line in out.splitlines():
+        if "refs/tags/" not in line:
+            continue
+        tag = line.split("refs/tags/", 1)[1].strip()
+        if tag.endswith("^{}") or not tag.startswith(OFFICIAL_TAG_PREFIX):
+            continue
+        version = tag[len(OFFICIAL_TAG_PREFIX):]
+        if not best_version or version_key(version) > version_key(best_version):
+            best_tag, best_version = tag, version
+    branch = head = ""
+    for candidate in ("master", "main"):
+        code, out, _ = run_git(["ls-remote", name, f"refs/heads/{candidate}"],
+                               timeout=timeout)
+        if code == 0 and out.strip():
+            branch, head = candidate, out.split()[0][:7]
+            break
+    return OfficialStatus(ok=True, remote=name, url=url, version=best_version,
+                          tag=best_tag, branch=branch, head=head)
+
+
 def tracking_remote(info: RepoInfo) -> str:
     """分支跟踪的远端名（`@{u}` 的第一段）；没有跟踪就回退 origin。
 
@@ -253,7 +337,13 @@ def tracking_remote(info: RepoInfo) -> str:
 
 @dataclass(frozen=True)
 class UpdateStatus:
-    """与远端的比较结果；behind>0 表示有更新可拉。"""
+    """与远端的比较结果；behind>0 表示有更新可拉。
+
+    `behind` 是相对**本分支跟踪的那个远端**的：开发机上它常常是你自己的 fork，
+    所以 `behind=0` 只说明"你的 fork 没有新东西"，**不等于官方没出新版本**。
+    官方那一侧由 `official_status` 独立核对，两者必须一起看——只看 behind 就会把
+    "fork 同步"误报成"产品已是最新"（真机就是这么错报的）。
+    """
     ok: bool
     behind: int = 0
     ahead: int = 0
@@ -264,33 +354,40 @@ class UpdateStatus:
     official: bool = False
     latest: str = ""
     latest_subject: str = ""
+    version: str = ""
+    official_status: Optional[OfficialStatus] = None
     error: str = ""
 
 
-def check_update(path: Path, *, remote: str = "") -> UpdateStatus:
-    """`git fetch` 后比较本地 HEAD 与**该分支跟踪的远端**：behind>0 = 有更新。
+def check_update(path: Path, *, remote: str = "", official: bool = True) -> UpdateStatus:
+    """先跟**本分支跟踪的远端**比，再**独立核对官方**——两件事都得做。
 
-    remote 留空就跟 `@{u}` 走（小白的 origin 通常就是官方；开发机上分支可能跟踪
-    自己的 fork，那本来就该跟自己的 fork 比）。需要联网；失败返回结构化结果，不抛异常。
+    只跟 `@{u}` 比是不够的：开发机上分支常常跟踪自己的 fork，于是 `behind=0` 只说明
+    "你的 fork 没有新东西"，很容易被读成"产品已是最新"（真机实测：本地 0.1.2-alpha.3、
+    官方已到 0.1.6-alpha.2，界面却显示"✓ 已是最新"）。所以这里再问一次官方——
+    用 `ls-remote`（只取引用）而不是 fetch：直连官方全量 fetch 在这类网络环境下十分钟
+    都不返回，`ls-remote` 却只要几秒。
+    需要联网；失败返回结构化结果，不抛异常。
     """
     info = repo_info(path)
     if not info.ok:
         return UpdateStatus(ok=False, error=info.error)
     branch = info.branch
     if not branch or branch == "HEAD":
-        return UpdateStatus(ok=False, error="处于分离头（detached HEAD）状态，无法判断更新")
+        return UpdateStatus(ok=False, version=info.version,
+                            error="处于分离头（detached HEAD）状态，无法判断更新")
     remote = remote or tracking_remote(info)
     if remote not in info.remotes:
-        return UpdateStatus(ok=False, branch=branch, remote=remote,
+        return UpdateStatus(ok=False, branch=branch, remote=remote, version=info.version,
                             error=f"没有名为 {remote} 的远端")
     url = info.remotes[remote]
-    official = official_remote({remote: url}) == url
+    is_official = official_remote({remote: url}) == url
 
     # 不带 --depth：带它会给本地仓库凭空加一个浅边界，把本来完整的祖先关系弄断
     code, _out, err = run_git(["fetch", remote, branch], path, timeout=FETCH_TIMEOUT)
     if code != 0:
-        return UpdateStatus(ok=False, branch=branch, remote=remote, official=official,
-                            upstream=info.upstream, remote_url=url,
+        return UpdateStatus(ok=False, branch=branch, remote=remote, official=is_official,
+                            upstream=info.upstream, remote_url=url, version=info.version,
                             error=f"git fetch 失败：{_first_line(err)}")
 
     code, out, _ = run_git(["rev-parse", "--short", "FETCH_HEAD"], path)
@@ -309,9 +406,14 @@ def check_update(path: Path, *, remote: str = "") -> UpdateStatus:
         if code == 0 and out.strip():
             ahead = int(out.strip().split()[0])
 
+    officials = None
+    if official and official_remote_name(info.remotes):
+        officials = official_status(info)
+
     return UpdateStatus(ok=True, behind=behind, ahead=ahead, branch=branch,
                         remote=remote, upstream=info.upstream, remote_url=url,
-                        official=official, latest=latest, latest_subject=subject)
+                        official=is_official, latest=latest, latest_subject=subject,
+                        version=info.version, official_status=officials)
 
 
 @dataclass(frozen=True)
