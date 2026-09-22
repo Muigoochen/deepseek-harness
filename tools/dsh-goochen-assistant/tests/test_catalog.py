@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue as queue_module
 import shutil
 import subprocess
 import sys
@@ -942,6 +943,11 @@ class InterruptedInstallTest(unittest.TestCase):
     def test_force_redoes_deps_and_build_after_an_interrupt(self):
         project = self._checkout()
         (project / "node_modules").mkdir()
+        # 真跑完 pnpm install 的目录一定有 .modules.yaml（本工具也靠它读 storeDir）。
+        # "目录在"就当作装好了是旧的判据：被打断的半成品也有 node_modules，会被跳过依赖、
+        # 直接进构建，报出来是一堆"找不到模块"。
+        (project / "node_modules" / ".modules.yaml").write_text(
+            "nodeLinker: isolated\n", encoding="utf-8")
         mark = project / installer.BUILD_MARK
         mark.parent.mkdir(parents=True, exist_ok=True)
         mark.write_text("{}", encoding="utf-8")
@@ -969,6 +975,26 @@ class InterruptedInstallTest(unittest.TestCase):
         self.assertEqual(len(calls), 2, f"被打断过就必须重做依赖与构建：{calls}")
         self.assertTrue(any("install" in c for c in calls[0]), calls)
 
+    def test_half_installed_tree_is_not_treated_as_installed(self):
+        """只有 node_modules、没有 .modules.yaml ⇒ 上次没装完，即使没被打断标记也要重装。"""
+        project = self._checkout()
+        (project / "node_modules").mkdir()          # 有意不写 .modules.yaml
+        installer.set_active_dir(project)
+        calls: list[list[str]] = []
+
+        def fake_run_cli(argv, cwd=None, env=None):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with mock.patch.object(installer, "run_cli", fake_run_cli), \
+                mock.patch.object(installer.Engine, "check_env", lambda self: {}), \
+                mock.patch.object(installer.Engine, "install_node", lambda self, env: None), \
+                mock.patch.object(installer.Engine, "install_pnpm", lambda self: None):
+            installer.Engine(mode="auto", use_mirror=False, log=self.logs.append,
+                             force=False).run_full(headless=False, start=False)
+        self.assertTrue(any("install" in c for c in calls),
+                        f"半成品必须重装依赖，不能只看目录在不在：{calls}")
+
     def test_successful_full_install_clears_the_flag(self):
         project = self._checkout()
         installer.set_active_dir(project)
@@ -988,6 +1014,77 @@ class InterruptedInstallTest(unittest.TestCase):
                          "装完了就该取消标记，别让以后每次安装都白重做一遍")
 
 
+class WorkLogGoesToFileTest(unittest.TestCase):
+    """工作线程的日志必须**同时**进界面和 installer.log。
+
+    真机踩过：更新线程卡住时界面一片安静、翻 installer.log 也什么都没有，只能靠进程快照
+    反推。评审又发现完整安装那条主路径只传了 `_append`（只进界面），失败后同样查不到原因，
+    所以这里对**文件内容**做断言（此前没有任何测试断言过 installer.log）。
+    """
+
+    def test_log_work_writes_the_file(self):
+        app = SimpleNamespace(_append=lambda _m: None)
+        marker = "ZZ_测试标记_工作线程日志必须落盘"
+        installer.App._log_work.__get__(app)(marker)
+        self.assertIn(marker, installer.LOG_PATH.read_text(encoding="utf-8"))
+
+    def test_drain_all_empties_a_long_queue(self):
+        """关窗前要把攒下的回调**全部**刷出来：原来只取 50 条，失败原因那几行常被丢掉。"""
+        ran: list[int] = []
+        app = SimpleNamespace(
+            _ui_queue=queue_module.Queue(), _closing=False,
+            after=lambda *a: None)
+        for index in range(200):
+            app._ui_queue.put((ran.append, (index,)))
+        app._drain_ui_queue = installer.App._drain_ui_queue.__get__(app)
+        installer.App._drain_ui_queue.__get__(app)(drain_all=True)
+        self.assertEqual(len(ran), 200, "200 条都要跑完，不能只跑 50 条")
+
+    def test_failed_install_marks_the_directory(self):
+        """失败也要记「装到一半」：否则下次会被『node_modules 已存在』跳过依赖，直接构建再失败。"""
+        class Boom:
+            def run_full(self, **_kw):
+                raise RuntimeError("假装装依赖失败")
+
+        marked: list[str] = []
+        posted: list[tuple] = []
+        app = SimpleNamespace(
+            _op_target=r"C:\installing\A", busy=True,
+            _status=lambda *a: None, _log_work=lambda m: posted.append(("log", m)),
+            _post=lambda fn, *a: posted.append((getattr(fn, "__name__", ""), a)),
+            _set_busy=lambda *a: None)
+        with mock.patch.object(installer, "set_interrupted_target", marked.append), \
+                mock.patch.object(installer.messagebox, "showerror", lambda *a, **k: None):
+            installer.App._job.__get__(app)(Boom())
+        self.assertEqual(marked, [r"C:\installing\A"])
+
+    def test_rebuild_reads_tk_values_in_the_ui_thread(self):
+        """Tk 变量只能在界面线程读：工作线程里读会偶发 RuntimeError，还被记成"构建失败"。"""
+        seen: list[tuple] = []
+        app = SimpleNamespace(
+            git_busy=False, busy=False, _effective_dir=lambda: Path(r"C:\ds"),
+            mode=SimpleNamespace(get=lambda: "auto"),
+            mirror=SimpleNamespace(get=lambda: True),
+            _set_git_buttons=lambda *a: None, _log_work=lambda m: None,
+            _post=lambda *a: None, _rebuild_done=lambda *a: None)
+        app._rebuild_worker = installer.App._rebuild_worker.__get__(app)
+
+        class FakeThread:
+            def __init__(self, target=None, args=(), **kw):
+                seen.append(args)
+
+            def start(self):
+                pass
+
+        with mock.patch.object(installer.Path, "exists", lambda _self: True), \
+                mock.patch.object(installer, "port_in_use", lambda: False), \
+                mock.patch.object(installer.messagebox, "askyesno", lambda *a, **k: True), \
+                mock.patch.object(installer.threading, "Thread", FakeThread):
+            installer.App.on_rebuild.__get__(app)()
+        self.assertEqual(seen, [(Path(r"C:\ds"), "auto", True)],
+                         "安装方式/镜像要在界面线程取好，再当参数传进工作线程")
+
+
 class CloseMarksOpTargetTest(unittest.TestCase):
     """关窗这条接线：记的是**正在安装的那个目录**，不是关窗那一刻路径框里的值。
 
@@ -1004,7 +1101,7 @@ class CloseMarksOpTargetTest(unittest.TestCase):
             busy=False, git_busy=False, plugin_busy=False, mig_busy=False,
             _op_target=None, _closing=False,
             _stop_web_internal=lambda quiet=True: None,
-            _drain_ui_queue=lambda: None,
+            _drain_ui_queue=lambda **kw: None,
             destroy=lambda: None)
         app.__dict__.update(kw)
         app._long_task_running = installer.App._long_task_running.__get__(app)
@@ -1130,7 +1227,8 @@ class InstallPnpmTest(unittest.TestCase):
             calls.append(list(argv))
             return subprocess.CompletedProcess(argv, 0, b"", b"")
 
-        with mock.patch.object(installer, "find_pnpm", lambda: None), \
+        with mock.patch.object(installer, "find_pnpm",
+                               side_effect=[None, r"C:\Users\me\AppData\Roaming\npm\pnpm.CMD"]), \
                 mock.patch.object(installer, "find_npm",
                                   lambda: r"C:\Program Files\nodejs\npm.CMD"), \
                 mock.patch.object(installer.shutil, "which",
@@ -1142,6 +1240,25 @@ class InstallPnpmTest(unittest.TestCase):
             self.assertNotIn(argv[0], ("npm", "corepack"), f"不能用裸名字：{argv}")
             self.assertTrue(argv[0].upper().endswith(".CMD") or os.path.isabs(argv[0]),
                             f"必须是解析出来的全路径：{argv}")
+
+    def test_installed_but_unresolvable_pnpm_is_reported(self):
+        """装完却仍然找不到 pnpm 时必须**明确报错**，不能继续往下跑。
+
+        新机器第一次一键安装就踩这条：`npm install -g pnpm` 把 pnpm.cmd 放进
+        %APPDATA%\\npm，而这个目录不在当前进程的 PATH 里（环境块启动时定格，注册表里
+        新写的 PATH 不会回流）→ 后面 ⑤⑥⑦ 每一条都报"'pnpm' 不是内部或外部命令"。
+        原来这里只 log 一句"pnpm 安装完成"，返回值还被调用方丢掉。
+        """
+        with mock.patch.object(installer, "find_pnpm", lambda: None), \
+                mock.patch.object(installer, "find_npm",
+                                  lambda: r"C:\Program Files\nodejs\npm.CMD"), \
+                mock.patch.object(installer.shutil, "which", lambda n: None), \
+                mock.patch.object(installer, "run",
+                                  lambda argv, cwd=None, env=None: subprocess.CompletedProcess(
+                                      argv, 0, b"", b"")):
+            with self.assertRaises(installer.InstallError) as ctx:
+                self._engine().install_pnpm()
+        self.assertIn("PATH", str(ctx.exception), "要说清是 PATH 里找不到，并给出下一步")
 
     def test_missing_npm_explains_instead_of_crashing(self):
         with mock.patch.object(installer, "find_pnpm", lambda: None), \

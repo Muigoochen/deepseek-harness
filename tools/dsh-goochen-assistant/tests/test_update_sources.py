@@ -152,7 +152,11 @@ class UpdateFromTest(unittest.TestCase):
         self.assertTrue(result.ok, result.error)
         self.assertTrue(result.changed)
         self.assertEqual(result.strategy, "ff")
-        self.assertEqual(result.backup, "", "快进不需要备份")
+        # 快进路径**也**要建备份：快进被超时掐断或写盘失败时工作区会半更新，没有备份就
+        # 没有任何回退目标，而提示还会指向一个（因无备份而隐藏的）按钮，用户被卡死。
+        self.assertTrue(result.backup.startswith("backup/before-update-"), result.backup)
+        self.assertIn(result.backup, self._branches(self.local),
+                      "快进也必须留下备份分支，任何一次更新失败都要有路可退")
         self.assertEqual((self.local / "file.txt").read_text(encoding="utf-8"), "v2")
 
     def test_nothing_to_do_is_success_not_failure(self):

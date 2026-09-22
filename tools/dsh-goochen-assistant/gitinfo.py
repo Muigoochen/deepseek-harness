@@ -845,7 +845,11 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
             "不是快进关系（你本地有自己的提交），已中止，你的文件没有被改动。"))
 
     backup_branch = ""
-    if not fast_forward and backup:
+    if backup:
+        # **无条件建备份分支**。原来只在"分叉（不能快进）"时建：可快进那条路被超时掐断或
+        # 写盘失败时，工作区同样会半更新，而那时**没有任何回退目标**，提示还指向一个
+        # （因为无备份而被隐藏的）回退按钮——用户被卡住，只能自己敲 git。多一条 ref 的成本
+        # 可以忽略，换来"任何一次更新失败都有路可退"。
         backup_branch = _existing_backup_name(path)
         code, _out, err = run_git(["branch", backup_branch, "HEAD"], path)
         if code != 0:
@@ -891,7 +895,12 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
         _code_u, out_u, _err_u = run_git(["diff", "--name-only", "-z", "--diff-filter=U"],
                                         path)
         files = [f for f in out_u.split("\0") if f.strip()]
-        undo = ["rebase", "--abort"] if used == "rebase" else ["merge", "--abort"]
+        # 快进路径的撤销**不能**用 `merge --abort`：快进不产生合并提交，也没有 MERGE_HEAD，
+        # 那句必然报 "There is no merge to abort (MERGE_HEAD missing)"。快进前 HEAD 没动过，
+        # 所以 `reset --hard HEAD` 正好把工作区还原成更新前的样子（更新前已确认工作区干净）。
+        undo = (["rebase", "--abort"] if used == "rebase"
+                else ["reset", "--hard", "HEAD"] if used == "ff"
+                else ["merge", "--abort"])
         # 撤销**自己也会失败**（merge 被超时杀掉、文件被占用、磁盘满…）。这时绝不能嘴上
         # 还说"你的文件没有被改动"——退出码和 MERGE_HEAD 说了算。
         undo_code, _undo_out, _undo_err = run_git(undo, path, timeout=GIT_UNDO_TIMEOUT)
@@ -902,11 +911,17 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
         else:
             detail = _first_line(err) or f"git 退出码 {code}"
         if undo_code != 0 or still_merging:
-            # 这里**绝不能让用户自己去敲命令**：界面上有【回退到更新前】按钮，
-            # 它做的就是这件事（先把服务停掉，再 reset --hard）。
-            hint = ("**撤销没能做完**，点界面上的【回退到更新前】就能收拾干净"
-                    + (f"（等价于 git reset --hard {backup_branch}，"
-                       "但不用你动手）" if backup_branch else ""))
+            if still_merging:
+                # 真的还在合并态：界面上的按钮做的就是这件事（先停服务，再 reset --hard）。
+                hint = ("**撤销没能做完**，点界面上的【回退到更新前】就能收拾干净"
+                        + (f"（等价于 git reset --hard {backup_branch}，"
+                           "但不用你动手）" if backup_branch else ""))
+            else:
+                # 没有 MERGE_HEAD ⇒ git 在**真正开始合并之前**就退出了（工作区在检查之后被改、
+                # 未跟踪文件挡路、索引被锁、钩子失败…），什么都没动。这时绝不能建议用户做硬
+                # 回退——那会把他刚被 git 保护下来的改动直接抹掉，而且提示与事实不符。
+                hint = ("git 在真正开始合并之前就退出了，**你的文件没有被改动**，"
+                        "不需要做任何回退。")
         elif backup_branch:
             hint = (f"已整体撤销，你的文件没有被改动。备份分支 {backup_branch} 仍在，"
                     "随时可以退回去。")
@@ -939,14 +954,27 @@ def update_backups(path: Path) -> list[str]:
     return names
 
 
-def reset_to(path: Path, ref: str) -> tuple[bool, str]:
+def reset_to(path: Path, ref: str, *, require_clean: bool = True) -> tuple[bool, str]:
     """把当前分支**硬回退**到 ref，返回 `(成功, 说明)`。
 
     只给"回退到更新前"用：ref 必须是本仓库真实存在的备份分支，否则直接拒绝，
-    免得手滑传进来一个假名字。**先确认引用存在，再 reset。**
+    免得手滑传进来一个假名字。**先确认引用存在、工作区干净，再 reset。**
+
+    `--hard` 会覆盖已跟踪的改动、还可能删掉挡路的未跟踪文件（git 官方文档明说
+    "may overwrite untracked files"），所以默认要求工作区干净；读不出状态也拒绝
+    （**查不出来不等于干净**，宁可让用户先处理，也不能替他丢东西）。
     """
     if not ref:
         return False, "没有指定要回退到哪个备份"
+    if require_clean:
+        code, out, _err = run_git(["status", "--porcelain"], path)
+        if code != 0:
+            return False, ("读不出工作区状态（git status 失败），为免抹掉你的改动已拒绝硬回退。\n"
+                           "先确认没有别的 git 在跑（另一个窗口/编辑器/终端），再重试。")
+        dirty = [ln for ln in out.splitlines() if ln.strip()]
+        if dirty:
+            return False, (f"工作区有 {len(dirty)} 处本地改动，硬回退会丢掉它们，已拒绝。\n"
+                           "请先提交或撤销这些改动，再回退。")
     code, out, _err = run_git(["rev-parse", "--verify", "--quiet", f"refs/heads/{ref}"], path)
     if code != 0 or not out.strip():
         return False, f"找不到备份分支 {ref}（可能已经被删了）"

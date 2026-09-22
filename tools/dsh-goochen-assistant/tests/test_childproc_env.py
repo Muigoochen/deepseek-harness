@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """`childproc.run` 的环境传递（真机踩过的坑，比看上去重要）。
 
-它以前把 `env=None` 改写成 `dict(os.environ)` 再交给 `Popen`。实测在 Windows 上这份拷贝
-**会漏掉进程真实持有的变量**（本机漏过 `npm_execpath`），于是"外面明明有、子进程却看不到"——
-离线安装在 ⑥ 构建直接报 `pnpm invocation: npm_execpath is unavailable` 退出 1。
-`None` 必须原样交给 `Popen`：那才是"继承"，也才是操作系统眼里的真相。
+它以前把 `env=None` 改写成 `dict(os.environ)` 再交给 `Popen`，理由是"实测这份拷贝会漏掉
+`npm_execpath`"。**那个理由经复核是错的**：Windows 上 Python 会把环境变量名大写化
+（`npm_execpath` 存成 `NPM_EXECPATH`），所以 `dict(os.environ).get("npm_execpath")` 查不到，
+但值一直都在——`Popen(env=…)` 传过去后 Node 仍读得到（`process.env` 在 Windows 上不区分
+大小写）。真正会出问题的是**按前缀枚举**（`npm_config_*` → `NPM_CONFIG_*`）。
+`None` 仍然是对的选择——那才是"继承"，是操作系统眼里的真相，也省掉一整套大小写陷阱——
+但别再拿"拷贝会丢变量"当理由。
 """
 from __future__ import annotations
 

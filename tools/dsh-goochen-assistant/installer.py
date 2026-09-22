@@ -176,6 +176,14 @@ def _existing_store_dir(project: Path) -> str:
     return found.group(1).strip().strip('"').strip("'") if found else ""
 
 
+PERMANENT_WORDS = (
+    "err_pnpm_fetch_404", "e404", "404 not found", "not found in the store",
+    "eacces", "eperm", "err_pnpm_outdated_lockfile", "err_pnpm_bad_lockfile",
+    "unknown option", "unsupported engine", "err_pnpm_unsupported_platform",
+    "no matching version", "is not recognized as an internal or external command",
+)
+
+
 def _same_dir(left: str, right: Path) -> bool:
     """两个路径是不是同一个目录（Windows 上大小写与斜杠都要归一）。"""
     try:
@@ -186,8 +194,15 @@ def _same_dir(left: str, right: Path) -> bool:
 
 
 def _looks_transient(text: str) -> bool:
-    """这次失败像不像"网络抽了一下"（而不是"包真的缺"）。"""
+    """这次失败像不像"网络抽了一下"（而不是"包真的缺"）。
+
+    先排除**重试也没用**的永久错误：缺包（404）、权限、lockfile 版本对不上、参数不认识…
+    原来只按 TRANSIENT_WORDS 里的裸词判断，`request to` / `network` 这类词会出现在 404 与
+    权限报错里，于是用户白等一轮（每条都是几分钟的命令）。
+    """
     low = text.lower()
+    if any(word in low for word in PERMANENT_WORDS):
+        return False
     return any(word.lower() in low for word in TRANSIENT_WORDS)
 
 
@@ -304,13 +319,15 @@ def build_variables(project: Path, log=log_line,
         `git rev-parse HEAD`；而**离线解压的源码没有 `.git`**（实测构建因此退出 1）。
         取值：`assets/source-commit.txt` 里记了真提交号就用真的，没有就用全 0 占位并说明。
 
-    **绝对不要补 `npm_execpath`**（这条是花钱买来的）：构建脚本 `pnpmInvocation()` 拿它再调
-    pnpm 子脚本，看起来"缺失就该补"，于是早先真这么补了——结果它**正是**构建失败的病根。
-    在同一台机器、同一个工作树上逐条对拍（都走小助手自己的 `run_cli`）：
-      不补 → 构建正常；补成全局 pnpm 的入口（`…\\pnpm\\bin\\pnpm.mjs`）→ 2 秒就抛
-      "pnpm invocation: npm_execpath is unavailable" 退出 1；不补、直接 `node <入口>` → 同样抛。
-    也就是说 pnpm 自己被启动后会按自己的规则给脚本注入正确的值，外面塞一个反而让它认不出。
-    这里同样不整份替换环境：实测 `dict(os.environ)` 会漏掉进程真实持有的变量。
+    **绝对不要补 `npm_execpath`**：早先"看它缺失就补一下"是错的，已删除。当时的实测是
+    （同一台机器、同一个工作树、都走小助手自己的 `run_cli`）：不补 → 构建正常；
+    补成全局 pnpm 的入口（`…\\pnpm\\bin\\pnpm.mjs`）→ 2 秒抛
+    "pnpm invocation: npm_execpath is unavailable" 退出 1；改用 `node <入口>` 但照样补 → 同样抛。
+    **机制至今没有定论**：查 pnpm 自带 bundle 的源码，`lifecycle()` 是无条件
+    `env.npm_execpath = process.argv[1] || process.cwd()`——外部塞的值会被它覆盖，
+    所以"pnpm 认不出我们塞的值"这个解释站不住；真正原因还没查清。可以确定的是：
+    pnpm 自己会注入正确的值，**外面不该替它设置**，删掉这段之后构建恢复正常。
+    另外同样不整份替换环境：Windows 上 Python 会把变量名大写化，按前缀枚举的代码会看不见。
     `base` 只给测试用；不传就看进程环境。
     """
     _ = base                           # 只为兼容老调用/测试的签名，现在不再读环境
@@ -376,13 +393,26 @@ def run_text(argv: list[str], cwd: Path | None = None,
 
 
 def decode_proc(proc: subprocess.CompletedProcess) -> str:
-    raw = (proc.stdout or b"") + (proc.stderr or b"")
-    for enc in ("utf-8", "gbk"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+    """把子进程输出解成文本；**按流分别解码**。
+
+    不能把 stdout+stderr 拼起来再猜一个编码：中文 Windows 上 cmd 自己的消息是 CP936、
+    而 pnpm/node 的输出是 UTF-8，混在一起猜会把另一半变成乱码——用户看到的失败原因、
+    以及"挑错误行"的分支都会跟着失真。所以两个流各自先试 UTF-8、再试本地代码页。
+    """
+    def one(raw: bytes) -> str:
+        if not raw:
+            return ""
+        for enc in ("utf-8", "gbk"):
+            try:
+                return raw.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    out, err = one(proc.stdout or b""), one(proc.stderr or b"")
+    if out and err:
+        return f"{out.rstrip()}\n{err}"
+    return out or err
 
 
 def find_node() -> str | None:
@@ -1258,6 +1288,13 @@ class Engine:
             raise InstallError("Node 装完但找不到 node.exe，请手动确认安装路径")
         # 让后续子进程看得到新装的 node / npm
         os.environ["PATH"] = str(npx.parent) + os.pathsep + os.environ.get("PATH", "")
+        # npm 的**全局 bin**（Windows 上是 %APPDATA%\npm）也要在 PATH 里：pnpm.cmd 装在那儿。
+        # 这个进程的环境块在启动时就定格了，注册表里新写的 PATH 不会回流——新机器第一次
+        # 一键安装时，正是"Node 刚装好、pnpm 还没进 PATH"的处境。
+        global_bin = Path(os.environ.get("APPDATA", "")) / "npm"
+        if global_bin.exists() and str(global_bin) not in os.environ["PATH"]:
+            os.environ["PATH"] = str(global_bin) + os.pathsep + os.environ["PATH"]
+            self.log(f"  · 把 npm 全局目录加进 PATH：{global_bin}")
         self.log(f"  Node.js 安装完成：{npx.parent}")
         return str(npx.parent)
 
@@ -1310,8 +1347,23 @@ class Engine:
             done = run([corepack, "enable"])
             if done.returncode != 0:
                 self.log("  （corepack enable 未生效，不影响：已有 pnpm 可用）")
-        self.log("  pnpm 安装完成")
-        return find_pnpm()
+        # 装完必须**验证真的能调到**：npm 全局安装把 pnpm.cmd 放进 %APPDATA%\npm，而这个
+        # 目录通常不在当前进程的 PATH 里（环境块启动时定格，注册表的新 PATH 不回流）。
+        # 不补这一步，后面 ⑤⑥⑦ 每一条都会报"'pnpm' 不是内部或外部命令"——新机器第一次
+        # 一键安装必踩。原来这里只是 log("pnpm 安装完成")，返回值还被 run_full 丢掉了。
+        global_bin = Path(os.environ.get("APPDATA", "")) / "npm"
+        if global_bin.exists() and str(global_bin) not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = str(global_bin) + os.pathsep + os.environ.get("PATH", "")
+            self.log(f"  · 把 npm 全局目录加进 PATH：{global_bin}")
+        found = find_pnpm()
+        if not found:
+            raise InstallError(
+                "pnpm 装好了，但在 PATH 里找不到它——刚装完的目录不会自动进入本进程的 PATH。\n"
+                f"它的预期位置：{global_bin}\n\n"
+                "请关掉小助手重新打开，再点一次【一键完整安装】；"
+                "若仍不行，就把上面这个目录手动加进系统 PATH。")
+        self.log(f"  pnpm 安装完成：{found}")
+        return found
 
     def prepare_source(self) -> Path:
         project = project_dir()
@@ -1334,7 +1386,14 @@ class Engine:
         offline = self.use_offline(
             SOURCE_ARCHIVE.exists() or STORE_DIR.exists(),
             "源码包/依赖缓存")
-        if offline and SOURCE_ARCHIVE.exists():
+        if offline and not SOURCE_ARCHIVE.exists():
+            # 『离线安装』的承诺是不联网，那就**不许**在缺源码包时偷偷去 git clone——
+            # 原来这里会落到下面的 else 分支真的联网，甚至在没有 git 时让用户去装 Git。
+            raise InstallError(
+                f"『离线安装』需要随包源码（{SOURCE_ARCHIVE.name}），但它不在。\n"
+                "离线模式不会改用 git clone（那要联网）。\n"
+                "请把 assets/ 一起拷过来，或改用『自动选择』（允许联网下载源码）。")
+        if offline:
             # 与在线分支同等的前置检查：非空、又没有 DSH 身份的目录一律不碰。
             # 以前这里没有检查，解压会直接铺进用户选中的目录并覆盖同名文件
             # （实测：用户自己的 README.md 被改成官方 README，随后该目录还会通过
@@ -1390,19 +1449,24 @@ class Engine:
         return project
 
     def install_deps(self, project: Path, *, force: bool = False) -> None:
-        if not force and (project / "node_modules").exists():
-            self.log("⑤ node_modules 已存在，跳过依赖安装")
+        # 只看 node_modules 在不在不够：被打断或手装的半成品也有这个目录，跳过依赖会直接进
+        # 构建，报出来是一堆"找不到模块"，看不出真因。真跑完 pnpm install 的目录一定有
+        # .modules.yaml（本工具也靠它读 storeDir），据此判定"装完整了"。
+        installed = (project / "node_modules" / ".modules.yaml").exists()
+        if not force and (project / "node_modules").exists() and installed:
+            self.log("⑤ node_modules 已存在且完整（有 .modules.yaml），跳过依赖安装")
             return
+        if not force and (project / "node_modules").exists() and not installed:
+            self.log("⑤ 有 node_modules 但没有 .modules.yaml（上次没装完），这次重装依赖")
         self.log("⑤ 安装项目依赖 …")
         store = str(STORE_DIR) if STORE_DIR.exists() else ""
-        # 现有 node_modules 若是**别的 store** 装出来的，就不再指定 store-dir，免得平白多出差异。
-        # 说清楚：这条**不是**真机那个 ABORTED_REMOVE_MODULES_DIR_NO_TTY 的根因——11.7.0 与
-        # 11.25 都实测过，换 store 并不会让 pnpm 去清目录。保留它只是让 store 保持一致，
-        # 不制造无谓差异（顺带避免虚拟 store 指向一个以后可能被清掉的 store）。
+        # 现有 node_modules 若是**别的 store** 装出来的，仍然指定随包 store：pnpm 会自己按需
+        # 重建（无 TTY 那关由下面的 --config.confirmModulesPurge=false 放行）。反过来"干脆不指定"
+        # 会把离线模式整条路删空，还报一句"随包缓存不存在"的**假消息**——缓存其实就在 assets/ 里。
         existing = _existing_store_dir(project)
         if store and existing and not _same_dir(existing, STORE_DIR):
-            self.log(f"  · 现有 node_modules 用的是 {existing}，这次不指定 --store-dir")
-            store = ""
+            self.log(f"  · 现有 node_modules 用的是 {existing}；这次改用随包 store "
+                     f"{STORE_DIR}（pnpm 会按需重建）")
         # 真机那个中止是 pnpm 要**清空 node_modules 重建**，而我们用管道捕获输出、stdin 接
         # 空设备（没有 TTY），它不敢自己动手就中止了：三条来源全废在同一句话上。直接授权它做。
         # 实测：`--confirm-modules-purge=false` 会报 Unknown option；正确写法是下面这个。
@@ -1430,9 +1494,8 @@ class Engine:
                 attempts.append((name, argv))
         if not attempts:
             raise InstallError(
-                "没有可用的依赖来源：随包缓存（assets/pnpm-store）不存在，"
-                "而当前是『离线安装』。\n"
-                "请把 assets/ 一起拷过来，或改用『自动选择』（允许联网补包）。")
+                f"没有可用的依赖来源：随包缓存不存在（{STORE_DIR}），而当前是『离线安装』。\n"
+                "请把 assets/（含 pnpm-store）一起拷过来，或改用『自动选择』（允许联网补包）。")
         problems: list[str] = []
         for index, (name, argv) in enumerate(attempts):
             last = index == len(attempts) - 1
@@ -1498,11 +1561,10 @@ class Engine:
 
     def start(self, project: Path) -> None:
         self.log(f"⑦ 启动 Web UI（{WEB_URL}）…")
-        argv: list[str] = ["pnpm", "dsh", "web"]
-        overlay = web_clock_overlay(project)
-        if overlay is not None:
-            argv += ["--patch", str(overlay)]
-        proc = run_cli(argv, cwd=project)
+        # **必须复用 web_command**：它带 `--no-open`。`dsh web` 默认自己会开浏览器，而它跑在
+        # 我们登记进 Job 的进程树里——用户关小助手时会连整台浏览器（含他所有标签页）一起被杀。
+        # 这条不变量原来只在界面那条启动路径（_launch_web）守着，headless 走这里就漏了。
+        proc = childproc.run(web_command("pnpm", project), cwd=project, shell=True)
         if proc.returncode != 0:
             raise InstallError(f"启动失败：\n{decode_proc(proc)}")
 
@@ -1863,9 +1925,18 @@ class App(tk.Tk):
         """
         self._ui_queue.put((fn, args))
 
-    def _drain_ui_queue(self) -> None:
-        """界面线程侧：取出并执行工作线程投递的回调（每轮限量，避免饿死界面）。"""
-        for _ in range(50):
+    def _drain_ui_queue(self, *, drain_all: bool = False) -> None:
+        """界面线程侧：取出并执行工作线程投递的回调。
+
+        平时每轮限量，避免长任务把界面饿死；关窗前用 `drain_all=True` 把剩下的**全部**
+        刷出来——原来只取 50 条且不再排下一轮，安装时最后几十行（往往正是失败原因那几行）
+        会随窗口一起消失。这里再加个总时长上限，避免卡住关窗。
+        """
+        limit = 10 ** 9 if drain_all else 50
+        deadline = time.monotonic() + 2.0 if drain_all else None
+        for _ in range(limit):
+            if deadline is not None and time.monotonic() > deadline:
+                break
             try:
                 fn, args = self._ui_queue.get_nowait()
             except queue.Empty:
@@ -2046,8 +2117,10 @@ class App(tk.Tk):
         retry = install_was_interrupted(target)
         if retry:
             self._append("[安装位置] 上次安装被中途关窗打断过，这次重新装依赖并重新构建")
+        # 日志要**同时**进界面和 installer.log：主安装路径原来只传 _append（只进界面），
+        # 于是完整安装失败后翻日志只有零星几行，步骤 ①…⑦ 和每个来源的失败原因全丢了。
         eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
-                     log=self._append, force=retry, progress=self._progress_line)
+                     log=self._log_work, force=retry, progress=self._progress_line)
         threading.Thread(target=self._job, args=(eng,), daemon=True).start()
 
     def _current_dir(self) -> Path:
@@ -2223,6 +2296,11 @@ class App(tk.Tk):
             head = "？无法确认是不是 DSH" if suspect else "✗ 未确认是 DSH 安装"
             self._set_label(self.git_info_lbl, f"{head}：{ident.evidence}",
                             "#a05a00" if suspect else "#b00000")
+            # 身份认不出也要摆出【回退到更新前】：这里正是"装坏了要退回去"的场景，
+            # 而回退只依赖 backup/before-update-* 分支存在，不需要身份确认。
+            # （更新按钮不在这里摆：对没确认是 DSH 的目录谈"更新到官方"是误导。）
+            self._refresh_rollback_button(
+                ginfo.update_backups(info.root) if info.root else [])
             return
         bits: list[str] = []
         if info.version:
@@ -2290,19 +2368,23 @@ class App(tk.Tk):
                 "  ② pnpm run build\n\n"
                 "首次可能要 5–15 分钟，期间别关窗。现在开始吗？", parent=self):
             return
+        # Tk 变量只能在界面线程读：工作线程里读会偶发 RuntimeError（被下面的 except
+        # 记成"构建失败"，原因还看不出来）。这里先取好，再当参数传进线程。
+        mode = self.mode.get()
+        mirror = bool(self.mirror.get())
         self.busy = True
         self._set_git_buttons(False)
         try:
-            threading.Thread(target=self._rebuild_worker, args=(target,), daemon=True).start()
+            threading.Thread(target=self._rebuild_worker, args=(target, mode, mirror),
+                             daemon=True).start()
         except RuntimeError as exc:                 # 线程起不来也要把按钮放回去
             self._post(self._rebuild_done, False, str(exc))
 
-    def _rebuild_worker(self, target: Path) -> None:
+    def _rebuild_worker(self, target: Path, mode: str, mirror: bool) -> None:
         ok, detail = True, ""
         try:
             self._log_work("[构建] 开始：重装依赖（缓存优先，缺的联网补）…")
-            eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
-                         log=self._log_work)
+            eng = Engine(mode=mode, use_mirror=mirror, log=self._log_work)
             eng.install_deps(target, force=True)
             self._log_work("[构建] 依赖好了，开始编译 …")
             eng.build(target, force=True)
@@ -2358,6 +2440,19 @@ class App(tk.Tk):
                 "这个目录里没有 backup/before-update-… 备份分支。\n\n"
                 "备份分支是「从官方更新／从你的仓库更新」在合并之前自动打的；"
                 "没更新过就没有它。",
+                parent=self)
+            return
+        # 状态读不出来时**不许**硬回退：`reset --hard` 会覆盖已跟踪的改动、还可能删掉挡路的
+        # 未跟踪文件（git 官方文档明说 may overwrite untracked files），而"查不出来"不等于
+        # "干净"。更新那条路早就有这道闸门（gitinfo 的 status_ok），回退这条路原来漏了。
+        if not getattr(info, "status_ok", True):
+            messagebox.showwarning(
+                "读不出工作区状态",
+                "git 没能把工作区状态读出来（超时、索引被占用或目录异常）。\n\n"
+                "回退是**硬回退**：状态读不出来时，可能把你自己还没提交的改动一起抹掉，"
+                "所以这里先不动。\n\n"
+                "请确认没有别的 git 在跑（另一个小助手窗口、编辑器或终端），"
+                "然后点【刷新信息】重试。",
                 parent=self)
             return
         if info.dirty:
@@ -2475,6 +2570,10 @@ class App(tk.Tk):
             self.btn_deepen.pack(side="left", padx=(6, 0))
         else:
             self.btn_deepen.pack_forget()
+        if not sources and self._update_sources:
+            # 探测整体失败（弱网最常见）时**不许把按钮撤下**：撤了之后只能靠改路径
+            # 才回来，用户会以为更新功能没了。保留上一次已知的来源，点下去如实报错。
+            sources = list(self._update_sources)
         self._update_sources = list(sources)
         by_kind = {source.kind: source for source in sources}
         for kind, btn in (("official", self.btn_update_official),
@@ -2535,9 +2634,8 @@ class App(tk.Tk):
             self._append("[更新] 『更新到最新』会把你带到官方最新（走快进）。")
         else:
             self._append("[更新] 注意：『更新到最新』只更新你 fork 跟踪的那个分支，"
-                         "不会把你带到官方版本。要跟官方，得自己把官方并进来，例如：\n"
-                         "        git fetch upstream && git rebase upstream/master\n"
-                         "       （有本地提交时不能快进，工具不会替你合并，避免覆盖你的东西）")
+                         "不会把你带到官方版本。要跟官方，用上面的【从官方更新】——"
+                         "它会自己把官方那份合并进来并先留好备份，不用你敲命令。")
 
     def on_deepen(self) -> None:
         """补齐浅克隆的历史（`git fetch --unshallow`）——补完才可能跟官方合并。
@@ -2726,8 +2824,10 @@ class App(tk.Tk):
             return
         newest = snaps[0]
         others = len(snaps) - 1
-        tail = (f"\n\n另外还有 {others} 份更旧的备份，都在 {sdata.default_backup_root()} 里，"
-                "要选别的可以直接改「会话备份目录」后手动复制。" if others else "")
+        backup_root = sdata.default_backup_root(self._effective_dir())
+        tail = (f"\n\n另外还有 {others} 份更旧的备份，都在 {backup_root} 里。\n"
+                "（想换备份位置：设环境变量 DSH_SESSION_BACKUP_DIR，或把备份文件夹整体搬走。）"
+                if others else "")
         if not messagebox.askyesno(
                 "还原会话数据？",
                 f"要还原最近这份备份吗？\n\n  时间：{newest.created_at}\n"
@@ -2851,9 +2951,13 @@ class App(tk.Tk):
                 return
             how = {"ff": "快进", "merge": "合并", "rebase": "变基"}.get(res.strategy,
                                                                       res.strategy)
-            self._log_work(f"[更新] 已{how} {res.before} → {res.after}：{res.subject}")
+            self._log_work("[更新] 已{0} {1} → {2}：{3}".format(how, res.before, res.after,
+                                                              res.subject))
             if getattr(res, "note", ""):
+                # 这条**必须让用户看见**：它说的是"这次合进去的可能是官方旧提交"。
+                # 原来只写进日志，界面照旧显示"✓ 更新完成"，用户无从分辨。
                 self._log_work(f"[更新] ⚠ {res.note}")
+                self._append(f"⚠ {res.note}")
             if res.backup:
                 self._log_work(f"[更新] 万一有问题：点界面上的【回退到更新前】就能回来"
                                f"（等价于 git reset --hard {res.backup}）")
@@ -2958,7 +3062,8 @@ class App(tk.Tk):
             messagebox.showerror(
                 "推回你的仓库失败",
                 f"{error}\n\n本机已经更新好了，这一步失败不影响本机使用。\n"
-                f"想手动推，就在这个目录里跑：\n    git push {remote} {branch}",
+                "想重试就再点一次【从官方更新】；推回你的仓库只是一份异地副本，"
+                "现在这台机器上的内容不受影响。",
                 parent=self)
         if was_running:
             self._append("[更新] 服务原本在运行，正在重新启动 …")
@@ -2975,8 +3080,12 @@ class App(tk.Tk):
             self._post(self._after_install_start)
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
-            self._append(f"\n✗ 失败：{msg}")
+            self._log_work(f"\n✗ 安装失败：{msg}")   # 失败原因必须留在 installer.log 里
             self._status("失败 ✗（详情见日志，可复制反馈）", "#b00000")
+            if self._op_target:
+                # 装到一半就失败了也要记下来：否则下次点【一键完整安装】会被
+                # "node_modules 已存在，跳过依赖安装"骗过去，直接进构建再失败一次。
+                set_interrupted_target(self._op_target)
             self._post(messagebox.showerror, "操作失败", msg)
         finally:
             self._op_target = None                # 长任务结束，关窗不再算它
@@ -3807,7 +3916,10 @@ class App(tk.Tk):
                                      env=self._bundle_env())
                 self._plog(f"[市场] ✓ 已更新 {spec}（重启生效）")
                 self._status(f"已更新 {spec}")
-        except (pstore.PluginError, pstore.GateError) as exc:
+        except Exception as exc:  # noqa: BLE001
+            # 这里**必须**宽捕获：原来只捕 PluginError/GateError，其它异常（OSError、
+            # TimeoutExpired，甚至上面的 UnboundLocalError）会逃出线程——界面既不写日志也
+            # 不弹窗，用户点了【安装】只觉得"没反应"。同文件其它 worker 都是 except Exception。
             self._plog(f"[市场] ✗ {value}：{exc}")
             self._status("市场操作失败：%s" % exc, "#b00000")
             # 弹窗必须在界面线程（工作是子线程），参数先取值再投递
@@ -3842,9 +3954,11 @@ class App(tk.Tk):
             if not pstore._pkg_main_present(cand):
                 self._plog(f"[包] {cand.name} 未构建，用 pnpm 构建（需要 devDeps）…")
                 pstore.bundle_build(cand)
+            # 先取 pkg 再判错误信息：原来 `pkg.get('main')` 写在赋值**之前**，真走到
+            # "构建后仍缺入口"这条分支会抛 UnboundLocalError 而不是这句人话。
+            pkg = pstore._pkg_json(cand) or {}
             if not pstore._pkg_main_present(cand):
                 raise pstore.PluginError(f"{cand.name} 构建后仍缺入口 {pkg.get('main') or 'lib/index.js'}")
-            pkg = pstore._pkg_json(cand) or {}
             name = pstore._bundle_name(cand)
             tgz_out = ASSETS / ".cache" / f"{name}-{pkg.get('version', '')}.tgz"
             pstore.bundle_pack(cand, tgz_out, name=name,
@@ -4754,7 +4868,7 @@ class App(tk.Tk):
         # 用较短的等待：个别进程赖着不走时不必让界面干等，Job Object 会在本进程
         # 退出（句柄关闭）时兜底结束它们。
         childproc.kill_all(timeout=childproc.CLOSE_KILL_TIMEOUT)
-        self._drain_ui_queue()             # 把「正在停止 / 已停止」这几句先刷出来
+        self._drain_ui_queue(drain_all=True)   # 关窗前把攒下的日志全刷出来，别丢尾巴
         try:
             self.destroy()
         except Exception:  # noqa: BLE001  已经在销毁中时 destroy 会报错，无需处理

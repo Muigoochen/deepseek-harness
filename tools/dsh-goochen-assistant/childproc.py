@@ -263,8 +263,11 @@ def run(argv: Any, *, cwd: Optional[Any] = None, env: Optional[dict] = None,
     返回值（args/returncode/stdout/stderr）与老写法一致，调用方无需改动。
     字符串命令加 `shell=True`（Windows 上跑 `pnpm.cmd` 这类批处理需要）。
     `env=None` 就是**继承**（交给 `Popen` 自己的语义），不要改写成 `dict(os.environ)`：
-    实测在 Windows 上这份拷贝会漏掉进程真实持有的变量（本机漏过 `npm_execpath`），
-    于是"明明有、子进程却看不到"，构建因此报 `npm_execpath is unavailable` 退出 1。
+    Windows 上 Python 会把环境变量名**大写化**（`npm_execpath` 存成 `NPM_EXECPATH`），
+    于是 `dict(os.environ).get("npm_execpath")` 查不到——那只是键名大小写的假象，
+    `Popen(env=…)` 传过去后 Node 仍然读得到（`process.env` 在 Windows 上不区分大小写）。
+    真正的问题是**按前缀枚举**：`npm_config_*` 会变成 `NPM_CONFIG_*`，凡是 `startswith`
+    大小写敏感的地方就会全部看不见。所以这里继续用 `env=None` 继承，不自己拼环境。
     """
     proc = subprocess.Popen(
         argv,

@@ -284,10 +284,15 @@ class PurgePermissionTest(unittest.TestCase):
         calls = self._calls(modules_store=str(self.store))
         self.assertIn("--store-dir", calls[0], "同一份 store，照用")
 
-    def test_store_dir_is_dropped_when_the_existing_tree_differs(self):
+    def test_store_dir_is_kept_when_the_existing_tree_differs(self):
+        """现有 node_modules 来自别的 store 时**照样**指定随包 store。
+
+        原来这里写的是"不一致就不指定 --store-dir"，代价是把『离线安装』整条路删空
+        （不留任何来源），还报一句"随包缓存不存在"的**假消息**——缓存其实就在 assets/ 里。
+        现在交给 pnpm 按需重建，无 TTY 那关由 --config.confirmModulesPurge=false 放行。
+        """
         calls = self._calls(modules_store="E:\\.pnpm-store\\v11")
-        self.assertNotIn("--store-dir", calls[0],
-                         "现有 node_modules 是别的 store 装的就别再指定，免得平添差异")
+        self.assertIn("--store-dir", calls[0], "随包 store 照用，别把离线来源删掉")
         self.assertIn("--config.confirmModulesPurge=false", calls[0])
 
 
