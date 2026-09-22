@@ -2313,11 +2313,11 @@ class App(tk.Tk):
     def _refresh_session_note(self) -> None:
         """显示"最近一份会话备份是什么时候的、放哪儿"——用户最想知道的就是这个。"""
         try:
-            snaps = sdata.list_snapshots()
+            snaps = sdata.list_snapshots(install_dir=self._effective_dir())
         except Exception as exc:  # noqa: BLE001  读备份目录失败不该影响别的功能
             self._set_label(self.sess_note, f"读不出备份目录：{exc}", "#b00000")
             return
-        root = sdata.default_backup_root()
+        root = sdata.default_backup_root(self._effective_dir())
         if not snaps:
             self._set_label(self.sess_note,
                             f"还没有备份（更新前会自动备份一份）；备份会放在 {root}", "#888")
@@ -2344,7 +2344,7 @@ class App(tk.Tk):
         target = self._effective_dir()
         info = ginfo.repo_info(target)
         res = sdata.snapshot(label=label, app_version=info.version, app_commit=info.short,
-                             log=self._append)
+                             install_dir=target, log=self._append)
         self._post(self._backup_done, res)
 
     def _backup_done(self, res) -> None:
@@ -2365,7 +2365,8 @@ class App(tk.Tk):
         info = ginfo.repo_info(target)
         res = sdata.snapshot(
             label=f"{source.label}之前（本地 {info.version or '读不到版本'}）",
-            app_version=info.version, app_commit=info.short, log=self._append)
+            app_version=info.version, app_commit=info.short, install_dir=target,
+            log=self._append)
         if res.ok:
             return True
         self._append(f"[更新] ✗ 会话数据没备份成功，已停止更新：{res.error}")
@@ -2373,10 +2374,11 @@ class App(tk.Tk):
 
     def on_restore_sessions(self) -> None:
         """从备份还原会话数据。**必须先停服务**：服务在写日志时覆盖只会得到半截数据。"""
-        snaps = sdata.list_snapshots()
+        snaps = sdata.list_snapshots(install_dir=self._effective_dir())
         if not snaps:
             messagebox.showinfo("还没有备份",
-                                f"还没备份过。备份目录：{sdata.default_backup_root()}",
+                                f"还没备份过。备份目录："
+                                f"{sdata.default_backup_root(self._effective_dir())}",
                                 parent=self)
             return
         if port_in_use():

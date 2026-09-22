@@ -65,14 +65,23 @@ def default_home() -> Path:
     return Path(raw) if raw else Path.home() / ".dsh"
 
 
-def default_backup_root() -> Path:
-    """默认备份根：**不在** `.dsh` 里面（免得被当成数据目录误扫、也免得递归变大）。
+def system_drive() -> str:
+    """系统盘盘符（Windows 上是 `C:`）。只用来**提示**"放在系统盘上不太理想"。"""
+    return (os.environ.get("SystemDrive") or "C:").lower()
 
-    放在用户目录下的 `dsh-backups`；可用 `DSH_SESSION_BACKUP_DIR` 指到别的盘。
+
+def default_backup_root(install_dir: Optional[Path] = None) -> Path:
+    """默认备份根：**和 DSH 安装目录同级**，也就是 `E:\\Deepseek\\dsh-backups` 这种位置。
+
+    为什么不用 `~/.dsh` 同级：那是用户目录，通常就在系统盘上（C:）。备份是"数据没了才想起它"
+    的东西，放在系统盘上，重装系统时正好一起没。装在哪里、备份就在哪块盘的旁边，更符合直觉。
+    仍然可以用 `DSH_SESSION_BACKUP_DIR` 指定到别的盘或网盘目录。
     """
     raw = os.environ.get(BACKUP_ENV, "").strip()
     if raw:
         return Path(raw)
+    if install_dir is not None:
+        return Path(install_dir).parent / "dsh-backups"
     return default_home().parent / "dsh-backups"
 
 
@@ -122,19 +131,21 @@ def _free_bytes(path: Path) -> int:
 
 def snapshot(home: Optional[Path] = None, dest_root: Optional[Path] = None, *,
              keep: Optional[int] = None, label: str = "", app_version: str = "",
-             app_commit: str = "",
+             app_commit: str = "", install_dir: Optional[Path] = None,
              log: Callable[[str], None] = lambda _m: None) -> BackupResult:
     """把 `home` 下的会话数据整体复制成一份带时间戳的快照，并清理旧快照。
 
     参数：
         home: DSH 数据目录，默认 `default_home()`。
-        dest_root: 备份根，默认 `default_backup_root()`。
-        keep: 保留份数，默认 `keep_count()`（判完旧份数才动手复制）。
+        dest_root: 备份根，默认 `default_backup_root(install_dir)`（与安装目录同级）。
+        keep: 保留份数，默认 `keep_count()`。
         label: 写到清单里的说明，例如"更新到 0.1.6 之前"。
+        install_dir: DSH 安装目录；只用于算默认备份根，以及"别备进仓库里"这条检查。
     返回 BackupResult；失败时 error 说清原因，**绝不静默降级**。
     """
     home = Path(home) if home else default_home()
-    dest_root = Path(dest_root) if dest_root else default_backup_root()
+    install_dir = Path(install_dir) if install_dir else None
+    dest_root = Path(dest_root) if dest_root else default_backup_root(install_dir)
     keep = keep_count() if keep is None else max(1, int(keep))
     sessions = home / "sessions"
     if not sessions.is_dir():
@@ -146,6 +157,13 @@ def snapshot(home: Optional[Path] = None, dest_root: Optional[Path] = None, *,
             error=(f"备份位置不能放在数据目录里面：{dest_root}\n"
                    f"（放在里面会把上次的备份也一起备进来，越备越大）\n"
                    f"换个地方，或用环境变量 {BACKUP_ENV} 指定。"))
+    # 同理不能放进被更新的仓库里：那会让仓库凭空多出几百 MB 未跟踪文件，还可能被误提交
+    if install_dir is not None and _inside(dest_root, install_dir):
+        return BackupResult(
+            ok=False,
+            error=(f"备份位置不能放在仓库里面：{dest_root}\n"
+                   f"（会把仓库塞满未跟踪文件，还容易被误提交）\n"
+                   f"放在它**同级**的位置，或用环境变量 {BACKUP_ENV} 指定。"))
 
     parts = (["sessions"]
              + [n for n in EXTRA_FILES if (home / n).is_file()]
@@ -175,6 +193,11 @@ def snapshot(home: Optional[Path] = None, dest_root: Optional[Path] = None, *,
         index += 1
         target = dest_root / f"dsh-sessions-{stamp}-{index}"
     note = ""
+    if str(dest_root)[:2].lower() == system_drive():
+        # 只提示，不拦：系统盘的用户目录是绝大多数人的默认，硬拒绝会让功能不可用。
+        note = (f"备份放在系统盘（{dest_root}）上，重装系统时可能一起丢；"
+                f"想更稳就用环境变量 {BACKUP_ENV} 指到别的盘或网盘目录。")
+        log(f"[会话备份] {note}")
     try:
         dest_root.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
@@ -213,9 +236,10 @@ def snapshot(home: Optional[Path] = None, dest_root: Optional[Path] = None, *,
     return BackupResult(ok=True, snapshot=snap, pruned=pruned, note=note)
 
 
-def list_snapshots(dest_root: Optional[Path] = None) -> list[Snapshot]:
+def list_snapshots(dest_root: Optional[Path] = None, *,
+                   install_dir: Optional[Path] = None) -> list[Snapshot]:
     """列出已有快照，**新的在前**。读不出清单的目录也列出来（宁可让用户看见）。"""
-    dest_root = Path(dest_root) if dest_root else default_backup_root()
+    dest_root = Path(dest_root) if dest_root else default_backup_root(install_dir)
     if not dest_root.is_dir():
         return []
     out: list[Snapshot] = []

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -108,6 +109,54 @@ class SnapshotTest(unittest.TestCase):
         ok, detail = sd.restore(empty, self.home)
         self.assertFalse(ok)
         self.assertIn("没有可还原的内容", detail)
+
+
+class DefaultRootTest(unittest.TestCase):
+    """默认备份位置：与 DSH **安装目录同级**，不是用户目录，也不是仓库里面。
+
+    用户提的：默认放在 C 盘用户目录下不合适——那是系统盘，重装系统时备份会一起没。
+    仍然可以用 `DSH_SESSION_BACKUP_DIR` 指定到别的盘或网盘目录。
+    """
+
+    def setUp(self) -> None:
+        self._old = os.environ.pop(sd.BACKUP_ENV, None)
+
+    def tearDown(self) -> None:
+        os.environ.pop(sd.BACKUP_ENV, None)
+        if self._old is not None:
+            os.environ[sd.BACKUP_ENV] = self._old
+
+    def test_default_is_next_to_the_install_dir(self):
+        repo = Path(r"E:\Deepseek\deepseek_harness")
+        root = sd.default_backup_root(repo)
+        self.assertEqual(root, Path(r"E:\Deepseek\dsh-backups"))
+        self.assertFalse(sd._inside(root, repo), "备份不能落在仓库里面")
+
+    def test_env_var_still_wins(self):
+        os.environ[sd.BACKUP_ENV] = r"D:\我的备份"
+        self.assertEqual(sd.default_backup_root(Path(r"E:\Deepseek\deepseek_harness")),
+                         Path(r"D:\我的备份"))
+
+    def test_refuses_a_backup_root_inside_the_repo(self):
+        tmp = Path(tempfile.mkdtemp(prefix="dsh-inside-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = make_home(tmp)
+        repo = tmp / "harness"
+        repo.mkdir()
+        res = sd.snapshot(home, repo / "dsh-backups", install_dir=repo)
+        self.assertFalse(res.ok, "放进仓库会把仓库塞满未跟踪文件，必须拒绝")
+        self.assertIn("不能放在仓库里面", res.error)
+
+    def test_notes_when_the_backup_lands_on_the_system_drive(self):
+        tmp = Path(tempfile.mkdtemp(prefix="dsh-sysdrive-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        home = make_home(tmp)
+        res = sd.snapshot(home, tmp / "backups")
+        self.assertTrue(res.ok, res.error)
+        if str(res.snapshot.path)[:2].lower() == sd.system_drive():
+            self.assertIn("系统盘", res.note, "落在系统盘要如实提示")
+        else:
+            self.assertEqual(res.note, "", "不在系统盘就别多嘴")
 
 
 if __name__ == "__main__":
