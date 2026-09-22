@@ -214,6 +214,13 @@ def update_summary(status) -> tuple[str, str]:
         text = (f"⚠ 官方已到 {official.version}（本地 {status.version}）"
                 f"　·　你的分支无新提交")
         color = "#a05a00"
+    elif not (official and official.ok):
+        # 官方**没核对上**（网络不通/没配官方远端/超时）——这时绝不能报"已是最新"。
+        # 用户报的就是这个形态：只跟自己的 fork 比，比出"没落后"就宣布最新了。
+        why = (official.error if official else "这个目录没有官方远端")
+        text, color = f"？ 没核对上官方（{why}）", "#a05a00"
+    elif not (official.version and status.version):
+        text, color = "？ 两边版本号拿不全，没法比", "#a05a00"
     else:
         text, color = "✓ 已是最新", "#1a6b1a"
     if status.ahead:
@@ -2240,21 +2247,35 @@ class App(tk.Tk):
         self._set_git_buttons(False)
         self._set_label(self.git_note, "正在更新…（进度见下方日志）", "#a05a00")
         mirror = bool(self.mirror.get())           # Tk 变量只在界面线程读
-        threading.Thread(target=self._update_worker,
-                         args=(target, was_running, mirror, kind), daemon=True).start()
+        # 选定的来源**当参数传进去**：工作线程不再回头读 self._update_sources
+        # （那份列表随时可能被下一次"检查更新"换掉，读到的就不是用户确认的那个了）
+        try:
+            threading.Thread(target=self._update_worker,
+                             args=(target, was_running, mirror, source),
+                             daemon=True).start()
+        except RuntimeError as exc:                # 线程起不来也要把按钮放回去
+            self._append(f"[更新] 起不了后台线程：{exc}")
+            self._post(self._update_done, False, str(exc), was_running)
 
     def _update_worker(self, target: Path, was_running: bool, mirror: bool,
-                       kind: str) -> None:
-        eng = Engine(mode="auto", use_mirror=mirror, log=self._append)
-        source = next((s for s in self._update_sources if s.kind == kind), None)
-        if source is None:
-            self._post(self._update_done, False, "没有可用的更新来源", was_running)
-            return
+                       source) -> None:
+        """在后台线程里真的更新；**任何**异常都必须以 `_update_done` 收尾。
+
+        `Engine` 的构造也在 try 里面：它要是在外面抛，`git_busy` 会永远是真、
+        四个按钮永远灰、关窗还会被当成"长任务进行中"。
+        """
         try:
+            if source is None:
+                self._post(self._update_done, False, "没有可用的更新来源", was_running)
+                return
+            eng = Engine(mode="auto", use_mirror=mirror, log=self._append)
+            # 配置里是 (名字, 地址) 二元组，这里只要地址：传元组会让 Popen 直接抛 TypeError
+            mirror_urls = [url for _name, url in git_mirrors()]
             self._append(f"[更新] 来源：{source.label}（{source.url}，分支 {source.branch}）")
-            res = ginfo.update_from(target, source,
-                                    mirrors=git_mirrors() if kind == "official" else (),
-                                    strategy="merge")
+            res = ginfo.update_from(
+                target, source,
+                mirrors=mirror_urls if source.kind == "official" else (),
+                strategy="merge")
             if not res.ok:
                 self._post(self._update_done, False, res.error, was_running)
                 return

@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
@@ -324,14 +325,21 @@ class UpdateWorkerTest(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _run_worker(self, result, *, kind="official", mirrors=("https://mirror/x.git",),
-                    engine=None):
+    def _run_worker(self, result, *, kind="official",
+                    mirrors=(("国内镜像1", "https://mirror/x.git"),), source=None):
+        """真跑一遍更新工作线程。
+
+        `mirrors` 用**真实形状** `(名字, 地址)` 二元组——`installer.git_mirrors()` 就是这个形状，
+        子代理审查时正因为我用字符串列表打桩，漏掉了"传元组给 git 直接抛 TypeError"这个必炸 bug。
+        """
         fake = self._Fake([self.source, self.mine])
         calls: list[tuple] = []
         updated: list[tuple] = []
+        chosen = source if source is not None else (
+            self.source if kind == "official" else self.mine)
 
-        def fake_update_from(path, source, *, mirrors=(), strategy=""):
-            updated.append((source, tuple(mirrors), strategy))
+        def fake_update_from(path, src, *, mirrors=(), strategy=""):
+            updated.append((src, tuple(mirrors), strategy))
             return result
 
         class FakeEngine:
@@ -348,7 +356,7 @@ class UpdateWorkerTest(unittest.TestCase):
                 mock.patch.object(installer, "Engine", FakeEngine), \
                 mock.patch.object(installer, "git_mirrors", lambda: list(mirrors)), \
                 mock.patch.object(installer, "clear_interrupted", lambda _p: None):
-            installer.App._update_worker(fake, self.target, False, True, kind)
+            installer.App._update_worker(fake, self.target, False, True, chosen)
         return fake, calls, updated
 
     def test_official_update_passes_mirrors_and_rebuilds_after_success(self):
@@ -358,7 +366,8 @@ class UpdateWorkerTest(unittest.TestCase):
         fake, calls, updated = self._run_worker(result)
         source, mirrors, strategy = updated[0]
         self.assertEqual(source.kind, "official")
-        self.assertEqual(mirrors, ("https://mirror/x.git",), "官方来源必须带上镜像")
+        self.assertEqual(mirrors, ("https://mirror/x.git",),
+                         "配置里的 (名字,地址) 必须拆成地址再交给 git")
         self.assertEqual(strategy, "merge", "分叉时默认合并")
         self.assertIn(("deps", True), calls, "成功后要重装依赖")
         self.assertIn(("build", True), calls, "成功后要重新构建")
@@ -393,10 +402,126 @@ class UpdateWorkerTest(unittest.TestCase):
     def test_missing_source_is_reported_instead_of_crashing(self):
         fake = self._Fake([])
         with mock.patch.object(gi, "update_from") as never:
-            installer.App._update_worker(fake, self.target, False, True, "official")
+            installer.App._update_worker(fake, self.target, False, True, None)
         never.assert_not_called()
         self.assertEqual(fake.posted[0][1][0], False)
         self.assertIn("没有可用的更新来源", fake.posted[0][1][1])
+
+
+class ShallowOfficialFetchTest(unittest.TestCase):
+    """官方那条路的真机约束（都是副本测试抓出来的）：
+
+    · 受限网络里全量 fetch 十分钟不返回，`--depth 1` 163 秒能取回同一个提交 → 必须能浅取；
+    · 浅克隆里两边可能**没有共同祖先** → 不能硬合，要如实说清楚；
+    · 冲突提示必须点出是哪些文件（不然就是"冲突没能完成：。"这种空话）。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-shallow-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _remote_and_shallow_clone(self):
+        remote = make_repo(self.tmp / "origin", message="第一版")
+        work = self.tmp / "work"
+        # 必须用 file:// —— 本地路径克隆时 git 会忽略 --depth，那就不是浅克隆了
+        git("clone", "-q", "--depth", "1", remote.as_uri(), str(work), cwd=self.tmp)
+        self.assertEqual(git("rev-parse", "--is-shallow-repository", cwd=work).strip(),
+                         "true", "前置条件：work 必须是浅克隆")
+        (remote / "RE_官方新增.txt").write_text("官方新增\n", encoding="utf-8")
+        git("add", "-A", cwd=remote)
+        git("commit", "-q", "-m", "官方：新增文件", cwd=remote)
+        return remote, work
+
+    def _official(self, remote: Path, branch: str = "main") -> gi.UpdateSource:
+        return gi.UpdateSource(kind="official", label="从官方更新",
+                               url=str(remote), branch=branch)
+
+    def test_shallow_repo_without_common_ancestor_says_so_clearly(self):
+        remote, work = self._remote_and_shallow_clone()
+        # 给远端造一条孤儿分支：和 work 这边**没有任何共同祖先**
+        git("checkout", "-q", "--orphan", "other", cwd=remote)
+        git("add", "-A", cwd=remote)
+        git("commit", "-q", "-m", "另一棵树", cwd=remote)
+        git("checkout", "-q", "main", cwd=remote)
+        head_before = git("rev-parse", "HEAD", cwd=work)
+        res = gi.update_from(work, self._official(remote, "other"))
+        self.assertFalse(res.ok)
+        self.assertIn("浅克隆", res.error)
+        self.assertIn("共同祖先", res.error)
+        self.assertIn("你的文件没有被改动", res.error)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=work), head_before, "拒绝后不能动 HEAD")
+
+    def test_conflict_message_names_the_conflicting_files(self):
+        remote = make_repo(self.tmp / "origin", message="第一版")
+        work = self.tmp / "work"
+        git("clone", "-q", str(remote), str(work), cwd=self.tmp)
+        # 故意用中文文件名：git 默认会把非 ASCII 路径转义成 "RE_\346\274\224..."，
+        # 直接甩给用户就是乱码，所以这里把它钉住
+        name = "RE_中文文件.md"
+        (remote / name).write_text("官方改的\n", encoding="utf-8")
+        git("add", "-A", cwd=remote)
+        git("commit", "-q", "-m", "官方改中文文件", cwd=remote)
+        (work / name).write_text("我改的\n", encoding="utf-8")
+        git("add", "-A", cwd=work)
+        git("commit", "-q", "-m", "我也改中文文件", cwd=work)
+        res = gi.update_from(work, self._official(remote))
+        self.assertTrue(res.conflict, res.error)
+        self.assertIn(name, res.error, "冲突提示必须点出是哪些文件")
+        self.assertNotIn("\\346", res.error, "中文文件名不能被 git 转义成乱码")
+        self.assertIn("已整体撤销", res.error)
+
+
+class OfficialStatusCwdTest(unittest.TestCase):
+    """官方核对必须**站在目标目录里**问远端。
+
+    子代理审查抓出来的严重 bug：`ls-remote --tags upstream` 少了 cwd 时，git 会拿
+    "进程当前目录"那个仓库去解析 `upstream` 这个名字——打包运行时当前目录根本不是仓库，
+    直接失败（界面于是变成绿色"✓ 已是最新"）；当前目录恰好是**另一个也有 upstream** 的
+    仓库时更糟：会拿别人的 tag 当官方版本。开发机上它"碰巧对"，把这个 bug 藏住了。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-cwd-"))
+        self.old_cwd = os.getcwd()
+
+    def tearDown(self) -> None:
+        os.chdir(self.old_cwd)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _repo_with_upstream(self, root: Path, tag: str) -> Path:
+        bare = root.parent / f"{root.name}-official.git"
+        root.parent.mkdir(parents=True, exist_ok=True)
+        git("init", "-q", "--bare", str(bare), cwd=root.parent)
+        work = make_repo(root, message="init")
+        # 远端地址写成**真官方地址**：official_remote_name 是按 URL 判断的，写本地路径就认不出来。
+        # （这也说明为什么不能用 url.<x>.insteadOf 把地址改写到本地——`git remote -v`
+        #  会自己套用 insteadOf，远端读出来就不再是官方地址了。）
+        git("remote", "add", "upstream", OFFICIAL_URL, cwd=work)
+        git("tag", f"dsh-v{tag}", cwd=work)
+        git("push", "-q", str(bare), "main", "--tags", cwd=work)
+        return work
+
+    def test_ls_remote_runs_inside_the_target_repo(self):
+        target = self._repo_with_upstream(self.tmp / "a", "0.1.6-alpha.2")
+        other = self._repo_with_upstream(self.tmp / "b", "9.9.9-alpha.1")
+        os.chdir(other)          # 当前目录是**另一个**也有 upstream 的仓库
+        seen: list = []
+
+        def spy(args, path=None, timeout=None):
+            if args and args[0] == "ls-remote":
+                seen.append(None if path is None else str(path))
+                return 0, "d0a458a9\trefs/tags/dsh-v0.1.6-alpha.2\n", ""
+            return _REAL_RUN_GIT(args, path, timeout=timeout)
+
+        with mock.patch.object(gi, "run_git", spy):
+            status = gi.official_status(gi.repo_info(target))
+        self.assertTrue(status.ok, status.error)
+        self.assertEqual(status.version, "0.1.6-alpha.2")
+        self.assertTrue(seen, "应当真的问过远端")
+        self.assertEqual(set(seen), {str(target)},
+                         f"ls-remote 必须站在目标目录里跑，否则会问到别的仓库；实际：{seen}")
 
 
 if __name__ == "__main__":

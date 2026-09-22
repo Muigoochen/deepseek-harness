@@ -118,9 +118,22 @@ class UpdateSummaryTest(unittest.TestCase):
         self.assertIn("已是最新", text)
         self.assertEqual(color, "#1a6b1a")
 
-    def test_no_official_info_keeps_the_old_wording(self):
-        text, _ = installer.update_summary(self._status())
-        self.assertIn("已是最新", text)
+    def test_no_official_info_never_claims_up_to_date(self):
+        """没有官方远端时**不能**说"已是最新"——那只是"没核对"，不是"已最新"。"""
+        text, color = installer.update_summary(self._status())
+        self.assertNotIn("已是最新", text)
+        self.assertIn("没核对上官方", text)
+        self.assertEqual(color, "#a05a00")
+
+    def test_official_check_failed_never_claims_up_to_date(self):
+        """官方核对失败（网络不通/超时）同样不能说"已是最新"——用户报的 bug 就是这个形态。"""
+        failed = gi.OfficialStatus(remote="upstream", url=OFFICIAL,
+                                   error="ls-remote 失败：Connection timed out")
+        text, color = installer.update_summary(self._status(official=failed))
+        self.assertNotIn("已是最新", text)
+        self.assertIn("没核对上官方", text)
+        self.assertIn("timed out", text)
+        self.assertEqual(color, "#a05a00")
 
     def test_behind_the_tracked_remote_wins_the_headline(self):
         text, _ = installer.update_summary(
@@ -137,6 +150,26 @@ class UpdateSummaryTest(unittest.TestCase):
         self.assertIn("已是最新", text)
         self.assertNotIn("非官方远端", text)
         self.assertEqual(color, "#1a6b1a")
+
+
+class VersionKeyEdgeTest(unittest.TestCase):
+    """版本号比较的边角：一个怪字符就能让"检查更新"以 Python 内部错误收场。"""
+
+    def test_unicode_digits_do_not_crash(self):
+        # '²'.isdigit() 是真，但 int('²') 会抛 ValueError——审查时实测过整条链路因此报错
+        self.assertIsInstance(gi.version_key("0.1.6-alpha.²"), tuple)
+        self.assertLess(gi.version_key("0.1.6-alpha.²"), gi.version_key("0.1.6-alpha.2"))
+
+    def test_unknown_prerelease_ranks_below_alpha(self):
+        for name in ("dev", "preview", "nightly"):
+            self.assertLess(gi.version_key(f"0.1.6-{name}.1"),
+                            gi.version_key("0.1.6-alpha.1"), name)
+
+    def test_build_metadata_is_ignored(self):
+        self.assertEqual(gi.version_key("0.1.6+build.5"), gi.version_key("0.1.6"))
+
+    def test_release_beats_prerelease(self):
+        self.assertGreater(gi.version_key("0.1.6"), gi.version_key("0.1.6-rc.9"))
 
 
 if __name__ == "__main__":

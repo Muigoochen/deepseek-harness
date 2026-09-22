@@ -33,6 +33,11 @@ DEFAULT_TIMEOUT = 20
 FETCH_TIMEOUT = 120
 #: `ls-remote` 只取引用、不拉历史，几秒就能回来（实测官方 5.8 秒）。给足余量，但不让它拖住界面。
 LS_REMOTE_TIMEOUT = 45
+# 官方那条路要先花几秒 `ls-remote` 探活：真机实测连不上 github 时，全量 fetch 会一直挂到
+# 超时（十分钟都不返回），用户看到的就是"更新卡死"。探不到就直接说清楚，不耗着。
+GIT_FETCH_TIMEOUT = 600
+# 撤销（merge --abort / rebase --abort）是本地操作，但目录可能有 node_modules，给宽一点
+GIT_UNDO_TIMEOUT = 120
 #: 官方发布 tag 的前缀：`dsh-v0.1.6-alpha.2` → 版本号 `0.1.6-alpha.2`。
 OFFICIAL_TAG_PREFIX = "dsh-v"
 _UNIT = "\x1f"          # git --format 的字段分隔符（正常文本里不会出现）
@@ -260,19 +265,31 @@ def official_remote_name(remotes: dict[str, str]) -> str:
     return found
 
 
+def _digits(text: str) -> int:
+    """只把**ASCII 十进制**当数字。
+
+    `'²'.isdigit()` 是真，但 `int('²')` 会抛 ValueError——官方 tag 里真出现这种字符时，
+    整个"检查更新"就会以 Python 内部错误收场（审查时实测过）。
+    """
+    return int(text) if text.isascii() and text.isdigit() else 0
+
+
 def version_key(text: str) -> tuple:
     """把版本号排成可比较的键（越大越新）。
 
-    `0.1.6` > `0.1.6-rc.2` > `0.1.6-alpha.10` > `0.1.6-alpha.2`：正式版最大，
-    预发布里 rc > beta > alpha，同档比序号（所以 alpha.10 > alpha.2，不是按字符串比）。
+    `0.1.6` > `0.1.6-rc.2` > `0.1.6-beta.1` > `0.1.6-alpha.10` > `0.1.6-alpha.2`：
+    正式版最大，预发布里 rc > beta > alpha，同档比序号（所以 alpha.10 > alpha.2，不是按字符串比）。
+    `+build` 元数据不参与比较；**不认识的**预发布名（dev/preview/nightly…）排在 alpha 之下——
+    官方真发什么名字我们不知道，但把它当成比 rc 还新，会让"官方已到 X"这种结论报出错的版本。
     """
-    core, _, pre = text.strip().partition("-")
-    nums = tuple(int(part) if part.isdigit() else 0 for part in core.split("."))
+    raw = text.strip().split("+", 1)[0]
+    core, _, pre = raw.partition("-")
+    nums = tuple(_digits(part) for part in core.split("."))
     if not pre:
         return (nums, 1, (0, 0))
     rank = {"alpha": 0, "beta": 1, "rc": 2}
     name, _, number = pre.partition(".")
-    return (nums, 0, (rank.get(name, 3), int(number) if number.isdigit() else 0))
+    return (nums, 0, (rank.get(name, -1), _digits(number)))
 
 
 @dataclass(frozen=True)
@@ -300,7 +317,10 @@ def official_status(info: RepoInfo, *,
     if not name:
         return OfficialStatus(error="没有配置官方远端，无法核对官方版本")
     url = info.remotes[name]
-    code, out, err = run_git(["ls-remote", "--tags", name], timeout=timeout)
+    # cwd 必须给：这里传的是**远端名**（upstream），git 要站在目标目录里才解析得对。
+    # 少了这个 cwd，打包运行时（当前目录不是仓库）会直接失败、界面就变成"已是最新"；
+    # 当前目录恰好是另一个也有 upstream 的仓库时，更会拿**别人的 tag** 当官方版本。
+    code, out, err = run_git(["ls-remote", "--tags", name], info.root, timeout=timeout)
     if code != 0:
         return OfficialStatus(remote=name, url=url,
                               error=f"ls-remote 失败：{_first_line(err) or code}")
@@ -317,7 +337,7 @@ def official_status(info: RepoInfo, *,
     branch = head = ""
     for candidate in ("master", "main"):
         code, out, _ = run_git(["ls-remote", name, f"refs/heads/{candidate}"],
-                               timeout=timeout)
+                               info.root, timeout=timeout)
         if code == 0 and out.strip():
             branch, head = candidate, out.split()[0][:7]
             break
@@ -550,8 +570,22 @@ def _existing_backup_name(path: Path) -> str:
         name = f"{base}-{index}"
 
 
+def _unrelated_hint(shallow: bool) -> str:
+    """两边没有共同祖先时的可操作说明：浅克隆被截断、或历史对不上，都会走到这里。
+
+    git 自己只会说 `refusing to merge unrelated histories`——对用户等于没说。
+    """
+    why = ("本地是浅克隆（历史不完全）" if shallow
+           else "本地和远端的历史对不上")
+    return (f"{why}，两边找不到共同祖先，没法安全合并。\n"
+            "两条路：① 能连上你自己的仓库时先补齐历史：git fetch --unshallow；\n"
+            "② 把取多深调大（配置项 gitDepth / 环境变量 DSH_GIT_DEPTH），或配官方镜像。\n"
+            "你的文件没有被改动。")
+
+
 def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = (),
-                strategy: str = "merge", backup: bool = True) -> UpdateResult:
+                strategy: str = "merge", backup: bool = True,
+                timeout: int = FETCH_TIMEOUT) -> UpdateResult:
     """从指定来源更新这个目录。
 
     · **能快进就快进**（`merge --ff-only`），不动你的提交；
@@ -559,7 +593,8 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
       `ff` 只允许快进（做不到就如实拒绝）；
     · 合并/变基之前**先打备份分支**（`backup/before-update-<时间戳>`），出问题一条命令退回去；
     · 冲突时**整体撤销**（`merge --abort` / `rebase --abort`）并如实报告，绝不自动解冲突；
-    · 官方来源按"镜像优先 → 官方"的顺序取（镜像由调用方从配置/环境传进来）。
+    · 官方来源按"镜像优先 → 官方"的顺序取（镜像由调用方从配置/环境传进来）；
+    · 取之前先对官方做一次便宜的 `ls-remote` 探活——连不上就别让用户干等 fetch 超时。
     所有结论都来自 git 的退出码，不猜。
     """
     info = repo_info(path)
@@ -582,10 +617,20 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
     problems: list[str] = []
     fetched = False
     for target in targets:
+        is_official = target not in mirrors and source.kind == "official"
         label = ("国内镜像" if target in mirrors
                  else ("官方源" if source.kind == "official" else "你的仓库"))
+        if is_official:
+            # 先花几秒探一下可达性：真机实测连不上 github 时，全量 fetch 会一直挂到超时
+            # （十分钟都不返回），用户看到的是"更新卡死"。探不到就直接说清楚，别耗着。
+            code_probe, _out_probe, err_probe = run_git(
+                ["ls-remote", "--heads", target, source.branch], path)
+            if code_probe != 0:
+                problems.append(f"{label}（{target}）：现在连不上"
+                                f"（{_first_line(err_probe) or code_probe}）")
+                continue
         code, _out, err = run_git(["fetch", target, source.branch], path,
-                                  timeout=FETCH_TIMEOUT)
+                                  timeout=GIT_FETCH_TIMEOUT if is_official else timeout)
         if code == 0:
             fetched = True
             break
@@ -593,18 +638,32 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
     if not fetched:
         return UpdateResult(ok=False, error="取不到远端更新：\n  " + "\n  ".join(problems))
 
+    # 浅克隆里祖先关系可能被截断；先确认两边**有共同祖先**，没有就别谈合并
+    if info.shallow:
+        code, _out, _err = run_git(["merge-base", "HEAD", "FETCH_HEAD"], path)
+        if code != 0:
+            return UpdateResult(ok=False, strategy=strategy,
+                                error=_unrelated_hint(True))
+
     # 用 git 自己的祖先判断决定"能不能快进"，不数提交数：浅克隆里数出来会骗人
     code, _out, _err = run_git(["merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"], path)
     fast_forward = code == 0
-    if fast_forward:
-        code, out, _ = run_git(["rev-list", "--count", "HEAD..FETCH_HEAD"], path)
-        behind = int(out.strip().split()[0]) if code == 0 and out.strip() else 0
-        if behind == 0:
-            return UpdateResult(ok=True, changed=False, before=info.short,
-                                after=info.short, strategy="ff")
-    else:
-        code, out, _ = run_git(["rev-list", "--count", "HEAD..FETCH_HEAD"], path)
-        behind = int(out.strip().split()[0]) if code == 0 and out.strip() else 0
+    # "是不是同一个提交"一律用两个 SHA 直接比，**不能**看 rev-list 数出来的 0：
+    # rev-list 超时/失败时也会退化成 0，那就把"数不出来"当成了"没有差异"（fail-open）。
+    code_h, out_h, _e = run_git(["rev-parse", "HEAD"], path)
+    code_f, out_f, _e = run_git(["rev-parse", "FETCH_HEAD"], path)
+    same_commit = (code_h == 0 and code_f == 0
+                   and out_h.strip() == out_f.strip() and out_h.strip() != "")
+
+    behind = 0
+    code, out, _err = run_git(["rev-list", "--count", "HEAD..FETCH_HEAD"], path,
+                              timeout=GIT_FETCH_TIMEOUT)
+    if code == 0 and out.strip():
+        behind = int(out.strip().split()[0])
+
+    if fast_forward and same_commit:
+        return UpdateResult(ok=True, changed=False, before=info.short,
+                            after=info.short, strategy="ff")
 
     if not fast_forward and strategy == "ff":
         return UpdateResult(ok=False, behind=behind, strategy="ff", error=(
@@ -629,12 +688,37 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
         used = "merge"
 
     if code != 0:
+        # git 说 "refusing to merge unrelated histories" 时，用户需要的是"为什么 + 怎么办"
+        if "unrelated histories" in err:
+            run_git(["merge", "--abort"], path)   # 没开始合并时这是空操作
+            return UpdateResult(ok=False, behind=behind, strategy=used,
+                                backup=backup_branch,
+                                error=_unrelated_hint(info.shallow))
         # 冲突/失败一律整体撤销：让目录回到更新前的样子，绝不留下半个合并
+        # 冲突文件名单要在 abort **之前**取，abort 之后索引就干净了、什么都问不出来。
+        # 用 -z 取：默认的引号会把中文路径转义成 "RE_\346\274\224..."，用户看到的全是乱码。
+        _code_u, out_u, _err_u = run_git(["diff", "--name-only", "-z", "--diff-filter=U"],
+                                        path)
+        files = [f for f in out_u.split("\0") if f.strip()]
         undo = ["rebase", "--abort"] if used == "rebase" else ["merge", "--abort"]
-        run_git(undo, path)
-        detail = _first_line(err)
-        hint = (f"已整体撤销，你的文件没有被改动。备份分支 {backup_branch} 仍在，"
-                "随时可以退回去。" if backup_branch else "已整体撤销，你的文件没有被改动。")
+        # 撤销**自己也会失败**（merge 被超时杀掉、文件被占用、磁盘满…）。这时绝不能嘴上
+        # 还说"你的文件没有被改动"——退出码和 MERGE_HEAD 说了算。
+        undo_code, _undo_out, _undo_err = run_git(undo, path, timeout=GIT_UNDO_TIMEOUT)
+        still_merging = (path / ".git" / "MERGE_HEAD").exists()
+        if files:
+            shown = "、".join(files[:5]) + ("…" if len(files) > 5 else "")
+            detail = f"{shown}（共 {len(files)} 个文件）"
+        else:
+            detail = _first_line(err) or f"git 退出码 {code}"
+        if undo_code != 0 or still_merging:
+            hint = ("**撤销没能做完**，请手动收拾：" + (
+                f"git reset --hard {backup_branch}" if backup_branch
+                else "git merge --abort"))
+        elif backup_branch:
+            hint = (f"已整体撤销，你的文件没有被改动。备份分支 {backup_branch} 仍在，"
+                    "随时可以退回去。")
+        else:
+            hint = "已整体撤销，你的文件没有被改动。"
         return UpdateResult(ok=False, behind=behind, strategy=used, conflict=True,
                             backup=backup_branch,
                             error=f"{'冲突' if used != 'ff' else '快进'}没能完成：{detail}。{hint}")
@@ -643,8 +727,8 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
     after = _first_line(out) if code == 0 else ""
     code, out, _ = run_git(["log", "-1", "--format=%s"], path)
     subject = _first_line(out) if code == 0 else ""
-    return UpdateResult(ok=True, changed=True, before=info.short, after=after,
-                        subject=subject, behind=behind, strategy=used,
+    return UpdateResult(ok=True, changed=after != info.short, before=info.short,
+                        after=after, subject=subject, behind=behind, strategy=used,
                         backup=backup_branch)
 
 
