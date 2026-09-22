@@ -16,6 +16,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
@@ -425,7 +426,226 @@ class UpdateResult:
     after: str = ""
     subject: str = ""
     behind: int = 0
+    strategy: str = ""
+    backup: str = ""
+    conflict: bool = False
     error: str = ""
+
+
+def unofficial_remote_name(remotes: dict[str, str]) -> str:
+    """远端**名**里仓库名对得上、owner 不是官方的那个（自己的仓库）。没有则 ''。"""
+    for name, url in remotes.items():
+        owner, repo = split_remote(url)
+        if repo.lower() == REPO_SLUG.lower() and owner.lower() != OFFICIAL_OWNER:
+            return name
+    return ""
+
+
+@dataclass(frozen=True)
+class UpdateSource:
+    """一个"可以从哪里更新"的来源——界面据此决定显示一个按钮还是两个。
+
+    kind=official：官方仓库（`deepseek-ai/deepseek-harness`）
+    kind=mine    ：你自己的仓库（fork / 团队镜像 / 私有化克隆，owner 不是官方）
+    """
+    kind: str
+    label: str = ""
+    owner: str = ""
+    remote: str = ""
+    url: str = ""
+    branch: str = ""
+    version: str = ""          # 官方才有：最新发布版本（标签）
+    head: str = ""             # 该分支的远端头（短 hash，探测到时）
+    reachable: bool = False
+    error: str = ""
+
+
+def _remote_default_branch(name_or_url: str, cwd: Optional[Path],
+                           timeout: int) -> str:
+    """远端默认分支：`ls-remote --symref ... HEAD` 的 `ref:` 行（只取引用，很便宜）。"""
+    code, out, _ = run_git(["ls-remote", "--symref", name_or_url, "HEAD"],
+                           cwd, timeout=timeout)
+    if code == 0:
+        for line in out.splitlines():
+            if line.startswith("ref:") and "refs/heads/" in line:
+                return line.split("refs/heads/", 1)[1].split()[0]
+    for candidate in ("master", "main"):
+        code, out, _ = run_git(["ls-remote", name_or_url, f"refs/heads/{candidate}"],
+                               cwd, timeout=timeout)
+        if code == 0 and out.strip():
+            return candidate
+    return ""
+
+
+def _remote_branch_head(name_or_url: str, branch: str, cwd: Optional[Path],
+                        timeout: int) -> str:
+    """远端某个分支的头（短 hash）；取不到返回空串。"""
+    code, out, _ = run_git(["ls-remote", name_or_url, f"refs/heads/{branch}"],
+                           cwd, timeout=timeout)
+    if code != 0 or not out.strip():
+        return ""
+    return out.split()[0][:7]
+
+
+def update_sources(path: Path, *, mirrors: Sequence[str] = (),
+                   timeout: int = LS_REMOTE_TIMEOUT) -> tuple[list[UpdateSource], str]:
+    """这台机器上"能从哪里更新"。
+
+    规则（与用户对齐过的）：**只有官方远端 → 只给官方一条；官方之外还有自己的远端 →
+    再多给一条"你自己的仓库"**；两者都没有就返回空并说明原因。
+    自己的那条跟**当前分支的同名分支**（开发机上通常就是它），没有同名才退回远端默认分支。
+    全程只 `ls-remote`（取引用，几秒），不 fetch 历史。
+    """
+    info = repo_info(path)
+    if not info.ok:
+        return [], info.error
+    remotes = dict(info.remotes)
+    sources: list[UpdateSource] = []
+
+    official_name = official_remote_name(remotes)
+    if official_name:
+        name = official_name
+        url = remotes[name]
+        official = official_status(info, timeout=timeout)
+        branch = official.branch or _remote_default_branch(name, path, timeout)
+        sources.append(UpdateSource(
+            kind="official", label="从官方更新", owner=OFFICIAL_OWNER,
+            remote=name, url=url, branch=branch, version=official.version,
+            head=official.head, reachable=official.ok,
+            error=official.error))
+
+    mine_name = unofficial_remote_name(remotes)
+    if mine_name:
+        url = remotes[mine_name]
+        branch = info.branch
+        head = _remote_branch_head(mine_name, branch, path, timeout) if branch else ""
+        if not head:
+            branch = _remote_default_branch(mine_name, path, timeout)
+            head = _remote_branch_head(mine_name, branch, path, timeout) if branch else ""
+        owner, _repo = split_remote(url)
+        label = f"从你的仓库更新（{owner or mine_name}）"
+        sources.append(UpdateSource(
+            kind="mine", label=label, owner=owner, remote=mine_name, url=url,
+            branch=branch, head=head, reachable=bool(head),
+            error="" if head else "远端上没有可用的分支"))
+
+    if not sources:
+        return [], ("这个目录没有配置任何 DSH 远端，无法更新"
+                    "（用『一键完整安装』装出来的离线目录就是这种）")
+    by_kind = {s.kind: s for s in sources}
+    ordered = [by_kind[k] for k in ("official", "mine") if k in by_kind]
+    return ordered, ""
+
+
+def _existing_backup_name(path: Path) -> str:
+    """给"更新前"打个备份分支，名字带时间戳（同一秒里加序号，避免撞名）。"""
+    base = f"backup/before-update-{time.strftime('%Y%m%d-%H%M%S')}"
+    name, index = base, 0
+    while True:
+        code, out, _ = run_git(["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"],
+                               path)
+        if code != 0 or not out.strip():
+            return name
+        index += 1
+        name = f"{base}-{index}"
+
+
+def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = (),
+                strategy: str = "merge", backup: bool = True) -> UpdateResult:
+    """从指定来源更新这个目录。
+
+    · **能快进就快进**（`merge --ff-only`），不动你的提交；
+    · 分叉（不是快进关系）时按 `strategy` 处理：`merge` 合并（默认）、`rebase` 变基、
+      `ff` 只允许快进（做不到就如实拒绝）；
+    · 合并/变基之前**先打备份分支**（`backup/before-update-<时间戳>`），出问题一条命令退回去；
+    · 冲突时**整体撤销**（`merge --abort` / `rebase --abort`）并如实报告，绝不自动解冲突；
+    · 官方来源按"镜像优先 → 官方"的顺序取（镜像由调用方从配置/环境传进来）。
+    所有结论都来自 git 的退出码，不猜。
+    """
+    info = repo_info(path)
+    if not info.ok:
+        return UpdateResult(ok=False, error=info.error)
+    if info.dirty:
+        return UpdateResult(ok=False, error=(
+            f"工作区有 {info.dirty} 处本地改动；为避免覆盖你的改动，"
+            "请先提交或撤销这些改动，再更新"))
+    if not info.branch or info.branch == "HEAD":
+        return UpdateResult(ok=False, error="处于分离头（detached HEAD）状态，无法更新")
+    if not source.branch:
+        return UpdateResult(ok=False, error=f"{source.label}：不知道要取哪个分支")
+
+    targets: list[str] = []
+    if source.kind == "official":
+        targets += [m for m in mirrors if m]
+    targets.append(source.remote or source.url)
+
+    problems: list[str] = []
+    fetched = False
+    for target in targets:
+        label = ("国内镜像" if target in mirrors
+                 else ("官方源" if source.kind == "official" else "你的仓库"))
+        code, _out, err = run_git(["fetch", target, source.branch], path,
+                                  timeout=FETCH_TIMEOUT)
+        if code == 0:
+            fetched = True
+            break
+        problems.append(f"{label}（{target}）：{_first_line(err) or code}")
+    if not fetched:
+        return UpdateResult(ok=False, error="取不到远端更新：\n  " + "\n  ".join(problems))
+
+    # 用 git 自己的祖先判断决定"能不能快进"，不数提交数：浅克隆里数出来会骗人
+    code, _out, _err = run_git(["merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"], path)
+    fast_forward = code == 0
+    if fast_forward:
+        code, out, _ = run_git(["rev-list", "--count", "HEAD..FETCH_HEAD"], path)
+        behind = int(out.strip().split()[0]) if code == 0 and out.strip() else 0
+        if behind == 0:
+            return UpdateResult(ok=True, changed=False, before=info.short,
+                                after=info.short, strategy="ff")
+    else:
+        code, out, _ = run_git(["rev-list", "--count", "HEAD..FETCH_HEAD"], path)
+        behind = int(out.strip().split()[0]) if code == 0 and out.strip() else 0
+
+    if not fast_forward and strategy == "ff":
+        return UpdateResult(ok=False, behind=behind, strategy="ff", error=(
+            "不是快进关系（你本地有自己的提交），已中止，你的文件没有被改动。"))
+
+    backup_branch = ""
+    if not fast_forward and backup:
+        backup_branch = _existing_backup_name(path)
+        code, _out, err = run_git(["branch", backup_branch, "HEAD"], path)
+        if code != 0:
+            return UpdateResult(ok=False, behind=behind, error=(
+                f"打备份分支失败，已中止（你的文件没有被改动）：{_first_line(err)}"))
+
+    if fast_forward:
+        code, _out, err = run_git(["merge", "--ff-only", "FETCH_HEAD"], path)
+        used = "ff"
+    elif strategy == "rebase":
+        code, _out, err = run_git(["rebase", "FETCH_HEAD"], path)
+        used = "rebase"
+    else:
+        code, _out, err = run_git(["merge", "--no-edit", "FETCH_HEAD"], path)
+        used = "merge"
+
+    if code != 0:
+        # 冲突/失败一律整体撤销：让目录回到更新前的样子，绝不留下半个合并
+        undo = ["rebase", "--abort"] if used == "rebase" else ["merge", "--abort"]
+        run_git(undo, path)
+        detail = _first_line(err)
+        hint = (f"已整体撤销，你的文件没有被改动。备份分支 {backup_branch} 仍在，"
+                "随时可以退回去。" if backup_branch else "已整体撤销，你的文件没有被改动。")
+        return UpdateResult(ok=False, behind=behind, strategy=used, conflict=True,
+                            backup=backup_branch,
+                            error=f"{'冲突' if used != 'ff' else '快进'}没能完成：{detail}。{hint}")
+
+    code, out, _ = run_git(["rev-parse", "--short", "HEAD"], path)
+    after = _first_line(out) if code == 0 else ""
+    code, out, _ = run_git(["log", "-1", "--format=%s"], path)
+    subject = _first_line(out) if code == 0 else ""
+    return UpdateResult(ok=True, changed=True, before=info.short, after=after,
+                        subject=subject, behind=behind, strategy=used,
+                        backup=backup_branch)
 
 
 def update_repo(path: Path, *, remote: str = "") -> UpdateResult:
@@ -440,40 +660,16 @@ def update_repo(path: Path, *, remote: str = "") -> UpdateResult:
        `rev-list` 两个方向都会把边界提交各算一次，自己算会误判成「有本地独有提交」而瞎拒绝；
        而 git 的合并机制在浅克隆里判断是准的。
     于是「已是最新」返回 `changed=False` 的成功，而不是失败。
+
+    `update_from` 是新的通用入口（可选合并/变基 + 备份）；这个函数保留为"只快进"的
+    老行为，供不区分来源的调用方继续使用。
     """
     info = repo_info(path)
     if not info.ok:
         return UpdateResult(ok=False, error=info.error)
-    if info.dirty:
-        return UpdateResult(ok=False, error=(
-            f"工作区有 {info.dirty} 处本地改动；为避免覆盖你的改动，"
-            "请先提交或撤销这些改动，再更新"))
-    if not info.branch or info.branch == "HEAD":
-        return UpdateResult(ok=False, error="处于分离头（detached HEAD）状态，无法更新")
     remote = remote or tracking_remote(info)
     if remote not in info.remotes:
         return UpdateResult(ok=False, error=f"没有名为 {remote} 的远端")
-
-    code, _out, err = run_git(["fetch", remote, info.branch], path,
-                              timeout=FETCH_TIMEOUT)
-    if code != 0:
-        return UpdateResult(ok=False, error=f"git fetch 失败：{_first_line(err)}")
-
-    behind = 0
-    code, out, _ = run_git(["rev-list", "--count", "HEAD..FETCH_HEAD"], path)
-    if code == 0 and out.strip():
-        behind = int(out.strip().split()[0])
-    if behind == 0:
-        return UpdateResult(ok=True, changed=False, before=info.short, after=info.short)
-
-    code, _out, err = run_git(["merge", "--ff-only", "FETCH_HEAD"], path)
-    if code != 0:
-        return UpdateResult(ok=False, behind=behind, error=(
-            "不是快进关系（你本地可能有自己的提交），已中止，你的文件没有被改动。"
-            f"git 说：{_first_line(err) or '无法快进'}"))
-    code, out, _ = run_git(["rev-parse", "--short", "HEAD"], path)
-    after = _first_line(out) if code == 0 else ""
-    code, out, _ = run_git(["log", "-1", "--format=%s"], path)
-    subject = _first_line(out) if code == 0 else ""
-    return UpdateResult(ok=True, changed=True, before=info.short, after=after,
-                        subject=subject, behind=behind)
+    source = UpdateSource(kind="mine", label=f"从你的仓库更新（{remote}）",
+                          remote=remote, url=info.remotes[remote], branch=info.branch)
+    return update_from(path, source, strategy="ff", backup=False)

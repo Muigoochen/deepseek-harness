@@ -1583,9 +1583,15 @@ class App(tk.Tk):
         self.btn_git_update = ttk.Button(grow, text="检查更新", width=10,
                                          command=self.on_check_update)
         self.btn_git_update.pack(side="left", padx=(6, 0))
-        self.btn_git_apply = ttk.Button(grow, text="更新到最新", width=11,
-                                        command=self.on_update_now)
-        self.btn_git_apply.pack(side="left", padx=(6, 0))
+        # 更新入口按"远端拓扑"决定（与用户对齐过的规则）：
+        #   只有官方远端（直接从官方克隆）→ 只显示「从官方更新」
+        #   官方之外还有你自己的远端（fork/镜像）→ 再多一条「从你的仓库更新（owner）」
+        #   两个都不显示 = 这个目录没有 DSH 远端（离线装出来的目录就是这种）
+        self.btn_update_official = ttk.Button(grow, text="从官方更新", width=12,
+                                              command=lambda: self.on_update_from("official"))
+        self.btn_update_mine = ttk.Button(grow, text="从你的仓库更新", width=18,
+                                          command=lambda: self.on_update_from("mine"))
+        self._update_sources: list = []     # 检查更新时探测到的来源，按钮据此显示
         self.git_note = ttk.Label(gbox, text="检查更新需要联网", foreground="#888",
                                   font=("Microsoft YaHei UI", 8), justify="left",
                                   wraplength=WRAP_LEFT)
@@ -2093,7 +2099,8 @@ class App(tk.Tk):
 
     def _set_git_buttons(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
-        for btn in (self.btn_git_refresh, self.btn_git_update, self.btn_git_apply):
+        for btn in (self.btn_git_refresh, self.btn_git_update,
+                    self.btn_update_official, self.btn_update_mine):
             try:
                 btn.configure(state=state)
             except Exception:  # noqa: BLE001  同上：窗口可能已销毁
@@ -2116,6 +2123,34 @@ class App(tk.Tk):
         except Exception as exc:  # noqa: BLE001  git 层意外 → 如实显示失败原因
             status = ginfo.UpdateStatus(ok=False, error=str(exc))
         self._post(self._show_update_status, status)
+        # 顺带探测"能从哪里更新"：界面据此决定显示 1 个还是 2 个按钮
+        try:
+            sources, error = ginfo.update_sources(target, mirrors=git_mirrors())
+        except Exception as exc:  # noqa: BLE001  探测失败不该让检查更新整个失败
+            sources, error = [], str(exc)
+        self._post(self._refresh_update_buttons, sources, error)
+
+    def _refresh_update_buttons(self, sources, error: str = "") -> None:
+        """按探测到的来源显示 1 个还是 2 个更新按钮；没有来源就都不显示并说明原因。
+
+        文字用来源自己的 label（官方＝「从官方更新」，自己的＝「从你的仓库更新（owner）」）。
+        远端探不到（比如网络不通）也照常显示按钮——点下去会如实报错，比藏起来更让人明白。
+        """
+        self._update_sources = list(sources)
+        by_kind = {source.kind: source for source in sources}
+        for kind, btn in (("official", self.btn_update_official),
+                          ("mine", self.btn_update_mine)):
+            source = by_kind.get(kind)
+            if source is None:
+                btn.pack_forget()
+                continue
+            btn.configure(text=source.label)
+            btn.pack(side="left", padx=(6, 0))
+            if not source.reachable:
+                self._append(f"[更新] {source.label}：现在探不到远端"
+                             f"（{source.error or '网络不通'}）；点它会如实报错")
+        if not sources:
+            self._append(f"[更新] {error or '这个目录没有可用的更新来源'}")
 
     def _show_update_status(self, status) -> None:
         self.git_busy = False
@@ -2153,11 +2188,21 @@ class App(tk.Tk):
                          "        git fetch upstream && git rebase upstream/master\n"
                          "       （有本地提交时不能快进，工具不会替你合并，避免覆盖你的东西）")
 
-    def on_update_now(self) -> None:
-        """把安装目录**快进**到远端最新，再重装依赖、重新构建。"""
+    def on_update_from(self, kind: str) -> None:
+        """从「官方」或「你自己的仓库」更新：能快进就快进，分叉就合并 + 自动备份。
+
+        与用户对齐过的规矩：分叉时**默认合并**（不改写你的提交历史），动手前先打备份分支；
+        冲突就整体撤销并如实报告（绝不自动解冲突）。
+        """
         if self.git_busy or self.busy:
             return
         target = self._effective_dir()
+        source = next((s for s in self._update_sources if s.kind == kind), None)
+        if source is None:
+            messagebox.showinfo("无法更新",
+                                "还没探测到可用的更新来源。\n\n请先点【检查更新】。",
+                                parent=self)
+            return
         info = ginfo.repo_info(target)
         ident = verify_install_dir(target, info)
         if not ident.ok:
@@ -2170,13 +2215,21 @@ class App(tk.Tk):
                 "为避免覆盖你自己的改动，请先提交或撤销这些改动，再更新。",
                 parent=self)
             return
-        if not messagebox.askyesno(
-                "更新到最新",
-                f"目录：{target}\n"
-                f"当前：{info.short}（分支 {info.branch}）\n"
-                f"写法：git fetch → 只做快进（不产生合并提交，也不动你已提交的内容）\n"
-                f"之后：重装依赖 → 重新构建（首次较慢）\n\n继续吗？",
-                parent=self):
+        lines = [f"目标：{source.label}",
+                 f"  远端：{source.url}",
+                 f"  分支：{source.branch}",
+                 f"当前：{info.short}（分支 {info.branch}）"]
+        if source.version:
+            lines.append(f"官方最新版本：{source.version}")
+        lines += ["",
+                  "做法：git fetch → 能快进就直接快进；不是快进关系就【合并】。",
+                  "合并前会先自动打一个备份分支（backup/before-update-…），",
+                  "万一冲突会整体撤销、你的文件一个都不动。",
+                  "",
+                  "之后：重装依赖 → 重新构建（首次较慢）",
+                  "",
+                  "继续吗？"]
+        if not messagebox.askyesno(source.label, "\n".join(lines), parent=self):
             return
         # 服务在跑就先停：Windows 上 node_modules 里的文件被占用时无法被替换
         was_running = self.web_proc is not None and self.web_proc.poll() is None
@@ -2188,13 +2241,20 @@ class App(tk.Tk):
         self._set_label(self.git_note, "正在更新…（进度见下方日志）", "#a05a00")
         mirror = bool(self.mirror.get())           # Tk 变量只在界面线程读
         threading.Thread(target=self._update_worker,
-                         args=(target, was_running, mirror), daemon=True).start()
+                         args=(target, was_running, mirror, kind), daemon=True).start()
 
-    def _update_worker(self, target: Path, was_running: bool, mirror: bool) -> None:
+    def _update_worker(self, target: Path, was_running: bool, mirror: bool,
+                       kind: str) -> None:
         eng = Engine(mode="auto", use_mirror=mirror, log=self._append)
+        source = next((s for s in self._update_sources if s.kind == kind), None)
+        if source is None:
+            self._post(self._update_done, False, "没有可用的更新来源", was_running)
+            return
         try:
-            self._append(f"[更新] 正在比对 {target} 与远端 …")
-            res = ginfo.update_repo(target)
+            self._append(f"[更新] 来源：{source.label}（{source.url}，分支 {source.branch}）")
+            res = ginfo.update_from(target, source,
+                                    mirrors=git_mirrors() if kind == "official" else (),
+                                    strategy="merge")
             if not res.ok:
                 self._post(self._update_done, False, res.error, was_running)
                 return
@@ -2202,7 +2262,12 @@ class App(tk.Tk):
                 self._append("[更新] 已是最新，无需更新。")
                 self._post(self._update_done, True, "已是最新", was_running)
                 return
-            self._append(f"[更新] 已快进 {res.before} → {res.after}：{res.subject}")
+            how = {"ff": "快进", "merge": "合并", "rebase": "变基"}.get(res.strategy,
+                                                                      res.strategy)
+            self._append(f"[更新] 已{how} {res.before} → {res.after}：{res.subject}")
+            if res.backup:
+                self._append(f"[更新] 万一有问题可以退回去："
+                             f"git reset --hard {res.backup}")
             self._append("[更新] 源码有变化，重新装依赖并重新构建 …")
             eng.install_deps(target, force=True)
             eng.build(target, force=True)
