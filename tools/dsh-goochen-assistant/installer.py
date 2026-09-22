@@ -1632,16 +1632,13 @@ class App(tk.Tk):
         self._wrap_labels.append(self.sess_note)
         self.after(200, self._refresh_session_note)
         # 「回退到更新前」：**绝不让用户自己去敲 git 命令**。
-        # 更新会自动打 backup/before-update-… 备份分支，这里就是它的一键入口；
-        # 有备份时才出现（没有备份时点它只会吓人）。真机踩过：出问题时工具只是打印
-        # 一句 git reset --hard …，普通用户根本不会用。
-        rrow = ttk.Frame(gbox)
-        rrow.pack(fill="x", pady=(4, 0))
-        self.btn_rollback = ttk.Button(rrow, text="回退到更新前", width=14,
-                                       command=self.on_rollback)
-        self.roll_note = ttk.Label(rrow, text="", foreground="#888",
-                                   font=("Microsoft YaHei UI", 8))
-        self.roll_note.pack(side="left", padx=(8, 0))
+        # 更新会自动打 backup/before-update-… 备份分支，这就是它的一键入口。
+        # 真机踩过三回：① 出问题时工具只打印一句 git reset --hard …，普通用户不会用；
+        # ② 我把它建在 gbox 里，而本文件的 git 区域有**两处**构建代码，用户看的不是那一份；
+        # ③ 更要命的：`btn_rollback` 这个名字**早被插件页的「回滚到上次保存…」占着**，
+        #    后面那段代码把我的属性覆盖了，于是我拿到并 pack 的是别人的按钮——当然看不见。
+        # 所以：换个不会撞的名字，而且父框架取 self.btn_git_refresh.master（用户看得见那排）。
+        self.btn_rollback_update = None
         self._wrap_labels.append(self.git_note)
 
         # 安装方式（可折叠：装好之后基本不用动；标题上始终显示当前选择）
@@ -2141,20 +2138,38 @@ class App(tk.Tk):
         lines.append(f"依据：{ident.evidence}")
         color = {"official": "#1a6b1a", "unofficial": "#a05a00"}.get(ident.tier, "#666")
         self._set_label(self.git_info_lbl, "\n".join(lines), color)
-        self._refresh_rollback_button(ginfo.update_backups(info.root) if info.root else [])
+        backups = ginfo.update_backups(info.root) if info.root else []
+        self._refresh_rollback_button(backups)
+        # 更新按钮**先按本地配置立刻摆出来**，别让用户等联网探测（真机实测官方那一路
+        # 要花几十秒到几分钟，用户看到的就是"这两个按钮为啥等很久才出现"）。
+        # 版本号、可达性这些联网信息由【检查更新】随后补上并覆盖。
+        self._refresh_update_buttons(ginfo.update_sources_local(info.root, info=info),
+                                     shallow=info.shallow)
+        if backups:
+            # 备份写进信息栏（按钮上写不下、也不该写）：用户一眼知道"上次更新是什么时候"。
+            newest = str(backups[0]).replace(ginfo.BACKUP_PREFIX, "")
+            tail = f"，共 {len(backups)} 份" if len(backups) > 1 else ""
+            self._set_label(self.git_note,
+                            f"可回退到更新前：{newest}{tail}（点【回退到更新前】）", "#888")
 
     def _refresh_rollback_button(self, backups: list) -> None:
-        """有备份分支才显示【回退到更新前】，并写出最近一份是什么时候的。"""
+        """有备份分支才显示【回退到更新前】——没备份时点它只会吓人。
+
+        按钮**第一次用的时候才创建**，父框架取 `btn_git_refresh.master`（用户看得见的那一排）。
+        名字带 `_update`：`btn_rollback` 已被插件页的「回滚到上次保存…」占用，同名会被覆盖，
+        真机上就是因此 pack 了别人的按钮、用户什么都看不到。
+        """
         try:
-            if backups:
-                if not self.btn_rollback.winfo_manager():
-                    self.btn_rollback.pack(side="left")
-                newest = str(backups[0]).replace(ginfo.BACKUP_PREFIX, "")
-                tail = f"（共 {len(backups)} 份）" if len(backups) > 1 else ""
-                self._set_label(self.roll_note, f"备份：{newest} {tail}", "#888")
-            else:
-                self.btn_rollback.pack_forget()
-                self._set_label(self.roll_note, "", "#888")
+            if not backups:
+                if self.btn_rollback_update is not None:
+                    self.btn_rollback_update.pack_forget()
+                return
+            if self.btn_rollback_update is None:
+                self.btn_rollback_update = ttk.Button(
+                    self.btn_git_refresh.master, text="回退到更新前",
+                    command=self.on_rollback)
+            if not self.btn_rollback_update.winfo_manager():
+                self.btn_rollback_update.pack(side="left", padx=(6, 0))
         except Exception:  # noqa: BLE001  窗口可能已销毁
             pass
 
@@ -2241,7 +2256,7 @@ class App(tk.Tk):
         state = "normal" if enabled else "disabled"
         for btn in (self.btn_git_refresh, self.btn_git_update,
                     self.btn_update_official, self.btn_update_mine, self.btn_deepen,
-                    self.btn_rollback):
+                    self.btn_rollback_update):
             try:
                 btn.configure(state=state)
             except Exception:  # noqa: BLE001  同上：窗口可能已销毁

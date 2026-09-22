@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """更新来源与更新动作（按远端拓扑给按钮 + 合并/备份/冲突安全中止）。
 
 与用户对齐的三条规矩：
@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 import threading as _threading
+import tkinter as tk
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -710,6 +711,91 @@ class RollbackTest(unittest.TestCase):
         ok, detail = gi.reset_to(self.repo, f"{gi.BACKUP_PREFIX}不存在的")
         self.assertFalse(ok, "名字不对就别动手")
         self.assertIn("找不到备份分支", detail)
+
+
+class RollbackButtonGuiTest(unittest.TestCase):
+    """界面上：有备份才出现【回退到更新前】，而且必须出现在用户看得见的那一排。"""
+
+    @classmethod
+    def setUpClass(cls):
+        probe = tk.Tk()
+        probe.destroy()
+
+    def setUp(self) -> None:
+        self.app = installer.App()
+
+    def tearDown(self) -> None:
+        try:
+            self.app.destroy()
+        except Exception:  # noqa: BLE001  窗口可能已经关掉
+            pass
+
+    def test_button_only_when_backups_exist(self):
+        self.assertIsNone(self.app.btn_rollback_update, "没备份时按钮根本不该建出来")
+        self.app._refresh_rollback_button([])
+        self.app.update()
+        self.assertIsNone(self.app.btn_rollback_update)
+        self.app._refresh_rollback_button([f"{gi.BACKUP_PREFIX}20260922-155952"])
+        self.app.update()
+        self.assertIsNotNone(self.app.btn_rollback_update, "有备份就该能一键回退")
+        self.assertTrue(self.app.btn_rollback_update.winfo_manager())
+
+    def test_button_sits_in_the_row_the_user_can_see(self):
+        """回退按钮必须和「刷新信息」「从官方更新」**同一排**（同一个父框架）。
+
+        真机踩过：我把它建在另一个框里，而本文件的 git 区域有两处构建代码，用户看的是
+        带滚动条那一份——于是按钮压根没显示，用户直接来问"你的回退到更新前按钮呢"。
+        """
+        self.app._refresh_rollback_button([f"{gi.BACKUP_PREFIX}20260922-155952"])
+        self.app.update()
+        self.assertIs(self.app.btn_rollback_update.master, self.app.btn_git_refresh.master,
+                      "回退按钮要和刷新信息/从官方更新挤在同一排")
+
+    def test_refuses_when_the_worktree_is_dirty(self):
+        """硬回退会丢改动，所以工作区脏的时候必须先拦下来。"""
+        seen: list = []
+        dirty = gi.RepoInfo(ok=True, root=Path("E:/x"), branch="plugins", dirty=3)
+        with mock.patch.object(type(self.app), "_effective_dir", lambda _s: Path("E:/x")), \
+                mock.patch.object(installer.ginfo, "repo_info", return_value=dirty), \
+                mock.patch.object(installer.ginfo, "update_backups",
+                                  return_value=[f"{gi.BACKUP_PREFIX}20260922-155952"]), \
+                mock.patch.object(installer.ginfo, "reset_to",
+                                  lambda *a, **k: seen.append("reset") or (True, "ok")), \
+                mock.patch.object(installer.messagebox, "showwarning",
+                                  lambda *a, **k: seen.append("warn")):
+            self.app.on_rollback()
+        self.assertIn("warn", seen, "应当提示先处理本地改动")
+        self.assertNotIn("reset", seen, "绝不能在脏工作区上硬回退")
+
+
+class LocalSourcesTest(unittest.TestCase):
+    """更新按钮要**立刻**出现：先用不联网的本地拓扑摆按钮，联网信息随后再补。
+
+    真机踩过：用户问"官方更新／从自己仓库更新两个按钮为啥会等很久才会出现呀"——
+    因为那时按钮要等联网探测（官方那一路几十秒到几分钟）。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-local-src-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = make_repo(self.tmp / "repo", message="起点")
+        add_remote(self.repo, "origin", "git@github.com:Muigoochen/deepseek-harness.git")
+
+    def test_official_and_mine_without_touching_the_network(self):
+        add_remote(self.repo, "upstream", "git@github.com:deepseek-ai/deepseek-harness.git")
+        info = gi.repo_info(self.repo)        # 这一次允许跑 git：纯本地读取
+        with mock.patch.object(gi, "run_git", side_effect=AssertionError("不许联网")):
+            sources = gi.update_sources_local(self.repo, info=info)
+        self.assertEqual([s.kind for s in sources], ["official", "mine"],
+                         "官方的排在前，自己的在后")
+        mine = [s for s in sources if s.kind == "mine"][0]
+        self.assertIn("Muigoochen", mine.label, "按钮上要带 owner 名字")
+
+    def test_no_remote_means_no_buttons(self):
+        plain = make_repo(self.tmp / "plain", message="没有远端")
+        info = gi.repo_info(plain)
+        with mock.patch.object(gi, "run_git", side_effect=AssertionError("不许联网")):
+            self.assertEqual(gi.update_sources_local(plain, info=info), [])
 
 
 class DepsChangeTest(unittest.TestCase):

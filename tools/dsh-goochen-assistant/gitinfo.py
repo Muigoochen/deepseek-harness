@@ -42,6 +42,10 @@ GIT_FETCH_TIMEOUT = 600
 LOCAL_FALLBACK_FETCH_TIMEOUT = 120
 # 撤销（merge --abort / rebase --abort）是本地操作，但目录可能有 node_modules，给宽一点
 GIT_UNDO_TIMEOUT = 120
+#: 合并本身也是本地操作，但"3482 个提交 / 10459 个文件"的合并要写很久：真机实测 20 秒不够，
+#: 被掐断后连 `merge --abort` 都会因为残留的 index.lock 失败，留下半合并状态（用户看到的是
+#: "git 超时（20 秒）：merge --no-edit" + "请手动收拾"）。给它足够时间，别在写盘中途动手。
+GIT_MERGE_TIMEOUT = 300
 #: 官方发布 tag 的前缀：`dsh-v0.1.6-alpha.2` → 版本号 `0.1.6-alpha.2`。
 OFFICIAL_TAG_PREFIX = "dsh-v"
 _UNIT = "\x1f"          # git --format 的字段分隔符（正常文本里不会出现）
@@ -607,6 +611,39 @@ def update_sources(path: Path, *, mirrors: Sequence[str] = (),
     return ordered, ""
 
 
+def update_sources_local(path: Path, *, info: RepoInfo | None = None) -> list[UpdateSource]:
+    """**不联网**地列出可用更新来源，只按本地配置（`git remote`）判断。
+
+    为什么单独要一个：`update_sources` 每探一次都要联网，官方那一路在真机上要花几十秒到
+    几分钟（实测这条链路只有 30~180 KB/s），于是「从官方更新／从你的仓库更新」两个按钮
+    要等很久才出现——用户的原话是"为啥会等很久才会出现呀"。现在按钮先用这份**本地结果
+    立刻显示**，版本号之类的联网信息留给【检查更新】去补。
+
+    分支名只能按本地惯例给（官方 master、自己的当前分支）：不联网就查不到远端的默认分支。
+    真要点下去更新时，`update_from` 会自己去核对远端。
+    """
+    info = info or repo_info(path)
+    if not info.ok:
+        return []
+    remotes = dict(info.remotes)
+    sources: list[UpdateSource] = []
+    official_name = official_remote_name(remotes)
+    if official_name:
+        sources.append(UpdateSource(
+            kind="official", label="从官方更新", owner=OFFICIAL_OWNER,
+            remote=official_name, url=remotes[official_name],
+            branch="master", reachable=True))
+    mine_name = unofficial_remote_name(remotes)
+    if mine_name:
+        url = remotes[mine_name]
+        owner, _repo = split_remote(url)
+        sources.append(UpdateSource(
+            kind="mine", label=f"从你的仓库更新（{owner or mine_name}）", owner=owner,
+            remote=mine_name, url=url, branch=info.branch, reachable=True))
+    by_kind = {s.kind: s for s in sources}
+    return [by_kind[k] for k in ("official", "mine") if k in by_kind]
+
+
 def _existing_backup_name(path: Path) -> str:
     """给"更新前"打个备份分支，名字带时间戳（同一秒里加序号，避免撞名）。"""
     base = f"backup/before-update-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -724,12 +761,27 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
         if is_official:
             # 先花几秒探一下可达性：真机实测连不上 github 时，全量 fetch 会一直挂到超时
             # （十分钟都不返回），用户看到的是"更新卡死"。探不到就直接说清楚，别耗着。
-            code_probe, _out_probe, err_probe = run_git(
+            code_probe, out_probe, err_probe = run_git(
                 ["ls-remote", "--heads", target, source.branch], path)
             if code_probe != 0:
                 problems.append(f"{label}（{target}）：现在连不上"
                                 f"（{_first_line(err_probe) or code_probe}）")
                 continue
+            # 远端这个分支的头**和手上已取回的那份是同一个提交**时，就别再拖几十 MB 了：
+            # 本地对象是全的，一个本地 fetch 就够。真机实测这条链路有时只有 33 KB/s，
+            # 重下 52 MB 要几十分钟——而结果和手上这份一模一样。
+            probe_sha = (out_probe.split() or [""])[0]
+            local_ref = local_official_ref(path, source)
+            if local_ref and probe_sha:
+                code_l, out_l, _err_l = run_git(["rev-parse", local_ref], path)
+                if code_l == 0 and out_l.strip() == probe_sha:
+                    code, _out, _err = run_git(
+                        ["fetch", ".", f"refs/remotes/{source.remote}/{source.branch}"], path)
+                    if code == 0:
+                        fetched = True
+                        fallback_note = (f"远端 {source.branch} 的头就是手上的 {probe_sha[:7]}"
+                                         "（已用 ls-remote 核对），直接用本地的，不重复下载")
+                        break
         code, _out, err = run_git(["fetch", target, source.branch], path,
                                   timeout=official_wait if is_official else timeout)
         if code == 0:
@@ -801,22 +853,38 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
                 f"打备份分支失败，已中止（你的文件没有被改动）：{_first_line(err)}"))
 
     if fast_forward:
-        code, _out, err = run_git(["merge", "--ff-only", "FETCH_HEAD"], path)
+        code, _out, err = run_git(["merge", "--ff-only", "FETCH_HEAD"], path,
+                                  timeout=GIT_MERGE_TIMEOUT)
         used = "ff"
     elif strategy == "rebase":
-        code, _out, err = run_git(["rebase", "FETCH_HEAD"], path)
+        code, _out, err = run_git(["rebase", "FETCH_HEAD"], path,
+                                  timeout=GIT_MERGE_TIMEOUT)
         used = "rebase"
     else:
-        code, _out, err = run_git(["merge", "--no-edit", "FETCH_HEAD"], path)
+        code, _out, err = run_git(["merge", "--no-edit", "FETCH_HEAD"], path,
+                                  timeout=GIT_MERGE_TIMEOUT)
         used = "merge"
 
     if code != 0:
         # git 说 "refusing to merge unrelated histories" 时，用户需要的是"为什么 + 怎么办"
         if "unrelated histories" in err:
-            run_git(["merge", "--abort"], path)   # 没开始合并时这是空操作
+            run_git(["merge", "--abort"], path, timeout=GIT_UNDO_TIMEOUT)
             return UpdateResult(ok=False, behind=behind, strategy=used,
                                 backup=backup_branch,
                                 error=_unrelated_hint(info.shallow))
+        # 合并被**超时掐断**时，git 会把自己的 index.lock 留在原地，于是接下来的
+        # `merge --abort` 一进门就失败——真机就是这样留下半合并状态的。只在这种
+        # "是我们把它杀掉的"情形下清锁：此时本仓库没有别的 git 在跑。
+        killed = code == GIT_TIMEOUT
+        lock = path / ".git" / "index.lock"
+        if killed and lock.exists():
+            try:
+                lock.unlink()
+                _locked_cleared = True
+            except OSError:
+                _locked_cleared = False
+        else:
+            _locked_cleared = False
         # 冲突/失败一律整体撤销：让目录回到更新前的样子，绝不留下半个合并
         # 冲突文件名单要在 abort **之前**取，abort 之后索引就干净了、什么都问不出来。
         # 用 -z 取：默认的引号会把中文路径转义成 "RE_\346\274\224..."，用户看到的全是乱码。
@@ -834,9 +902,11 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
         else:
             detail = _first_line(err) or f"git 退出码 {code}"
         if undo_code != 0 or still_merging:
-            hint = ("**撤销没能做完**，请手动收拾：" + (
-                f"git reset --hard {backup_branch}" if backup_branch
-                else "git merge --abort"))
+            # 这里**绝不能让用户自己去敲命令**：界面上有【回退到更新前】按钮，
+            # 它做的就是这件事（先把服务停掉，再 reset --hard）。
+            hint = ("**撤销没能做完**，点界面上的【回退到更新前】就能收拾干净"
+                    + (f"（等价于 git reset --hard {backup_branch}，"
+                       "但不用你动手）" if backup_branch else ""))
         elif backup_branch:
             hint = (f"已整体撤销，你的文件没有被改动。备份分支 {backup_branch} 仍在，"
                     "随时可以退回去。")
