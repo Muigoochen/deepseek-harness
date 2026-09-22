@@ -15,9 +15,20 @@ import os
 import shutil
 import stat
 import tempfile
+from pathlib import Path
 
 _ROOT = tempfile.mkdtemp(prefix="dsh-tests-")
 tempfile.tempdir = _ROOT
+
+# 别让测试把日志写进工具目录里的 installer.log：真机排查时会被测试噪音淹没
+# （实测真机日志里混着 "[配置] 保存失败：disk full"、临时目录路径这些测试用例的输出，
+#  看日志的人会以为真机上磁盘满了）。
+try:
+    import installer as _installer
+
+    _installer.LOG_PATH = Path(_ROOT) / "installer-tests.log"
+except Exception:            # noqa: BLE001  导入失败不该影响测试本身
+    pass
 
 
 def _wipe(path: str) -> None:

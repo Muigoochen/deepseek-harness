@@ -240,5 +240,56 @@ class InstallDepsSourceOrderTest(unittest.TestCase):
             self.assertIn(name, message)
 
 
+class PurgePermissionTest(unittest.TestCase):
+    """真机那个 ABORTED_REMOVE_MODULES_DIR_NO_TTY：必须授权 pnpm 直接重建目录。
+
+    pnpm 要把旧的 node_modules 清掉重建，而我们用管道捕获输出、stdin 接空设备（没有 TTY），
+    它不敢自己动手就中止——三条来源全废在同一句话上。
+    实测确认：`--confirm-modules-purge=false` 会报 Unknown option，
+    正确写法是 `--config.confirmModulesPurge=false`（pnpm 11.7.0 与 11.25 都接受）。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        self.store = self.project / "store"
+        self.store.mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _calls(self, modules_store: str = "") -> list[list[str]]:
+        if modules_store:
+            (self.project / "node_modules").mkdir(exist_ok=True)
+            (self.project / "node_modules" / ".modules.yaml").write_text(
+                '{"storeDir": "%s"}' % modules_store, encoding="utf-8")
+        calls: list[list[str]] = []
+
+        def fake(argv, cwd=None, **kwargs):
+            calls.append(list(argv))
+            return mock.Mock(returncode=0, stdout=b"", stderr=b"")
+
+        engine = installer.Engine("auto", use_mirror=True, log=lambda _m: None)
+        with mock.patch.object(installer, "run_cli", fake), \
+                mock.patch.object(installer, "STORE_DIR", self.store):
+            engine.install_deps(self.project, force=True)
+        return calls
+
+    def test_every_attempt_authorizes_the_purge(self):
+        for call in self._calls():
+            self.assertIn("--config.confirmModulesPurge=false", call,
+                          "每条路都要带这个授权，否则无 TTY 时会中止")
+
+    def test_store_dir_is_used_when_the_existing_tree_matches(self):
+        calls = self._calls(modules_store=str(self.store))
+        self.assertIn("--store-dir", calls[0], "同一份 store，照用")
+
+    def test_store_dir_is_dropped_when_the_existing_tree_differs(self):
+        calls = self._calls(modules_store="E:\\.pnpm-store\\v11")
+        self.assertNotIn("--store-dir", calls[0],
+                         "现有 node_modules 是别的 store 装的就别再指定，免得平添差异")
+        self.assertIn("--config.confirmModulesPurge=false", calls[0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -153,6 +153,38 @@ TRANSIENT_WORDS = ("ERR_PNPM_META_FETCH_FAIL", "FETCH_ERROR", "ECONNRESET", "ECO
                    "ETIMEDOUT", "EAI_AGAIN", "socket hang up", "network", "request to")
 
 
+def _existing_store_dir(project: Path) -> str:
+    """现有 `node_modules` 是用哪个 store 装出来的（读 `.modules.yaml` 的 storeDir）。
+
+    pnpm 11 写出来的这个文件是 JSON 风格，但字段顺序/引号形式不保证，所以先按 JSON 解析，
+    失败再退回正则——任意一条能拿到就行。
+    """
+    path = project / "node_modules" / ".modules.yaml"
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and isinstance(data.get("storeDir"), str):
+            return data["storeDir"]
+    except ValueError:                 # 不是合法 JSON：退回正则
+        pass
+    found = re.search(r'"?storeDir"?\s*:\s*"?([^",\n]+)"?', text)
+    return found.group(1).strip().strip('"').strip("'") if found else ""
+
+
+def _same_dir(left: str, right: Path) -> bool:
+    """两个路径是不是同一个目录（Windows 上大小写与斜杠都要归一）。"""
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return os.path.normcase(os.path.normpath(left)) == \
+            os.path.normcase(os.path.normpath(str(right)))
+
+
 def _looks_transient(text: str) -> bool:
     """这次失败像不像"网络抽了一下"（而不是"包真的缺"）。"""
     low = text.lower()
@@ -1354,6 +1386,18 @@ class Engine:
             return
         self.log("⑤ 安装项目依赖 …")
         store = str(STORE_DIR) if STORE_DIR.exists() else ""
+        # 现有 node_modules 若是**别的 store** 装出来的，就不再指定 store-dir，免得平白多出差异。
+        # 说清楚：这条**不是**真机那个 ABORTED_REMOVE_MODULES_DIR_NO_TTY 的根因——11.7.0 与
+        # 11.25 都实测过，换 store 并不会让 pnpm 去清目录。保留它只是让 store 保持一致，
+        # 不制造无谓差异（顺带避免虚拟 store 指向一个以后可能被清掉的 store）。
+        existing = _existing_store_dir(project)
+        if store and existing and not _same_dir(existing, STORE_DIR):
+            self.log(f"  · 现有 node_modules 用的是 {existing}，这次不指定 --store-dir")
+            store = ""
+        # 真机那个中止是 pnpm 要**清空 node_modules 重建**，而我们用管道捕获输出、stdin 接
+        # 空设备（没有 TTY），它不敢自己动手就中止了：三条来源全废在同一句话上。直接授权它做。
+        # 实测：`--confirm-modules-purge=false` 会报 Unknown option；正确写法是下面这个。
+        purge_ok = ["--config.confirmModulesPurge=false"]
         attempts: list[tuple[str, list[str]]] = []
         if store and self.mode == "auto":
             # "自动选择"下先走"缓存优先、缺的联网补"：**不能用 --offline**——跨版本更新时随包
@@ -1361,14 +1405,15 @@ class Engine:
             # 0.1.2→0.1.6 缺 @yao-pkg/pkg-6.21.0），三次尝试可能全废、用户白等一轮。
             # --prefer-offline 用得上缓存就用，缺的才下载，正是跨版本更新要的行为。
             attempts.append(("随包缓存优先", ["pnpm", "install", "--frozen-lockfile",
-                                             "--prefer-offline", "--store-dir", store]))
+                                             "--prefer-offline", *purge_ok,
+                                             "--store-dir", store]))
         if self.mode == "offline" and store:
             # "离线安装"的承诺是不联网，那就**只能**有这一条严格离线的路。
             attempts.append(("随包离线缓存", ["pnpm", "install", "--frozen-lockfile",
-                                             "--offline", "--store-dir", store]))
+                                             "--offline", *purge_ok, "--store-dir", store]))
         if self.mode != "offline":
             for name, registry in self.registries():
-                argv = ["pnpm", "install", "--frozen-lockfile"]
+                argv = ["pnpm", "install", "--frozen-lockfile", *purge_ok]
                 if store:
                     # 同一份 store：离线缺的包由这次联网补齐，随包缓存越用越全
                     argv += ["--store-dir", store]
@@ -1408,6 +1453,10 @@ class Engine:
             picked = (errs[:3] if errs else lines[-5:])
             detail = " / ".join(picked)[:400]
             problems.append(f"{name}：{detail}")
+            # 真机排查用：把这次 pnpm 的原始输出尾部写进日志文件（只进文件、不进界面，
+            # 免得刷屏）。真机那次中止只留下一句 ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY，
+            # 完全没有上下文，只能靠猜；有这段就不必再猜。
+            log_line(f"[依赖] {name} 原始输出（尾部 40 行）：\n" + "\n".join(lines[-40:]))
             if last:
                 self.log(f"  ✗ {name} 失败（{detail}）")
             else:
@@ -2811,6 +2860,8 @@ class App(tk.Tk):
             self._log_work(f"[更新] ✗ 更新失败：{detail}")
             self._log_work("[更新] 要退回去就点界面上的【回退到更新前】"
                            "（没有备份时它会告诉你为什么退不了）")
+            self._log_work("[更新] 若只是依赖/构建没成，代码其实已经合好了："
+                           "点【重装依赖并构建】就地补上，不用重走一遍更新")
             if was_running:
                 self._log_work("[更新] 服务已停止（更新前在运行）；"
                                "处理完上面的问题后点【运行】重新启动。")
