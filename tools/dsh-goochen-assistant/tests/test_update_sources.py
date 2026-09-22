@@ -288,5 +288,116 @@ class UpdateButtonsGuiTest(unittest.TestCase):
         self.assertEqual(self._shown(), [])
 
 
+class UpdateWorkerTest(unittest.TestCase):
+    """更新工作线程的接线：来源怎么选、镜像怎么传、成功后才重装依赖+重建、失败不重建。
+
+    直接以**未绑定**方式调用 `App._update_worker`，用一个只带它真正用到的那几个属性的
+    替身——不用开窗口，也不需要网络。
+    """
+
+    class _Fake:
+        def __init__(self, sources):
+            self._update_sources = sources
+            self.log: list[str] = []
+            self.posted: list[tuple] = []
+
+        def _append(self, msg):
+            self.log.append(str(msg))
+
+        def _update_done(self, ok, detail, was_running):
+            """工作线程会把它当回调交给 _post；替身里只要存在即可（_post 只记录）。"""
+
+        def _post(self, func, *args):
+            self.posted.append((getattr(func, "__name__", str(func)), args))
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-updw-"))
+        self.target = self.tmp / "repo"
+        self.target.mkdir()
+        self.source = gi.UpdateSource(kind="official", label="从官方更新",
+                                      remote="upstream", url="git@example/x.git",
+                                      branch="master")
+        self.mine = gi.UpdateSource(kind="mine", label="从你的仓库更新（me）",
+                                    remote="origin", url="git@example/y.git",
+                                    branch="plugins")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run_worker(self, result, *, kind="official", mirrors=("https://mirror/x.git",),
+                    engine=None):
+        fake = self._Fake([self.source, self.mine])
+        calls: list[tuple] = []
+        updated: list[tuple] = []
+
+        def fake_update_from(path, source, *, mirrors=(), strategy=""):
+            updated.append((source, tuple(mirrors), strategy))
+            return result
+
+        class FakeEngine:
+            def __init__(self, *args, **kwargs):
+                calls.append(("engine", kwargs.get("use_mirror")))
+
+            def install_deps(self, path, *, force=False):
+                calls.append(("deps", force))
+
+            def build(self, path, *, force=False):
+                calls.append(("build", force))
+
+        with mock.patch.object(gi, "update_from", fake_update_from), \
+                mock.patch.object(installer, "Engine", FakeEngine), \
+                mock.patch.object(installer, "git_mirrors", lambda: list(mirrors)), \
+                mock.patch.object(installer, "clear_interrupted", lambda _p: None):
+            installer.App._update_worker(fake, self.target, False, True, kind)
+        return fake, calls, updated
+
+    def test_official_update_passes_mirrors_and_rebuilds_after_success(self):
+        result = gi.UpdateResult(ok=True, changed=True, before="aaa", after="bbb",
+                                 subject="官方新提交", strategy="merge",
+                                 backup="backup/before-update-1")
+        fake, calls, updated = self._run_worker(result)
+        source, mirrors, strategy = updated[0]
+        self.assertEqual(source.kind, "official")
+        self.assertEqual(mirrors, ("https://mirror/x.git",), "官方来源必须带上镜像")
+        self.assertEqual(strategy, "merge", "分叉时默认合并")
+        self.assertIn(("deps", True), calls, "成功后要重装依赖")
+        self.assertIn(("build", True), calls, "成功后要重新构建")
+        self.assertEqual([p[0] for p in fake.posted], ["_update_done"])
+        self.assertTrue(fake.posted[0][1][0], "应当报告成功")
+        self.assertTrue(any("可以退回去" in line for line in fake.log),
+                        "有备份分支就要告诉用户怎么退回去")
+
+    def test_mine_update_never_uses_the_official_mirrors(self):
+        result = gi.UpdateResult(ok=True, changed=True, before="a", after="b",
+                                 strategy="ff")
+        _, _, updated = self._run_worker(result, kind="mine")
+        self.assertEqual(updated[0][1], (), "自己的仓库不该走官方镜像")
+
+    def test_conflict_is_reported_and_nothing_is_rebuilt(self):
+        result = gi.UpdateResult(ok=False, conflict=True, backup="backup/before-update-2",
+                                 error="冲突没能完成：…已整体撤销。")
+        fake, calls, _ = self._run_worker(result)
+        self.assertNotIn(("deps", True), calls, "冲突后绝不能继续重装/重建")
+        self.assertNotIn(("build", True), calls)
+        name, args = fake.posted[0]
+        self.assertEqual(name, "_update_done")
+        self.assertFalse(args[0], "冲突要如实报失败")
+        self.assertIn("冲突", args[1])
+
+    def test_no_change_reports_success_without_rebuilding(self):
+        result = gi.UpdateResult(ok=True, changed=False, before="a", after="a")
+        fake, calls, _ = self._run_worker(result)
+        self.assertNotIn(("deps", True), calls)
+        self.assertEqual(fake.posted[0][1], (True, "已是最新", False))
+
+    def test_missing_source_is_reported_instead_of_crashing(self):
+        fake = self._Fake([])
+        with mock.patch.object(gi, "update_from") as never:
+            installer.App._update_worker(fake, self.target, False, True, "official")
+        never.assert_not_called()
+        self.assertEqual(fake.posted[0][1][0], False)
+        self.assertIn("没有可用的更新来源", fake.posted[0][1][1])
+
+
 if __name__ == "__main__":
     unittest.main()
