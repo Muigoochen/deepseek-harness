@@ -211,8 +211,12 @@ def update_summary(status) -> tuple[str, str]:
                  if status.latest else "")
         text, color = f"⚠ 落后 {status.behind} 个提交{extra}", "#a05a00"
     elif official_is_newer(status):
+        # 能数出"离官方还差多少"就报出来（本地有官方对象时才数得出，浅克隆里不数）
+        gap = ""
+        if getattr(official, "behind", 0):
+            gap = f"、距官方 {official.branch or '默认分支'} 还差 {official.behind} 个提交"
         text = (f"⚠ 官方已到 {official.version}（本地 {status.version}）"
-                f"　·　你的分支无新提交")
+                f"　·　你自己的仓库没有新提交{gap}，可用【从官方更新】")
         color = "#a05a00"
     elif not (official and official.ok):
         # 官方**没核对上**（网络不通/没配官方远端/超时）——这时绝不能报"已是最新"。
@@ -2092,12 +2096,17 @@ class App(tk.Tk):
             bits.append(f"相对 {info.upstream}：领先 {info.ahead} / 落后 {info.behind}")
         lines = [" · ".join(bits)]
 
-        # 分支跟踪的远端若不是官方，就说清「更新从哪来」，别让人以为在跟官方同步
+        # 分支跟踪的远端若不是官方，就说清「更新从哪来」，别让人以为在跟官方同步。
+        # 这里**不能**再说"官方更新需自行合并"——那是加【从官方更新】之前的老话，
+        # 现在工具自己就能合（真机上用户看到这句旧文案，以为信息不对）。
         if info.upstream:
             tracked = ginfo.tracking_remote(info)
             url = info.remotes.get(tracked, "")
             if url and not ginfo.official_remote({tracked: url}):
-                lines.append(f"更新来源：{info.upstream}（{url}，非官方 —— 官方更新需自行合并）")
+                note = f"更新来源：{info.upstream}（{url}，非官方）"
+                if ginfo.official_remote(info.remotes):
+                    note += "；要跟官方走就用【从官方更新】"
+                lines.append(note)
         lines.append(f"依据：{ident.evidence}")
         color = {"official": "#1a6b1a", "unofficial": "#a05a00"}.get(ident.tier, "#666")
         self._set_label(self.git_info_lbl, "\n".join(lines), color)

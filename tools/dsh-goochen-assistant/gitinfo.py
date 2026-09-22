@@ -307,6 +307,7 @@ class OfficialStatus:
     tag: str = ""              # 原始标签名，如 dsh-v0.1.6-alpha.2
     branch: str = ""           # 官方默认分支
     head: str = ""             # 该分支头（短 hash）
+    behind: int = 0            # 本地离官方那个分支还差几个提交（本地有该引用时才数得出来）
     error: str = ""
 
 
@@ -341,8 +342,16 @@ def official_status(info: RepoInfo, *,
         if code == 0 and out.strip():
             branch, head = candidate, out.split()[0][:7]
             break
+    # 本地已经有官方那个分支的引用（之前取过）时，顺手数一下差多少提交——用户最想看到的
+    # 就是这个数。浅克隆里数出来是骗人的，所以浅克隆不数。
+    behind = 0
+    if branch and not info.shallow:
+        code, out, _ = run_git(["rev-list", "--count", f"HEAD..{name}/{branch}"],
+                               info.root, timeout=timeout)
+        if code == 0 and out.strip():
+            behind = int(out.strip().split()[0])
     return OfficialStatus(ok=True, remote=name, url=url, version=best_version,
-                          tag=best_tag, branch=branch, head=head)
+                          tag=best_tag, branch=branch, head=head, behind=behind)
 
 
 def tracking_remote(info: RepoInfo) -> str:

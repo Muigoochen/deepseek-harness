@@ -172,5 +172,31 @@ class VersionKeyEdgeTest(unittest.TestCase):
         self.assertGreater(gi.version_key("0.1.6"), gi.version_key("0.1.6-rc.9"))
 
 
+class OfficialGapTest(unittest.TestCase):
+    """能数出「离官方还差多少」就报出来；数不出来（浅克隆/没取过官方引用）就不报数字。"""
+
+    def _status(self, official):
+        return gi.UpdateStatus(ok=True, behind=0, branch="plugins", remote="origin",
+                               upstream="origin/plugins", official=False,
+                               version="0.1.2-alpha.3", official_status=official)
+
+    def _official(self, behind=0):
+        return gi.OfficialStatus(ok=True, remote="upstream", url=OFFICIAL,
+                                 version="0.1.6-alpha.2", tag="dsh-v0.1.6-alpha.2",
+                                 branch="master", head="ddefc45", behind=behind)
+
+    def test_gap_is_shown_when_it_can_be_counted(self):
+        text, color = installer.update_summary(self._status(self._official(3482)))
+        self.assertIn("还差 3482 个提交", text)
+        self.assertIn("从官方更新", text, "顺带告诉用户该点哪儿")
+        self.assertEqual(color, "#a05a00")
+
+    def test_no_gap_number_when_it_is_unknown(self):
+        text, _ = installer.update_summary(self._status(self._official()))
+        self.assertNotIn("还差", text)
+        self.assertIn("你自己的仓库没有新提交", text)
+        self.assertNotIn("你的分支无新提交", text, "旧说法容易被读成「没活干」")
+
+
 if __name__ == "__main__":
     unittest.main()
