@@ -299,32 +299,22 @@ def build_variables(project: Path, log=log_line,
                     base: dict | None = None) -> dict[str, str]:
     """`pnpm run build` 缺的**那几项**环境变量（只返回要补的，不返回整份环境）。
 
-    构建脚本有两处依赖"外面给的东西"，而在小助手安装出来的目录里两者都可能没有：
+    构建脚本有一处依赖"外面给的东西"，而在小助手安装出来的目录里它可能没有：
       · `DSH_CLIENT_COMMIT_HASH`——`repositoryCommitHash()` 优先读它，没有再
         `git rev-parse HEAD`；而**离线解压的源码没有 `.git`**（实测构建因此退出 1）。
         取值：`assets/source-commit.txt` 里记了真提交号就用真的，没有就用全 0 占位并说明。
-      · `npm_execpath`——`pnpmInvocation()` 拿它再调 pnpm 子脚本，缺失同样是致命错误。
-    只补缺的、已有的一律不动，也不整份替换环境：实测 `dict(os.environ)` 可能漏掉
-    进程真实持有的变量（Windows 上就漏过 `npm_execpath`），整份替换会把变量悄悄弄丢。
+
+    **绝对不要补 `npm_execpath`**（这条是花钱买来的）：构建脚本 `pnpmInvocation()` 拿它再调
+    pnpm 子脚本，看起来"缺失就该补"，于是早先真这么补了——结果它**正是**构建失败的病根。
+    在同一台机器、同一个工作树上逐条对拍（都走小助手自己的 `run_cli`）：
+      不补 → 构建正常；补成全局 pnpm 的入口（`…\\pnpm\\bin\\pnpm.mjs`）→ 2 秒就抛
+      "pnpm invocation: npm_execpath is unavailable" 退出 1；不补、直接 `node <入口>` → 同样抛。
+    也就是说 pnpm 自己被启动后会按自己的规则给脚本注入正确的值，外面塞一个反而让它认不出。
+    这里同样不整份替换环境：实测 `dict(os.environ)` 会漏掉进程真实持有的变量。
     `base` 只给测试用；不传就看进程环境。
     """
-    current = os.environ if base is None else base
+    _ = base                           # 只为兼容老调用/测试的签名，现在不再读环境
     extras: dict[str, str] = {}
-    entry = current.get("npm_execpath", "")
-    # 只在"没有"或"指向的文件已经不在了"时才替换：构建脚本要用的是**启动它的那个 pnpm**，
-    # 它可能来自项目本地或 corepack，版本和全局那份未必相同；能用就别动它。
-    # 真机那次构建报 "npm_execpath is unavailable"，根因是 pnpm_execpath() 找不到入口
-    # （原来只靠 `npm root -g`，在 GUI 进程里不可靠），所以修的是"入口查找"，
-    # 而不是无脑覆盖调用方的选择。
-    if not entry or not Path(entry).exists():
-        resolved = pnpm_execpath()
-        if resolved and resolved != entry:
-            extras["npm_execpath"] = resolved
-            log(f"  补齐 npm_execpath = {resolved}"
-                + (f"（原值不可用：{entry}）" if entry else "（原环境里没有）"))
-        elif not resolved:
-            log("  ⚠ 找不到 pnpm 的入口；构建脚本 scripts/pnpm-invocation.ts 可能报"
-                " npm_execpath is unavailable")
     if not (project / ".git").exists():
         marker = commit_marker or (SOURCE_ARCHIVE.parent / "source-commit.txt")
         raw = ""
@@ -1489,31 +1479,20 @@ class Engine:
             return
         self.log("⑥ 编译项目（本地编译、不联网；首次约 5–15 分钟）…")
         extras = build_variables(project, self.log)
-        # 真机连续两次死在构建脚本那句 "npm_execpath is unavailable"（脚本只在它空/缺失时抛），
-        # 而管道本身在别的机器上验过是通的。所以这里把**两边的事实都写进日志文件**：
-        # 我们准备传什么、进程环境里当时是什么。下次失败就不用再猜是哪一层丢的。
-        entry = pnpm_execpath()
-        log_line(f"[构建] npm_execpath 准备值 = {extras.get('npm_execpath') or '（没准备）'}；"
-                 f"环境当时 = {os.environ.get('npm_execpath') or '（空）'}；"
-                 f"当前 pnpm 入口 = {entry or '（找不到）'}")
+        # 实测结论（同一台机器逐条对拍）：**补 npm_execpath 反而让构建死**，
+        # 不补就正常——pnpm 给自己脚本注入的是它认的值，外面塞一个它不认。
+        # 所以这里只记录现场，绝不替调用方设置它。失败弹窗也带上这几行。
+        log_line(f"[构建] 本进程 npm_execpath = {os.environ.get('npm_execpath') or '（空）'}；"
+                 f"要补的变量 = {extras or '（无）'}；本机 pnpm 入口 = "
+                 f"{pnpm_execpath() or '（找不到）'}")
         with temporary_environment(extras):
             proc = run_cli(["pnpm", "run", "build"], cwd=project)
         text = decode_proc(proc)
-        if proc.returncode != 0 and "npm_execpath is unavailable" in text and entry:
-            # 换一条不经过 cmd 的 pnpm shim 的路：直接用 node 跑 pnpm 的入口。
-            # pnpm 无论是被谁启动，都会给自己的脚本注入 npm_execpath（实测过），
-            # 而 shim 那层在真机上正是可疑的一段。
-            self.log("  构建报 npm_execpath 缺失，改用 node 直跑 pnpm 入口再试一次…")
-            with temporary_environment(extras):
-                proc = run_cli(["node", entry, "run", "build"], cwd=project)
-            text = decode_proc(proc)
-            log_line(f"[构建] 直跑 pnpm 入口重试后退出码 = {proc.returncode}")
         if proc.returncode != 0:
-            # 把这台机器上的两个事实一起报出去：真机连续两次死在这句话上，光看报错看不出
-            # 是哪一层丢的值。弹窗里带上它，用户截个图就能定位，不必再去翻日志。
-            where = (f"\n\n（诊断）准备传的 npm_execpath = {extras.get('npm_execpath') or '（没准备）'}"
-                     f"\n（诊断）进程环境里当时 = {os.environ.get('npm_execpath') or '（空）'}"
-                     f"\n（诊断）本机 pnpm 入口 = {entry or '（找不到）'}")
+            where = (f"\n\n（诊断）本进程 npm_execpath = "
+                     f"{os.environ.get('npm_execpath') or '（空）'}"
+                     f"\n（诊断）要补的变量 = {extras or '（无）'}"
+                     f"\n（诊断）本机 pnpm 入口 = {pnpm_execpath() or '（找不到）'}")
             raise InstallError(f"构建失败：\n{text}{where}")
         self.log("  构建完成 ✓")
 

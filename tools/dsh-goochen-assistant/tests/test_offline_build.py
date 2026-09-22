@@ -3,10 +3,15 @@
 
 离线源码包是 tar 解出来的，**没有 .git**，而 `pnpm run build` 会执行
 `git rev-parse HEAD`（`scripts/client-build-environment.ts` 的 `repositoryCommitHash`），
-于是整个离线安装卡在最后一步、退出码 1。修好它之后又露出第二个：`scripts/build.ts`
-把 `pnpmInvocation()` 的结果交给 `spawnSync`，而 `pnpmInvocation()` 要求环境里有
-`npm_execpath`——它**只有 pnpm 自己跑脚本时才注入**，干净机器上没有，同样致命。
-两个值都由小助手补齐（不改仓库任何代码），且只补缺的、用完还原。
+于是整个离线安装卡在最后一步、退出码 1。现在补的是 `DSH_CLIENT_COMMIT_HASH`，用完还原
+（不改仓库任何代码）。
+
+**`npm_execpath` 千万不要补**——这里记着这笔学费：它看起来"缺失就该补"（`scripts/build.ts`
+的 `pnpmInvocation()` 只在它空/没有时抛错），早先真补了，结果它正是构建失败的病根。
+逐条对拍（同一台机器、同一工作树、都走小助手自己的 `run_cli`）：
+  不补 → 构建正常；补成全局 pnpm 的入口（`…\\pnpm\\bin\\pnpm.mjs`）→ 2 秒抛
+  "pnpm invocation: npm_execpath is unavailable" 退出 1；改用 `node <入口>` 但照样补 → 一样抛。
+pnpm 被启动后会按自己的规则给脚本注入它认的值，外面塞一个它反而认不出。
 
 注：测试都把"当前环境"显式传进去。Windows 上 `mock.patch.dict(os.environ, …)` 改出来的值
 `dict(os.environ)` 看不见（实测），用传参才不会测出假结果。
@@ -74,31 +79,25 @@ class BuildVariablesTest(unittest.TestCase):
         self.assertRegex(extras["DSH_CLIENT_COMMIT_HASH"], HEX)
         self.assertTrue(any("占位值" in line for line in self.logs), self.logs)
 
-    def test_missing_npm_execpath_is_supplied(self):
+    def test_npm_execpath_is_never_supplied(self):
+        """**这是那次构建失败的病根**：不管环境里有没有、可不可用，都不许补它。
+
+        逐条对拍（同一台机器、同一工作树、都走 run_cli）：不补 → 构建正常；
+        补成全局 pnpm 的入口 → 2 秒抛 "npm invocation: npm_execpath is unavailable"。
+        """
         entry = r"C:\fake\node_modules\pnpm\bin\pnpm.mjs"
         with mock.patch.object(installer, "pnpm_execpath", lambda: entry):
-            extras = self._extras({})
-        self.assertEqual(extras["npm_execpath"], entry)
-        self.assertTrue(any("npm_execpath" in line for line in self.logs), self.logs)
+            for base in ({}, {"npm_execpath": ""},
+                         {"npm_execpath": str(self.given)},
+                         {"npm_execpath": r"E:\.pnpm-store\gone\pnpm.mjs"}):
+                extras = self._extras(base)
+                self.assertNotIn("npm_execpath", extras,
+                                 f"补它正是构建失败的原因（环境={base!r}）")
 
-    def test_existing_npm_execpath_is_left_alone(self):
-        given = self.root / "pnpm.mjs"
-        given.write_text("// pnpm\n", encoding="utf-8")
-        with mock.patch.object(installer, "pnpm_execpath", lambda: r"C:\other\pnpm.mjs"):
-            extras = self._extras({"npm_execpath": str(given)})
-        self.assertNotIn("npm_execpath", extras, "可用就不要覆盖")
-
-    def test_stale_npm_execpath_is_replaced(self):
-        entry = r"C:\fake\node_modules\pnpm\bin\pnpm.mjs"
-        with mock.patch.object(installer, "pnpm_execpath", lambda: entry):
-            extras = self._extras({"npm_execpath": r"E:\.pnpm-store\gone\pnpm.mjs"})
-        self.assertEqual(extras["npm_execpath"], entry,
-                         "指向已经不存在的文件时，要换成这台机器上真实的入口")
-        self.assertTrue(any("原值不可用" in line for line in self.logs), self.logs)
-
-    def test_unresolvable_npm_execpath_does_not_invent_one(self):
-        (self.root / ".git").mkdir()
-        self.assertEqual(self._extras({}), {}, "查不到入口就什么都别加，让构建自己如实报错")
+    def test_offline_source_gets_only_the_commit_hash(self):
+        extras = self._extras({})
+        self.assertEqual(list(extras), ["DSH_CLIENT_COMMIT_HASH"],
+                         "离线源码该补的只有提交号这一项")
 
 
 class TemporaryEnvironmentTest(unittest.TestCase):

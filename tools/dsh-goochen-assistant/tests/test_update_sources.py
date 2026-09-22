@@ -876,12 +876,13 @@ class TransientRetryTest(unittest.TestCase):
 
 
 class PnpmExecpathTest(unittest.TestCase):
-    """构建报 "npm_execpath is unavailable" 的根：小助手自己没把 pnpm 入口补对。
+    """pnpm 的 JS 入口在哪——只用于诊断，**不再往构建里塞**。
 
-    `scripts/pnpm-invocation.ts` 只在 npm_execpath **空或没有**时抛那句话，而真机更新就死在
-    这句上。原实现只靠 `npm root -g` 去找 pnpm，那条路要起一个 npm.cmd 子进程，在 GUI 进程里
-    不可靠（PATH 不全会失败）。现在按"PATH 上 pnpm shim 的同级目录 → %APPDATA%\\npm →
-    npm root -g"的顺序找。
+    真机连续几轮构建失败，最后逐条对拍才定案：那句 "pnpm invocation: npm_execpath is
+    unavailable" 的根因**就是小助手自己补了 npm_execpath**。同一台机器、同一个工作树、都走
+    小助手自己的 `run_cli`：不补 → 构建正常；补成全局 pnpm 的入口 → 2 秒抛错退出 1；
+    改用 `node <入口>` 但照样补 → 一样抛。pnpm 被启动后会按自己的规则给脚本注入它认的值，
+    外面塞一个它反而认不出。所以这里锁两件事：入口还找得到（诊断用），以及**绝不**再补。
     """
 
     def setUp(self) -> None:
@@ -905,65 +906,36 @@ class PnpmExecpathTest(unittest.TestCase):
             self.assertEqual(installer.pnpm_execpath(), "",
                              "找不到就如实返回空串，别编一个假路径")
 
-    def test_build_variables_replaces_a_stale_entry(self):
-        """环境里那个值指向一个已经不在的文件时，必须补成这台机器上真存在的入口。
-
-        真机那次构建抛 "npm_execpath is unavailable"，根因就是入口没找到——
-        这里锁住"过期值一定要换掉"，同时不碰"可用值"（那条由老测试守着）。
-        """
-        extras = installer.build_variables(self.tmp, log=lambda _m: None,
-                                           base={"npm_execpath": r"C:\stale\pnpm.mjs"})
-        self.assertIn("npm_execpath", extras)
-        self.assertTrue(Path(extras["npm_execpath"]).exists(),
-                        "补进去的必须是真存在的入口")
+    def test_build_variables_never_touches_npm_execpath(self):
+        """这次失败的病根就是"好心地补一下"，所以四种环境都不许补。"""
+        envs = ({}, {"npm_execpath": ""}, {"npm_execpath": r"C:\stale\pnpm.mjs"},
+                {"npm_execpath": installer.pnpm_execpath()})
+        for base in envs:
+            extras = installer.build_variables(self.tmp, log=lambda _m: None, base=base)
+            self.assertNotIn("npm_execpath", extras,
+                             f"补它正是构建失败的原因（环境={base!r}）")
 
 
-class BuildRetryTest(unittest.TestCase):
-    """构建报 npm_execpath 缺失时，换一条不经过 cmd shim 的路再试一次。
-
-    真机连续两次死在这句话上，而管道本身验过是通的；shim 那层是最可疑的一段，
-    所以失败就改用 `node <pnpm 入口> run build` 重试，并把两边的事实写进日志文件。
-    """
+class BuildEnvUntouchedTest(unittest.TestCase):
+    """构建期间进程环境里的 npm_execpath 必须原样不动——我们不许动它。"""
 
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-buildretry-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-buildenv-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def test_retries_through_the_pnpm_entrypoint(self):
-        calls: list[list[str]] = []
+    def test_build_leaves_npm_execpath_alone(self):
+        seen: list = []
 
         def fake(argv, cwd=None, **kwargs):
-            calls.append(list(argv))
-            if len(calls) == 1:
-                return installer.subprocess.CompletedProcess(
-                    argv, 1, b"", b"Error: pnpm invocation: npm_execpath is unavailable")
+            seen.append(installer.os.environ.get("npm_execpath"))
             return installer.subprocess.CompletedProcess(argv, 0, b"", b"")
 
-        entry = str(self.tmp / "pnpm.mjs")
         eng = installer.Engine("auto", use_mirror=True, log=lambda _m: None)
         with mock.patch.object(installer, "run_cli", side_effect=fake), \
-                mock.patch.object(installer, "pnpm_execpath", lambda: entry), \
-                mock.patch.object(installer, "build_variables", lambda *a, **k: {}):
+                mock.patch.dict(installer.os.environ, {}, clear=False):
+            installer.os.environ.pop("npm_execpath", None)
             eng.build(self.tmp, force=True)
-        self.assertEqual(len(calls), 2, "应该重试一次")
-        self.assertEqual(calls[0][:2], ["pnpm", "run"])
-        self.assertEqual(calls[1][:2], ["node", entry], "重试要走 node 直跑 pnpm 入口")
-
-    def test_does_not_retry_other_failures(self):
-        calls: list[list[str]] = []
-
-        def fake(argv, cwd=None, **kwargs):
-            calls.append(list(argv))
-            return installer.subprocess.CompletedProcess(argv, 1, b"", b"TypeError: other")
-
-        entry = str(self.tmp / "pnpm.mjs")
-        eng = installer.Engine("auto", use_mirror=True, log=lambda _m: None)
-        with mock.patch.object(installer, "run_cli", side_effect=fake), \
-                mock.patch.object(installer, "pnpm_execpath", lambda: entry), \
-                mock.patch.object(installer, "build_variables", lambda *a, **k: {}):
-            with self.assertRaises(installer.InstallError):
-                eng.build(self.tmp, force=True)
-        self.assertEqual(len(calls), 1, "不是这个问题就别浪费时间重试")
+        self.assertEqual(seen, [None], "构建期间不许往环境里塞 npm_execpath")
 
 
 class DepsChangeTest(unittest.TestCase):
