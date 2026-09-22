@@ -838,7 +838,7 @@ class TransientRetryTest(unittest.TestCase):
     def test_retries_a_flaky_registry_once(self):
         calls: list = []
 
-        def fake(argv, cwd=None, env=None):
+        def fake(argv, cwd=None, env=None, **kwargs):
             calls.append(list(argv))
             if len(calls) == 1:
                 return installer.subprocess.CompletedProcess(
@@ -856,7 +856,7 @@ class TransientRetryTest(unittest.TestCase):
     def test_first_attempt_prefers_cache_but_may_download(self):
         seen: list = []
 
-        def fake(argv, cwd=None, env=None):
+        def fake(argv, cwd=None, env=None, **kwargs):
             seen.append(list(argv))
             return installer.subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -869,7 +869,7 @@ class TransientRetryTest(unittest.TestCase):
     def test_offline_mode_keeps_a_strict_attempt(self):
         seen: list = []
 
-        def fake(argv, cwd=None, env=None):
+        def fake(argv, cwd=None, env=None, **kwargs):
             seen.append(list(argv))
             return installer.subprocess.CompletedProcess(argv, 0, "", "")
 

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -954,7 +955,7 @@ class InterruptedInstallTest(unittest.TestCase):
         installer.set_active_dir(project)
         calls: list[list[str]] = []
 
-        def fake_run_cli(argv, cwd=None, env=None):
+        def fake_run_cli(argv, cwd=None, env=None, **kwargs):
             calls.append(list(argv))
             return subprocess.CompletedProcess(argv, 0, b"", b"")
 
@@ -982,7 +983,7 @@ class InterruptedInstallTest(unittest.TestCase):
         installer.set_active_dir(project)
         calls: list[list[str]] = []
 
-        def fake_run_cli(argv, cwd=None, env=None):
+        def fake_run_cli(argv, cwd=None, env=None, **kwargs):
             calls.append(list(argv))
             return subprocess.CompletedProcess(argv, 0, b"", b"")
 
@@ -1000,7 +1001,7 @@ class InterruptedInstallTest(unittest.TestCase):
         installer.set_active_dir(project)
         installer.set_interrupted_target(str(project))
 
-        def fake_run_cli(argv, cwd=None, env=None):
+        def fake_run_cli(argv, cwd=None, env=None, **kwargs):
             return subprocess.CompletedProcess(argv, 0, b"", b"")
 
         with mock.patch.object(installer, "run_cli", fake_run_cli), \
@@ -1223,7 +1224,7 @@ class InstallPnpmTest(unittest.TestCase):
     def test_uses_resolved_paths_instead_of_bare_names(self):
         calls: list[list[str]] = []
 
-        def fake_run(argv, cwd=None, env=None):
+        def fake_run(argv, cwd=None, env=None, **kwargs):
             calls.append(list(argv))
             return subprocess.CompletedProcess(argv, 0, b"", b"")
 
@@ -1254,8 +1255,8 @@ class InstallPnpmTest(unittest.TestCase):
                                   lambda: r"C:\Program Files\nodejs\npm.CMD"), \
                 mock.patch.object(installer.shutil, "which", lambda n: None), \
                 mock.patch.object(installer, "run",
-                                  lambda argv, cwd=None, env=None: subprocess.CompletedProcess(
-                                      argv, 0, b"", b"")):
+                                  lambda argv, cwd=None, env=None, **kwargs:
+                                  subprocess.CompletedProcess(argv, 0, b"", b"")):
             with self.assertRaises(installer.InstallError) as ctx:
                 self._engine().install_pnpm()
         self.assertIn("PATH", str(ctx.exception), "要说清是 PATH 里找不到，并给出下一步")
@@ -1266,6 +1267,87 @@ class InstallPnpmTest(unittest.TestCase):
             with self.assertRaises(installer.InstallError) as ctx:
                 self._engine().install_pnpm()
         self.assertIn("找不到 npm", str(ctx.exception))
+
+
+class TimeoutAndHousekeepingTest(unittest.TestCase):
+    """长任务必须有上限；随包下载物要能自己清干净。
+
+    评审指出的两条：① `pnpm install` 在网络半死时会一直挂着，界面除关窗没有任何取消入口；
+    ② `downloads/*.msi` 与 `assets/.cache/*.tgz` 永不清理，Node MSI 一份就几十 MB。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-timeout-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_install_deps_times_out_with_a_readable_reason(self):
+        project = self.tmp / "app"
+        (project / "node_modules").mkdir(parents=True)
+        calls: list[float] = []
+
+        def fake(argv, cwd=None, env=None, **kwargs):
+            calls.append(kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd="pnpm install", timeout=1)
+
+        eng = installer.Engine(mode="auto", use_mirror=True, log=lambda _m: None)
+        with mock.patch.object(installer, "run_cli", fake):
+            with self.assertRaises(installer.InstallError) as ctx:
+                eng.install_deps(project, force=True)
+        self.assertTrue(calls and calls[0], "必须给一个明确的上限，不能无限等")
+        self.assertIn("分钟", str(ctx.exception), "要说清是超时，并给出下一步")
+
+    def test_build_times_out_with_a_readable_reason(self):
+        seen: list[float] = []
+
+        def fake(argv, cwd=None, env=None, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd="pnpm run build", timeout=1)
+
+        eng = installer.Engine(mode="auto", use_mirror=True, log=lambda _m: None)
+        with mock.patch.object(installer, "run_cli", fake), \
+                mock.patch.object(installer, "build_variables", lambda *a, **k: {}):
+            with self.assertRaises(installer.InstallError) as ctx:
+                eng.build(self.tmp, force=True)
+        self.assertTrue(seen and seen[0], "构建也要有上限")
+        self.assertIn("分钟", str(ctx.exception))
+
+    def test_run_cli_quotes_arguments_with_the_platform_rules(self):
+        """引号交给 subprocess.list2cmdline，别手写拼接（含空格的路径是常事）。"""
+        captured: list[str] = []
+
+        def fake(cmdline, cwd=None, env=None, shell=False, **kwargs):
+            captured.append(cmdline)
+            return subprocess.CompletedProcess(cmdline, 0, b"", b"")
+
+        argv = ["pnpm", "install", "--store-dir", r"E:\my store\v11"]
+        with mock.patch.object(installer.childproc, "run", fake):
+            installer.run_cli(argv, cwd=self.tmp)
+        expected = subprocess.list2cmdline(argv) if os.name == "nt" else None
+        if expected is not None:
+            self.assertEqual(captured, [expected])
+
+    def test_stale_downloads_are_removed_and_fresh_ones_kept(self):
+        downloads = self.tmp / "downloads"
+        cache = self.tmp / "assets" / ".cache"
+        downloads.mkdir(parents=True)
+        cache.mkdir(parents=True)
+        old = downloads / "node-old.msi"
+        fresh = downloads / "node-fresh.msi"
+        old_tgz = cache / "plug.tgz"
+        for path in (old, fresh, old_tgz):
+            path.write_bytes(b"x" * 16)
+        ancient = time.time() - 90 * 86400
+        os.utime(old, (ancient, ancient))
+        os.utime(old_tgz, (ancient, ancient))
+
+        with mock.patch.object(installer, "HERE", self.tmp), \
+                mock.patch.object(installer, "ASSETS", self.tmp / "assets"):
+            removed = installer.clean_stale_downloads(days=30)
+        self.assertIn(str(old), removed)
+        self.assertIn(str(old_tgz), removed)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists(), "最近用过的不能删")
+        self.assertNotIn(str(fresh), removed)
 
 
 class SaveConfigAtomicTest(unittest.TestCase):

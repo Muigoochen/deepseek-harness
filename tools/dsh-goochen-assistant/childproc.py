@@ -282,7 +282,12 @@ def run(argv: Any, *, cwd: Optional[Any] = None, env: Optional[dict] = None,
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         kill_tree(proc, timeout=5)         # 超时的命令不能留着继续跑
-        out, err = proc.communicate()
+        # 第二次 communicate 也必须带超时：taskkill 没杀成功时（权限、进程卡在内核）
+        # 这里会**无限等**，于是"超时保护"本身变成了挂死的入口。
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out, err = b"", b""
         raise
     finally:
         untrack(proc)

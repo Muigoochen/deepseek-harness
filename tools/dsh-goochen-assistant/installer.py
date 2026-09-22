@@ -135,6 +135,15 @@ WRAP_LEFT = 396
 SASH_PX = 6
 #: 日志区最多保留多少行（长时间跑安装/服务时不让 Text 无上限增长）。
 LOG_MAX_LINES = 5000
+# 长任务的**上限**（秒）。这些命令几分钟到几十分钟是正常的，所以给得很宽；但**必须有**：
+# 网络半死时 `pnpm install` 可以永久挂着，而界面里除了关窗没有任何取消入口——用户只能
+# 看着它不动、又不敢关。到点会杀掉整棵进程树并在日志里说清停在哪一步。
+INSTALL_TIMEOUT = 3600          # pnpm install（含冷 store 首次装全量依赖）
+BUILD_TIMEOUT = 2400            # pnpm run build（真机 5–15 分钟，给足余量）
+CLONE_TIMEOUT = 1800            # git clone 官方源码
+PNPM_INSTALL_TIMEOUT = 900      # npm install -g pnpm 装 pnpm 自己
+START_TIMEOUT = 180             # 启动服务后读登录地址的等待；服务本身不限时
+STALE_DOWNLOAD_DAYS = 30        # 随包下载物（Node MSI / 插件 tgz）多久没用到就清掉
 
 #: 安装方式的短名——折叠起来之后，标题上仍要看得出现在选的是哪个。
 MODE_CN = {
@@ -364,20 +373,31 @@ def temporary_environment(extras: dict[str, str]):
 
 
 def run(argv: list[str], cwd: Path | None = None,
-        env: dict | None = None) -> subprocess.CompletedProcess:
-    """跑一条命令（阻塞到结束）；句柄登记在册，关窗时会被一起结束。"""
-    return childproc.run(argv, cwd=cwd, env=env)
+        env: dict | None = None, timeout: float | None = None,
+        ) -> subprocess.CompletedProcess:
+    """跑一条命令（阻塞到结束）；句柄登记在册，关窗时会被一起结束。
+
+    `timeout` 到点会**杀掉整棵进程树**并抛 `subprocess.TimeoutExpired`（由 childproc 保证）。
+    长任务必须给一个上限：否则网络半死时 `pnpm install` 会一直挂着，界面只有关窗能停。
+    """
+    return childproc.run(argv, cwd=cwd, env=env, timeout=timeout)
 
 
 def run_cli(argv: list[str], cwd: Path | None = None,
-            env: dict | None = None) -> subprocess.CompletedProcess:
-    """Windows 下经 cmd shell 执行（能解析 pnpm.cmd 等批处理），
-    其他平台退化到原生 run()。GUI 进程/线程都可用。"""
+            env: dict | None = None, timeout: float | None = None,
+            ) -> subprocess.CompletedProcess:
+    """Windows 下经 cmd shell 执行（能解析 pnpm.cmd 等批处理），其他平台退化到原生 run()。
+
+    引号交给 `subprocess.list2cmdline`（cmd 的转义规则它最准），不再手写拼接。有一个 cmd
+    的固有行为要记住：**双引号里的 `%NAME%` 仍会被展开**。所以参数里出现 `%` 时只记一行
+    提醒（路径里带 % 的目录极少见），不假装已经处理好了——绝不能悄悄改错路径。
+    """
     if os.name == "nt":
-        cmdline = " ".join(f'"{a}"' if (" " in a or a.endswith((".cmd", ".exe"))) and not a.startswith('"') else a
-                           for a in argv)
-        return childproc.run(cmdline, cwd=cwd, env=env, shell=True)
-    return run(argv, cwd=cwd, env=env)
+        if any("%" in arg for arg in argv):
+            log_line("[命令] ⚠ 参数里含 %：cmd 会把它当变量展开，路径可能被改写")
+        return childproc.run(subprocess.list2cmdline(argv), cwd=cwd, env=env,
+                             shell=True, timeout=timeout)
+    return run(argv, cwd=cwd, env=env, timeout=timeout)
 
 
 def run_text(argv: list[str], cwd: Path | None = None,
@@ -1183,6 +1203,31 @@ class InstallError(RuntimeError):
     pass
 
 
+def clean_stale_downloads(*, days: int = STALE_DOWNLOAD_DAYS) -> list[str]:
+    """清掉很久没用到的随包下载物（`downloads/*.msi`、`assets/.cache/*.tgz`）。
+
+    这些东西只在"机器上还没有 Node / 要把插件打包上传"时才用得上；不清理就会一直占盘
+    （一份 Node MSI 几十 MB，插件 tgz 会一份一份攒起来）。最近用过的**一律不动**——
+    只删 mtime 超过 `days` 天的，免得刚下载完就被清掉。返回被删掉的路径，供日志记录。
+    """
+    removed: list[str] = []
+    cutoff = time.time() - days * 86400
+    for folder, pattern in ((HERE / "downloads", "*.msi"),
+                            (ASSETS / ".cache", "*.tgz")):
+        try:
+            items = sorted(folder.glob(pattern))
+        except OSError:
+            continue
+        for item in items:
+            try:
+                if item.is_file() and item.stat().st_mtime < cutoff:
+                    item.unlink()
+                    removed.append(str(item))
+            except OSError:
+                continue
+    return removed
+
+
 class Engine:
     """核心安装流程：由 worker 线程执行，log 回调发回 UI。"""
 
@@ -1332,7 +1377,7 @@ class Engine:
             last = index == len(attempts) - 1
             self.log(f"  → 尝试{name}：npm install -g "
                      f"{spec if spec in argv else PNPM_TGZ_ASSET.name}")
-            proc = run(argv)
+            proc = run(argv, timeout=PNPM_INSTALL_TIMEOUT)
             if proc.returncode == 0:
                 self.log(f"  ✓ {name} 装好了 pnpm")
                 break
@@ -1420,7 +1465,8 @@ class Engine:
             for index, (name, url) in enumerate(attempts):
                 last = index == len(attempts) - 1
                 self.log(f"  → 尝试{name} clone：{url}")
-                proc = run([git, "clone", "--depth", "1", url, str(project)])
+                proc = run([git, "clone", "--depth", "1", url, str(project)],
+                           timeout=CLONE_TIMEOUT)
                 if proc.returncode == 0:
                     self.log(f"  ✓ {name} clone 完成")
                     break
@@ -1500,7 +1546,14 @@ class Engine:
         for index, (name, argv) in enumerate(attempts):
             last = index == len(attempts) - 1
             self.log(f"  → 尝试{name}：{' '.join(argv)}")
-            proc = run_cli(argv, cwd=project)
+            try:
+                proc = run_cli(argv, cwd=project, timeout=INSTALL_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                raise InstallError(
+                    f"{name} 超过 {INSTALL_TIMEOUT // 60} 分钟还没结束，已强制结束它。\n\n"
+                    "常见原因：网络半死（拉包卡住）、杀毒软件拦住 pnpm、磁盘满。\n"
+                    "可以点【重装依赖并构建】重试；installer.log 里能看到它停在哪一步。"
+                ) from None
             if proc.returncode == 0:
                 self.log(f"  ✓ {name} 依赖安装完成")
                 return
@@ -1549,7 +1602,14 @@ class Engine:
                  f"要补的变量 = {extras or '（无）'}；本机 pnpm 入口 = "
                  f"{pnpm_execpath() or '（找不到）'}")
         with temporary_environment(extras):
-            proc = run_cli(["pnpm", "run", "build"], cwd=project)
+            try:
+                proc = run_cli(["pnpm", "run", "build"], cwd=project, timeout=BUILD_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                raise InstallError(
+                    f"构建超过 {BUILD_TIMEOUT // 60} 分钟还没结束，已强制结束它。\n\n"
+                    "常见原因：内存不足（tsc 被杀）、杀毒软件在扫描、磁盘满。\n"
+                    "可以点【重装依赖并构建】重试；installer.log 里能看到它停在哪一步。"
+                ) from None
         text = decode_proc(proc)
         if proc.returncode != 0:
             where = (f"\n\n（诊断）本进程 npm_execpath = "
@@ -2499,6 +2559,9 @@ class App(tk.Tk):
         if ok:
             self._log_work(f"[回退] ✓ {detail}")
             self._set_label(self.git_note, f"✓ {detail}", "#1a6b1a")
+            # 先问会话数据，再问依赖和构建：会话格式升级是**单向**的，代码回退了它不会跟着
+            # 回退，旧代码可能根本读不了新格式的会话——真机"回退后运行不了"里就有这一层。
+            self._offer_session_restore_after_rollback()
             # 回退只动源码：node_modules 和构建产物还留着"更新后"那一版，两边对不上就会
             # 起不来。真机就是"回退后运行不了，重启小助手才行"——所以这里主动问一句。
             rebuild = messagebox.askyesno(
@@ -2516,6 +2579,39 @@ class App(tk.Tk):
             self._set_label(self.git_note, "回退失败（见日志）", "#b00000")
             messagebox.showerror("回退失败", detail, parent=self)
         self._schedule_git_refresh(200)
+
+    def _offer_session_restore_after_rollback(self) -> None:
+        """回退之后问一句：会话数据要不要也退回去。
+
+        代码能回退，**会话格式不能**：0.1.2 → 0.1.6 会把会话从 v0 升到 v3，而迁移链是单向的
+        （`sessiondata.py` 开头就写着这条）。更新之前我们会做一份冷备份，但那份备份不会自己
+        回来；用户以为"回退 = 完全还原"，结果旧代码读不了新格式的会话。所以在这里问一句，
+        并且把"备份之后新建的会话会丢"说清楚。
+        """
+        project = self._effective_dir()
+        if port_in_use():
+            self._log_work("[回退] 服务在跑，跳过会话还原（会话正在被写，覆盖只会得到半截数据）")
+            return
+        try:
+            snaps = sdata.list_snapshots(install_dir=project)
+        except Exception as exc:  # noqa: BLE001  读不到备份不该影响回退本身
+            self._log_work(f"[回退] 读会话备份失败，跳过这一步：{exc}")
+            return
+        if not snaps:
+            return
+        newest = snaps[0]
+        if not messagebox.askyesno(
+                "会话数据要一起退回去吗？",
+                "代码已经回到更新前了。\n\n"
+                "会话数据的格式在更新时可能被升级过（v0 → v3，**迁移是单向的**），"
+                "旧代码不一定读得了新格式的会话。\n\n"
+                f"最近这份会话备份：\n  时间：{newest.created_at}\n"
+                f"  体量：{newest.size_text}\n  位置：{newest.path}\n\n"
+                "要把它还原回去吗？（推荐；这份备份之后新建的会话会丢失）",
+                parent=self):
+            return
+        ok, text = sdata.restore(newest.path, log=self._log_work)
+        self._log_work(("[回退] ✓ 会话数据已还原：" if ok else "[回退] ✗ 会话还原失败：") + text)
 
     def _set_label(self, widget, text: str, color: str) -> None:
         try:
@@ -3418,7 +3514,14 @@ class App(tk.Tk):
             self._post(self._update_web_buttons)
             self._post(self._poll_pending_open)
             self._post(self._update_run_buttons)
-            self._post(self._status, "就绪")
+            # 进程已经退出，状态**不能**再说"就绪"：真机现象是服务其实死了、界面还亮着绿的，
+            # 用户以为在跑、其实打不开页面。按退出码说实话。
+            code = proc.returncode
+            if not code:
+                self._post(self._status, "已停止")
+            else:
+                self._post(self._status,
+                           f"服务已退出（退出码 {code}，原因见上面的日志）", "#b00000")
 
     def on_stop_terminal(self) -> None:
         """终止窗口内运行的 dsh web（连同其子进程树）。"""
@@ -4955,6 +5058,10 @@ def main() -> int:
     args = [a.lower() for a in sys.argv[1:]]
     if "--selfcheck" in args:
         return selfcheck()
+    # 顺手清掉很久没用到的随包下载物（Node MSI / 插件 tgz）：它们只在下一次需要时才用得上，
+    # 一直留着会白占盘。只删 30 天没用过的，最近用过的一律不动。
+    for gone in clean_stale_downloads():
+        log_line(f"[清理] 删掉很久没用到的下载文件：{gone}")
     if "--headless" in args:
         mode = "auto"
         for cand in ("online", "offline"):
