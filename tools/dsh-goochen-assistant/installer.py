@@ -2185,6 +2185,18 @@ class App(tk.Tk):
         self.git_busy = False
         self._set_git_buttons(True)
         if not status.ok:
+            official = getattr(status, "official_status", None)
+            if official is not None and official.ok:
+                # 跟踪远端没查成，但官方那一半是**单独**问出来的、拿到手了——必须显示，
+                # 否则用户只看到一句"检查失败"，以为官方也查不到（真机踩过这条路径）。
+                self._set_label(
+                    self.git_note,
+                    f"⚠ 你那边没查成（{status.error}）"
+                    f"　·　官方已到 {official.version or official.tag or '？'}"
+                    f"（本地 {status.version or '读不到'}）",
+                    "#a05a00")
+                self._log_update_detail(status, official, official_is_newer(status))
+                return
             self._set_label(self.git_note, f"检查失败：{status.error}", "#b00000")
             return
         # 结论那行由 update_summary 统一算（含"官方更新时不许说已是最新"这条规矩），
@@ -2306,6 +2318,15 @@ class App(tk.Tk):
                 f"工作区有 {info.dirty} 处本地改动。\n\n"
                 "为避免覆盖你自己的改动，请先提交或撤销这些改动，再更新。",
                 parent=self)
+            return
+        # 这个服务可能**不是本窗口启动的**（用户自己敲的 pnpm dsh web、或上次没关干净）。
+        # 那种情况下更新流程停不掉它：源码被换掉、进程还跑着旧的，紧接着重装依赖、重建
+        # 又会跟它抢文件。所以动手前先确认端口能空出来，空不出来就别开始。
+        if not self.ensure_port_free(
+                "更新会重装依赖并重新构建，需要先停掉正在运行的服务。",
+                detail=("这个服务不是本窗口启动的，更新流程不会自动停它；"
+                        "它不停，更新中途会拿到半新半旧的代码。")):
+            self._append("[更新] 端口没空出来（或你选择不结束它），已取消更新。")
             return
         lines = [f"目标：{source.label}",
                  f"  远端：{source.url}",
@@ -2545,7 +2566,7 @@ class App(tk.Tk):
             return
         self._launch_web()
 
-    def ensure_port_free(self, purpose: str) -> bool:
+    def ensure_port_free(self, purpose: str, *, detail: str = "") -> bool:
         """确认真实端口是空的；被占就先问用户，同意则结束占用者。返回能否继续。
 
         `self.web_proc` 只是"我启动过什么"的记账，端口才是"现在到底有没有人在跑"的事实；
@@ -2559,8 +2580,9 @@ class App(tk.Tk):
                else ("、".join(f"PID {p}" for p in pids) if pids else "未知进程"))
         if not messagebox.askyesno(
                 f"端口 {WEB_PORT} 已被占用",
-                f"{purpose}\n\n127.0.0.1:{WEB_PORT} 正被{who}占用；再启动一个只会报 "
-                "EADDRINUSE。\n\n要先结束它再继续吗？（结束它会连它的子进程一起结束）",
+                f"{purpose}\n\n127.0.0.1:{WEB_PORT} 正被{who}占用。\n"
+                + (detail or "再启动一个只会报 EADDRINUSE。")
+                + "\n\n要先结束它再继续吗？（结束它会连它的子进程一起结束）",
                 parent=self):
             return False
         if mine:

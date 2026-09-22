@@ -94,6 +94,7 @@ class RepoInfo:
     ahead: int = 0
     behind: int = 0
     dirty: int = 0
+    status_ok: bool = True     # git status 本身跑成功了没；查不出来 ≠ 干净，不能当没事
     remotes: dict[str, str] = field(default_factory=dict)
     version: str = ""
     shallow: bool = False
@@ -129,9 +130,14 @@ def repo_info(path: Path) -> RepoInfo:
         committed_at = parts[3] if len(parts) > 3 else ""
 
     dirty = 0
+    status_ok = True
     code, out, _ = run_git(["status", "--porcelain"], path)
     if code == 0:
         dirty = len([ln for ln in out.splitlines() if ln.strip()])
+    else:
+        # 查不出来**不等于干净**。以前这里静默当成 0，结果是 git status 一失败
+        # （超时、索引被锁）后面的更新就以为工作区是干净的，可能直接覆盖别人的改动。
+        status_ok = False
 
     remotes: dict[str, str] = {}
     code, out, _ = run_git(["remote", "-v"], path)
@@ -160,8 +166,8 @@ def repo_info(path: Path) -> RepoInfo:
 
     return RepoInfo(ok=True, root=root, branch=branch, commit=commit, short=short,
                     subject=subject, committed_at=committed_at, upstream=upstream,
-                    ahead=ahead, behind=behind, dirty=dirty, remotes=remotes,
-                    version=_package_version(root), shallow=shallow)
+                    ahead=ahead, behind=behind, dirty=dirty, status_ok=status_ok,
+                    remotes=remotes, version=_package_version(root), shallow=shallow)
 
 
 def _package_version(root: Path) -> str:
@@ -413,11 +419,19 @@ def check_update(path: Path, *, remote: str = "", official: bool = True) -> Upda
     url = info.remotes[remote]
     is_official = official_remote({remote: url}) == url
 
+    # 官方那一半**先做、而且独立做**：它只花几秒（ls-remote 取引用），而且就算下面跟踪
+    # 远端的 fetch 失败（断网、超时、权限），用户至少还能看到"官方到哪一版了"。
+    # 真机踩过：这里一失败就整个 return，界面上只剩一句"检查失败"，官方信息全丢了。
+    officials = None
+    if official and official_remote_name(info.remotes):
+        officials = official_status(info)
+
     # 不带 --depth：带它会给本地仓库凭空加一个浅边界，把本来完整的祖先关系弄断
     code, _out, err = run_git(["fetch", remote, branch], path, timeout=FETCH_TIMEOUT)
     if code != 0:
         return UpdateStatus(ok=False, branch=branch, remote=remote, official=is_official,
                             upstream=info.upstream, remote_url=url, version=info.version,
+                            official_status=officials,
                             error=f"git fetch 失败：{_first_line(err)}")
 
     code, out, _ = run_git(["rev-parse", "--short", "FETCH_HEAD"], path)
@@ -549,6 +563,13 @@ def update_sources(path: Path, *, mirrors: Sequence[str] = (),
         branch = info.branch
         head = _remote_branch_head(mine_name, branch, path, timeout) if branch else ""
         if not head:
+            # 别急着去猜默认分支：每次 ls-remote 都要等满 timeout，连不上时真机实测
+            # 能把界面锁住好几分钟（按钮全灰）。先花一次 --heads 探活，连不上就如实说。
+            code, _out, err = run_git(["ls-remote", "--heads", mine_name], path,
+                                      timeout=timeout)
+            if code != 0:
+                return sources, (f"{mine_name} 连不上（{_first_line(err) or '超时'}）；"
+                                 "先恢复网络再点【检查更新】")
             branch = _remote_default_branch(mine_name, path, timeout)
             head = _remote_branch_head(mine_name, branch, path, timeout) if branch else ""
         owner, _repo = split_remote(url)
@@ -609,6 +630,11 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
     info = repo_info(path)
     if not info.ok:
         return UpdateResult(ok=False, error=info.error)
+    if not info.status_ok:
+        return UpdateResult(ok=False, error=(
+            "查不出工作区状态（git status 没跑成，多半是超时或索引被占用）。\n"
+            "为安全起见先不更新——工作区到底干不干净还不知道，"
+            "不能拿「没查到」当「没事」。稍后重试，或先手动确认工作区干净。"))
     if info.dirty:
         return UpdateResult(ok=False, error=(
             f"工作区有 {info.dirty} 处本地改动；为避免覆盖你的改动，"

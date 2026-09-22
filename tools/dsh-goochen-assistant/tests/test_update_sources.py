@@ -315,6 +315,49 @@ class UpdateButtonsGuiTest(unittest.TestCase):
         self.assertEqual(self.app.btn_update_mine.cget("text"),
                          "从你的仓库更新（Muigoochen）")
 
+    def test_official_half_survives_a_failed_tracked_check(self):
+        """跟踪远端查失败时，官方那一半（单独问到的）必须照样显示。
+
+        真机踩过：这条路径一失败就只剩"检查失败"，用户以为什么都没查到。
+        """
+        official = gi.OfficialStatus(
+            ok=True, remote="upstream",
+            url="git@github.com:deepseek-ai/deepseek-harness.git",
+            version="0.1.6-alpha.2", tag="dsh-v0.1.6-alpha.2",
+            branch="master", head="ddefc45", behind=3482)
+        self.app._show_update_status(gi.UpdateStatus(
+            ok=False, error="git fetch 失败：连不上", version="0.1.2-alpha.3",
+            official_status=official))
+        text = self.app.git_note.cget("text")
+        self.assertIn("官方已到 0.1.6-alpha.2", text, "官方那一半不能丢")
+        self.assertIn("你那边没查成", text)
+        self.assertNotIn("检查失败", text)
+        self.app._show_update_status(gi.UpdateStatus(ok=False, error="没有名为 x 的远端"))
+        self.assertIn("检查失败", self.app.git_note.cget("text"))
+
+    def test_update_is_cancelled_when_the_service_cannot_be_stopped(self):
+        """服务停不掉（不是本窗口启动的、用户不肯结束）时，绝不该开始更新。
+
+        否则源码被换掉、旧进程还在跑，紧跟着的重装依赖和重建会跟它抢文件。
+        """
+        source = gi.UpdateSource(kind="official", label="从官方更新", remote="upstream",
+                                 url="git@github.com:deepseek-ai/deepseek-harness.git",
+                                 branch="master", reachable=True)
+        self.app._update_sources = [source]
+        clean = gi.RepoInfo(ok=True, root=Path("E:/x"), branch="plugins", dirty=0)
+        asked = []
+        with mock.patch.object(type(self.app), "_effective_dir", lambda _s: Path("E:/x")), \
+                mock.patch.object(installer.ginfo, "repo_info", return_value=clean), \
+                mock.patch.object(installer, "verify_install_dir",
+                                  return_value=mock.Mock(ok=True, evidence="测试")), \
+                mock.patch.object(type(self.app), "ensure_port_free",
+                                  lambda *a, **k: False), \
+                mock.patch.object(installer.messagebox, "askyesno",
+                                  lambda *a, **k: asked.append(a) or True):
+            self.app.on_update_from("official")
+        self.assertEqual(asked, [], "端口没空出来就不该走到确认框")
+        self.assertFalse(self.app.git_busy, "也不该留下「正在忙」的状态")
+
     def test_deepen_button_only_when_shallow(self):
         """浅克隆要能看到「补齐历史」；历史完整时不该出现（免得误导）。"""
         self.app._refresh_update_buttons([], "", True)
@@ -563,6 +606,30 @@ class OfficialStatusCwdTest(unittest.TestCase):
         self.assertTrue(seen, "应当真的问过远端")
         self.assertEqual(set(seen), {str(target)},
                          f"ls-remote 必须站在目标目录里跑，否则会问到别的仓库；实际：{seen}")
+
+
+class StatusUnknownGateTest(unittest.TestCase):
+    """git status 跑不出来时**绝不能**当成"工作区干净"继续更新。
+
+    查不出来 ≠ 没事：索引被锁、超时都会走到这里，继续下去就可能覆盖别人的改动。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-status-"))
+        self.repo = make_repo(self.tmp / "repo", message="第一版")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_update_refuses_when_status_could_not_be_read(self):
+        source = gi.UpdateSource(kind="mine", label="从你的仓库更新（me）", remote="origin",
+                                 branch="main", reachable=True)
+        blind = gi.RepoInfo(ok=True, root=self.repo, branch="main", commit="0" * 40,
+                            short="0000000", dirty=0, status_ok=False)
+        with mock.patch.object(gi, "repo_info", return_value=blind):
+            result = gi.update_from(self.repo, source)
+        self.assertFalse(result.ok, "查不出工作区状态就不该动手")
+        self.assertIn("查不出工作区状态", result.error)
 
 
 class PushToOwnRepoTest(unittest.TestCase):
