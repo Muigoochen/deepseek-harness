@@ -1,12 +1,14 @@
 import { Context } from '@deepseek-ai/cordis'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
+import { SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import { createAssistantMessage, LlmAttemptId } from '@deepseek-ai/dsh-llm'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
 import {
   createScope, MutableSessionEventSource,
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import type {
-  ISessions, SessionBinding, SessionFace, SessionListState, SessionSnapshot,
+  ISessions, SessionBinding, SessionEventLike, SessionFace, SessionListState, SessionSnapshot,
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import {
   ConversationEventRegistry, ConversationNodeAssembler, ConversationViewRegistry, UiConversation,
@@ -17,10 +19,11 @@ import type {
 
 const SESSION_ID = 'resident' as SessionId
 
+afterEach(() => { vi.unstubAllGlobals() })
+
 function sessionSnapshot(): SessionSnapshot {
   return {
     sessionId: SESSION_ID,
-    queue: [],
     pendingSubmissions: [],
     running: false,
     subagent: null,
@@ -67,22 +70,27 @@ function fakeSessions(ctx: Context): { sessions: ISessions; binding: SessionBind
   const list = createSnapshotStore<SessionListState>({
     ids: [],
     byId: {},
-    current: undefined,
     phase: 'ready',
     subagentsByParent: {},
     jobsBySession: {},
-    currentAddress: undefined,
   })
-  const sessions = {
+  const reference = {
+    sessionId: SESSION_ID,
+    binding,
+    ready: Promise.resolve(binding),
+    release: () => {},
+    [Symbol.dispose]() {},
+  }
+  const sessions: ISessions = {
     list,
     searchResultLimit: 50,
     create: () => Promise.reject(new Error('unused fake Sessions operation')),
-    open: () => {},
-    openSubagent: () => {},
+    retain: () => reference,
+    using: async (_target, _options, operation) => await operation(reference),
+    retainInfo: () => createSnapshotStore({ referenceCount: 1, retainedBy: {} }),
     subagentAddress: () => undefined,
     setSubagentCatalogOpen: () => {},
     refreshSubagents: () => Promise.reject(new Error('unused fake Sessions operation')),
-    clear: () => {},
     refresh: () => Promise.reject(new Error('unused fake Sessions operation')),
     search: () => Promise.reject(new Error('unused fake Sessions operation')),
     fork: () => Promise.reject(new Error('unused fake Sessions operation')),
@@ -90,7 +98,7 @@ function fakeSessions(ctx: Context): { sessions: ISessions; binding: SessionBind
     scopeOf: candidate => candidate === binding.ctx ? SESSION_ID : undefined,
     sessionOf: candidate => candidate === binding.ctx ? binding.session : undefined,
     binding: id => id === SESSION_ID ? binding : undefined,
-  } satisfies ISessions
+  }
   return { sessions, binding }
 }
 
@@ -124,6 +132,7 @@ async function bootRegistries(): Promise<{
   views: ConversationViewRegistry
 }> {
   const ctx = new Context()
+  onTestFinished(async () => { await ctx.fiber.dispose() })
   const { sessions, binding } = fakeSessions(ctx)
   const uiConversation = new UiConversation(ctx, sessions)
   return {
@@ -136,6 +145,129 @@ async function bootRegistries(): Promise<{
 }
 
 describe('Conversation registries', () => {
+  it('publishes frame-paced updates after three animation frames and lets immediate updates preempt them', async () => {
+    let nextFrame = 0
+    const frames = new Map<number, FrameRequestCallback>()
+    const requestFrame = vi.fn((callback: FrameRequestCallback) => {
+      nextFrame++
+      frames.set(nextFrame, callback)
+      return nextFrame
+    })
+    const cancelFrame = vi.fn((frame: number) => { frames.delete(frame) })
+    vi.stubGlobal('requestAnimationFrame', requestFrame)
+    vi.stubGlobal('cancelAnimationFrame', cancelFrame)
+    const { uiConversation, binding, events, views } = await bootRegistries()
+    const definition: ConversationNodeDefinition<number> = {
+      kind: 'frame-probe',
+      target: 'chat',
+      match: event => event.type === 'turn/start'
+        ? { id: String(event.data.turn), role: 'start' }
+        : event.type === 'assistant/live-chunk' || event.type === 'assistant/message'
+          ? { id: String(event.data.turn), role: 'update' }
+          : null,
+      start: () => 0,
+      update: context => context.state + 1,
+      publication: match => match.event.type === 'assistant/live-chunk' ? 'animation-frame' : 'immediate',
+      buildViewNode: context => ({
+        key: context.key,
+        kind: 'frame-probe',
+        id: context.id,
+        target: 'chat',
+        data: context.state,
+      }),
+    }
+    events.register(definition)
+    views.register(viewDefinition('chat'))
+    await Promise.resolve()
+    const conversation = uiConversation.binding(binding)
+    conversation.activate('chat')
+    const listener = vi.fn()
+    const unsubscribe = conversation.snapshot.subscribe(listener)
+    const source = binding.eventSource as MutableSessionEventSource
+    const append = (event: SessionEventLike): void => {
+      source.append(event.type === 'assistant/live-chunk'
+        ? { type: 'transient', event }
+        : { type: 'event', event })
+    }
+
+    append({ seq: SessionSeq(1), time: 1, type: 'turn/start', data: { turn: 1 } })
+    listener.mockClear()
+    append({
+      seq: SessionSeq(2),
+      time: 2,
+      type: 'assistant/live-chunk',
+      data: {
+        attemptId: LlmAttemptId('frame-probe'),
+        turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'a' },
+      },
+    })
+    append({
+      seq: SessionSeq(3),
+      time: 3,
+      type: 'assistant/live-chunk',
+      data: {
+        attemptId: LlmAttemptId('frame-probe'),
+        turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'b' },
+      },
+    })
+    expect(requestFrame).toHaveBeenCalledOnce()
+    expect(listener).not.toHaveBeenCalled()
+
+    const first = frames.get(1)
+    if (first === undefined) throw new Error('first animation frame was not scheduled')
+    frames.delete(1)
+    first(0)
+    expect(requestFrame).toHaveBeenCalledTimes(2)
+    expect(listener).not.toHaveBeenCalled()
+
+    const second = frames.get(2)
+    if (second === undefined) throw new Error('second animation frame was not scheduled')
+    frames.delete(2)
+    second(16)
+    expect(requestFrame).toHaveBeenCalledTimes(3)
+    expect(listener).not.toHaveBeenCalled()
+
+    const third = frames.get(3)
+    if (third === undefined) throw new Error('third animation frame was not scheduled')
+    frames.delete(3)
+    third(32)
+    expect(listener).toHaveBeenCalledOnce()
+
+    append({
+      seq: SessionSeq(4),
+      time: 4,
+      type: 'assistant/live-chunk',
+      data: {
+        attemptId: LlmAttemptId('frame-probe'),
+        turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'c' },
+      },
+    })
+    source.settleAssistant(LlmAttemptId('frame-probe'), {
+      type: 'event',
+      event: {
+        seq: SessionSeq(5),
+        time: 5,
+        type: 'assistant/message',
+        data: {
+          turn: 1,
+          step: 1,
+          message: createAssistantMessage({
+            content: [],
+            source: { provider: 'test', model: 'test' },
+          }),
+          stream: [],
+        },
+        surfaceOp: 'append',
+      },
+    })
+    expect(cancelFrame).toHaveBeenCalledWith(4)
+    expect(frames).toHaveLength(0)
+    expect(listener).toHaveBeenCalledTimes(2)
+
+    unsubscribe()
+    await binding.ctx.fiber.dispose()
+  })
+
   it('rejects duplicate Event Definitions and disposes an ordinary registration once', async () => {
     const { events } = await bootRegistries()
     const definition = eventDefinition('message')

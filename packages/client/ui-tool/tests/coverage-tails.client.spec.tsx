@@ -25,12 +25,10 @@ function listStore() {
   return createSnapshotStore<SessionListState>({
     ids: [SID],
     byId: {
-      [SID]: { id: SID, title: 'r', displayTitle: 'r', running: false, blank: false, updatedAt: 0 },
+      [SID]: { id: SID, title: 'r', displayTitle: 'r', running: false, retainedBy: {}, blank: false, updatedAt: 0 },
     },
-    current: undefined,
     phase: 'ready',
     subagentsByParent: {}, jobsBySession: {},
-    currentAddress: undefined,
   })
 }
 
@@ -59,6 +57,7 @@ describe('Tool presentation tails', () => {
       content: [], isError: false, subCalls: [],
     }
     const props: GenericToolCardProps = {
+      loadImage: vi.fn(() => Promise.reject(new Error('not used'))),
       callId: 'c5', toolName: 'todo_write', block: settled, openFile: vi.fn(), t,
     }
     const view = render(<GenericToolCard {...props} />)

@@ -4,6 +4,8 @@
 - button "New session":
   - img
   - text: New Session
+- navigation "Global panels":
+  - button "Plugins"
 - text: Workspaces
 - button "Search sessions":
   - img
@@ -20,6 +22,9 @@
 - button "Settings":
   - img
   - text: Settings
+- banner:
+  - button "Open right sidebar":
+    - img
 - text: Into the Unknown Preview
 - button "Choose workspace":
   - img
@@ -29,8 +34,8 @@
   - img
   - text: Standard mode
   - img
-- textbox "Describe what you want to build... / commands, @ files or sessions"
-- button "Commands":
+- textbox "Describe what you want to build, / commands, @ files or sessions"
+- button "Add files or run commands":
   - img
 - 'button "Access mode, current: Workspace Write"': Workspace Write
 - button "Plan mode on, press to turn off": Plan
@@ -38,6 +43,3 @@
   - text: DeepSeek-V4-Flash
   - img
 - button "Send message" [disabled]
-- text: Details
-- button "Close details"
-- text: Click a tool row in the message flow to view its details

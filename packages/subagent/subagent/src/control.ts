@@ -21,6 +21,7 @@ const CONTROL_ID_SCHEMAS = {
     parentSessionId: SESSION_ID_SCHEMA,
     childSessionId: SESSION_ID_SCHEMA,
     mode: z.literal('continuable'),
+    delivery: z.enum(['queue', 'steer']),
   }),
   'subagent.interrupt': z.object({
     parentSessionId: SESSION_ID_SCHEMA,
@@ -135,6 +136,7 @@ export function rejectPrompt(error: unknown, childSessionId: SessionId, signal: 
         )
       case 'DRAINING':
       case 'ACTIVATION_CLOSING':
+      case 'ACTIVATION_LIMIT_REACHED':
       case 'CONTINUATION_UNAVAILABLE':
       case 'PERSISTENCE_UNAVAILABLE':
         throw new RemoteError(
