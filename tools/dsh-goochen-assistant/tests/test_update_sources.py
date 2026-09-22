@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """更新来源与更新动作（按远端拓扑给按钮 + 合并/备份/冲突安全中止）。
 
 与用户对齐的三条规矩：
@@ -775,6 +775,20 @@ class LocalSourcesTest(unittest.TestCase):
     因为那时按钮要等联网探测（官方那一路几十秒到几分钟）。
     """
 
+    def test_rebuild_button_is_really_there_and_visible(self):
+        """【重装依赖并构建】必须真的存在——我上次的提示让人点它，可按钮根本没有。
+
+        这条放在 GUI 类里（见 RollbackButtonGuiTest），这里只是为了贴近"按钮"话题。
+        """
+        app = installer.App()
+        try:
+            self.assertTrue(app.btn_rebuild.winfo_manager(), "按钮要被 pack 出来")
+            self.assertIs(app.btn_rebuild.master, app.btn_git_refresh.master,
+                          "和刷新信息/从官方更新同一排")
+            self.assertIn("构建", app.btn_rebuild.cget("text"))
+        finally:
+            app.destroy()
+
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="dsh-local-src-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -796,6 +810,69 @@ class LocalSourcesTest(unittest.TestCase):
         info = gi.repo_info(plain)
         with mock.patch.object(gi, "run_git", side_effect=AssertionError("不许联网")):
             self.assertEqual(gi.update_sources_local(plain, info=info), [])
+
+
+class TransientRetryTest(unittest.TestCase):
+    """网络类报错要原样重试一次再换来源——真机实测这条链路会来回抽。
+
+    顺带锁住一件事：随包缓存**不能**用 --offline 打头（跨版本更新必然缺新包，
+    真机实测 0.1.2→0.1.6 缺 @yao-pkg/pkg-6.21.0，--offline 直接硬失败，三次尝试全废）。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-retry-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.project = self.tmp / "proj"
+        self.project.mkdir()
+        (self.project / "package.json").write_text('{"name":"x"}', encoding="utf-8")
+        self.store = self.tmp / "store"
+        self.store.mkdir()
+
+    def _engine(self, mode: str = "auto"):
+        return installer.Engine(mode=mode, use_mirror=False, log=lambda _m: None)
+
+    def test_retries_a_flaky_registry_once(self):
+        calls: list = []
+
+        def fake(argv, cwd=None, env=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                return installer.subprocess.CompletedProcess(
+                    argv, 1, b"",
+                    b"ERR_PNPM_META_FETCH_FAIL request to ... failed: network")
+            return installer.subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with mock.patch.object(installer, "STORE_DIR", self.store), \
+                mock.patch.object(installer, "run_cli", side_effect=fake), \
+                mock.patch.object(installer.time, "sleep", lambda _s: None):
+            self._engine().install_deps(self.project, force=True)
+        self.assertEqual(len(calls), 2, "网络抖动要原样重试一次")
+        self.assertEqual(calls[0], calls[1], "重试就是同一条命令")
+
+    def test_first_attempt_prefers_cache_but_may_download(self):
+        seen: list = []
+
+        def fake(argv, cwd=None, env=None):
+            seen.append(list(argv))
+            return installer.subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(installer, "STORE_DIR", self.store), \
+                mock.patch.object(installer, "run_cli", side_effect=fake):
+            self._engine().install_deps(self.project, force=True)
+        self.assertIn("--prefer-offline", seen[0], "第一次要缓存优先、缺的联网补")
+        self.assertNotIn("--offline", seen[0], "--offline 会在跨版本更新时硬失败")
+
+    def test_offline_mode_keeps_a_strict_attempt(self):
+        seen: list = []
+
+        def fake(argv, cwd=None, env=None):
+            seen.append(list(argv))
+            return installer.subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(installer, "STORE_DIR", self.store), \
+                mock.patch.object(installer, "run_cli", side_effect=fake):
+            self._engine("offline").install_deps(self.project, force=True)
+        self.assertIn("--offline", seen[0], "『离线安装』模式仍然严格不联网")
 
 
 class DepsChangeTest(unittest.TestCase):

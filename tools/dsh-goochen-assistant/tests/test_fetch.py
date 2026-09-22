@@ -201,10 +201,17 @@ class InstallDepsSourceOrderTest(unittest.TestCase):
                 return calls, logs, str(ctx.exception)
         return calls, logs, ""
 
-    def test_offline_then_mirror_and_keeps_the_same_store(self):
+    def test_cache_first_then_mirror_and_keeps_the_same_store(self):
+        """"自动选择"下第一次是**缓存优先**（--prefer-offline），不是硬离线。
+
+        真机实测：跨版本更新（0.1.2→0.1.6）时随包缓存必然缺新包（实测缺
+        @yao-pkg/pkg-6.21.0），--offline 会直接以 ERR_PNPM_NO_OFFLINE_TARBALL 硬失败，
+        三次尝试可能全废、用户白等一轮。缺的包本来就该联网补。
+        """
         calls, logs, _ = self._run(mode="auto", results=[1, 0])
         self.assertEqual(len(calls), 2, calls)
-        self.assertIn("--offline", calls[0])
+        self.assertIn("--prefer-offline", calls[0])
+        self.assertNotIn("--offline", calls[0], "不能硬离线：跨版本更新必然缺包")
         self.assertNotIn("--offline", calls[1])
         self.assertIn("--registry", calls[1])
         self.assertIn(installer.REGISTRY_MIRROR, calls[1])
@@ -229,7 +236,7 @@ class InstallDepsSourceOrderTest(unittest.TestCase):
     def test_reports_every_source_on_total_failure(self):
         calls, _, message = self._run(mode="auto", results=[1, 1, 1])
         self.assertEqual(len(calls), 3, calls)
-        for name in ("随包离线缓存", "国内镜像", "官方源"):
+        for name in ("随包缓存优先", "国内镜像", "官方源"):
             self.assertIn(name, message)
 
 

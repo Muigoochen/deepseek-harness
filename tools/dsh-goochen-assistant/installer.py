@@ -148,6 +148,17 @@ ALL_STEPS = ("detect", "node", "pnpm", "source", "deps", "build", "start")
 
 
 # ---------------------------------------------------------------- helpers
+#: pnpm 输出里出现这些词就算"网络抖动"，值得原样重试一次再换来源。
+TRANSIENT_WORDS = ("ERR_PNPM_META_FETCH_FAIL", "FETCH_ERROR", "ECONNRESET", "ECONNREFUSED",
+                   "ETIMEDOUT", "EAI_AGAIN", "socket hang up", "network", "request to")
+
+
+def _looks_transient(text: str) -> bool:
+    """这次失败像不像"网络抽了一下"（而不是"包真的缺"）。"""
+    low = text.lower()
+    return any(word.lower() in low for word in TRANSIENT_WORDS)
+
+
 def log_line(msg: str) -> None:
     line = str(msg)
     print(line, flush=True)
@@ -1344,8 +1355,15 @@ class Engine:
         self.log("⑤ 安装项目依赖 …")
         store = str(STORE_DIR) if STORE_DIR.exists() else ""
         attempts: list[tuple[str, list[str]]] = []
-        if store and self.mode != "online":
-            # 先纯离线：store-dir 指向随包缓存，数据够用时完全不联网
+        if store and self.mode == "auto":
+            # "自动选择"下先走"缓存优先、缺的联网补"：**不能用 --offline**——跨版本更新时随包
+            # 缓存必然缺新包，--offline 会直接以 ERR_PNPM_NO_OFFLINE_TARBALL 失败（真机实测
+            # 0.1.2→0.1.6 缺 @yao-pkg/pkg-6.21.0），三次尝试可能全废、用户白等一轮。
+            # --prefer-offline 用得上缓存就用，缺的才下载，正是跨版本更新要的行为。
+            attempts.append(("随包缓存优先", ["pnpm", "install", "--frozen-lockfile",
+                                             "--prefer-offline", "--store-dir", store]))
+        if self.mode == "offline" and store:
+            # "离线安装"的承诺是不联网，那就**只能**有这一条严格离线的路。
             attempts.append(("随包离线缓存", ["pnpm", "install", "--frozen-lockfile",
                                              "--offline", "--store-dir", store]))
         if self.mode != "offline":
@@ -1369,8 +1387,26 @@ class Engine:
             if proc.returncode == 0:
                 self.log(f"  ✓ {name} 依赖安装完成")
                 return
-            lines = [line for line in decode_proc(proc).splitlines() if line.strip()]
-            detail = " / ".join(lines[-3:])[:300]
+            text = decode_proc(proc)
+            # 网络类错误值得再试一次：真机实测这条链路会"通几分钟、卡几分钟"来回抽，
+            # 换来源之前先原样重试一遍，往往就过去了。
+            if _looks_transient(text):
+                self.log(f"  … {name} 像是网络抖动，再试一次")
+                time.sleep(5)
+                proc = run_cli(argv, cwd=project)
+                if proc.returncode == 0:
+                    self.log(f"  ✓ {name} 依赖安装完成（重试后成功）")
+                    return
+                text = decode_proc(proc)
+            lines = [line for line in text.splitlines() if line.strip()]
+            # 只留最后 3 行会把真错误截掉：pnpm 结尾常是 `[WARN] There are cyclic workspace
+            # dependencies…` 这种**警告**，于是界面上看到的"失败原因"全是警告，用户和我们都
+            # 找不到病根（真机上就是这么被误导的）。优先挑真正的错误行，其次才用尾部。
+            errs = [ln for ln in lines
+                    if ("ERR_" in ln or ln.lstrip().startswith("ERROR")
+                        or "error" in ln.lower()[:12])]
+            picked = (errs[:3] if errs else lines[-5:])
+            detail = " / ".join(picked)[:400]
             problems.append(f"{name}：{detail}")
             if last:
                 self.log(f"  ✗ {name} 失败（{detail}）")
@@ -1639,6 +1675,13 @@ class App(tk.Tk):
         #    后面那段代码把我的属性覆盖了，于是我拿到并 pack 的是别人的按钮——当然看不见。
         # 所以：换个不会撞的名字，而且父框架取 self.btn_git_refresh.master（用户看得见那排）。
         self.btn_rollback_update = None
+        # 【重装依赖并构建】：更新可能卡在"代码合好了、依赖没装成"（真机就卡在这），
+        # 回退之后旧依赖又和新源码对不上。这时用户需要的是"把依赖和产物弄对"，而不是
+        # 再走一轮更新。**以前界面上根本没有这个入口，我的提示却让人"再点一次
+        # 【重新构建】"——按钮不存在，是我的错**，所以这次真把它做出来。
+        self.btn_rebuild = ttk.Button(grow, text="重装依赖并构建",
+                                      command=self.on_rebuild)
+        self.btn_rebuild.pack(side="left", padx=(6, 0))
         self._wrap_labels.append(self.git_note)
 
         # 安装方式（可折叠：装好之后基本不用动；标题上始终显示当前选择）
@@ -2152,6 +2195,61 @@ class App(tk.Tk):
             self._set_label(self.git_note,
                             f"可回退到更新前：{newest}{tail}（点【回退到更新前】）", "#888")
 
+    def on_rebuild(self) -> None:
+        """只重装依赖 + 重新构建，**完全不碰 git**。
+
+        真机场景：更新把官方代码合并好了、卡在装依赖（随包缓存缺新包）；或者回退之后
+        旧依赖和新源码对不上。这时用户要的是"把依赖和产物弄对"，不该再走一轮更新。
+        """
+        if self.git_busy or self.busy:
+            return
+        target = self._effective_dir()
+        if not (target / "package.json").exists():
+            messagebox.showwarning("这里不是 DSH 安装目录",
+                                   f"没找到 {target / 'package.json'}\n\n"
+                                   "先在上面的『安装位置』里选对目录。", parent=self)
+            return
+        if port_in_use() and not self.ensure_port_free(
+                "重装依赖和构建时服务不能跑着（文件会被替换）："):
+            self._append("[构建] 端口没空出来，已取消。")
+            return
+        if not messagebox.askyesno(
+                "重装依赖并重新构建？",
+                "会执行：\n"
+                "  ① pnpm install（缓存优先，缺的联网补）\n"
+                "  ② pnpm run build\n\n"
+                "首次可能要 5–15 分钟，期间别关窗。现在开始吗？", parent=self):
+            return
+        self.busy = True
+        self._set_git_buttons(False)
+        try:
+            threading.Thread(target=self._rebuild_worker, args=(target,), daemon=True).start()
+        except RuntimeError as exc:                 # 线程起不来也要把按钮放回去
+            self._post(self._rebuild_done, False, str(exc))
+
+    def _rebuild_worker(self, target: Path) -> None:
+        ok, detail = True, ""
+        try:
+            self._log_work("[构建] 开始：重装依赖（缓存优先，缺的联网补）…")
+            eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
+                         log=self._append)
+            eng.install_deps(target, force=True)
+            self._log_work("[构建] 依赖好了，开始编译 …")
+            eng.build(target, force=True)
+        except Exception as exc:  # noqa: BLE001  装依赖/构建失败都必须让用户看到原因
+            ok, detail = False, str(exc)
+        self._post(self._rebuild_done, ok, detail)
+
+    def _rebuild_done(self, ok: bool, detail: str) -> None:
+        self.busy = False
+        self._set_git_buttons(True)
+        if ok:
+            self._log_work("[构建] ✓ 依赖和产物都跟上了，可以点【运行】")
+            messagebox.showinfo("完成", "依赖和构建产物都好了，可以点【运行】。", parent=self)
+        else:
+            self._log_work(f"[构建] ✗ 失败：{detail}")
+            messagebox.showerror("失败", detail, parent=self)
+
     def _refresh_rollback_button(self, backups: list) -> None:
         """有备份分支才显示【回退到更新前】——没备份时点它只会吓人。
 
@@ -2256,7 +2354,7 @@ class App(tk.Tk):
         state = "normal" if enabled else "disabled"
         for btn in (self.btn_git_refresh, self.btn_git_update,
                     self.btn_update_official, self.btn_update_mine, self.btn_deepen,
-                    self.btn_rollback_update):
+                    self.btn_rollback_update, self.btn_rebuild):
             try:
                 btn.configure(state=state)
             except Exception:  # noqa: BLE001  同上：窗口可能已销毁
@@ -2444,12 +2542,23 @@ class App(tk.Tk):
         """
         stop = threading.Event()
         pack_dir = Path(target) / ".git" / "objects" / "pack"
+        # 先清掉历次被掐断的 fetch 留下的半截包：它们既白占空间，又会让下面这行心跳把
+        # "手上原本就有的残片"算成"这次收到的数据"——我自己就被它骗过一次，报了 92 MB。
+        now = time.time()
+        for stale in pack_dir.glob("tmp_pack_*"):
+            try:
+                if now - stale.stat().st_mtime > 3600:
+                    stale.unlink()
+            except OSError:
+                pass
 
         def watch() -> None:
             started = time.monotonic()
             while not stop.wait(10.0):
                 try:
-                    got = sum(p.stat().st_size for p in pack_dir.glob("tmp_pack_*"))
+                    # 只算**正在被写**的那个包（mtime 在最近 60 秒内）；残片不计。
+                    got = sum(p.stat().st_size for p in pack_dir.glob("tmp_pack_*")
+                              if time.time() - p.stat().st_mtime < 60)
                 except OSError:
                     got = 0
                 self._log_work(f"[更新] 还在取远端更新…已等 {int(time.monotonic() - started)} 秒，"
