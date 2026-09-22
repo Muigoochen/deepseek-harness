@@ -608,6 +608,38 @@ class OfficialStatusCwdTest(unittest.TestCase):
                          f"ls-remote 必须站在目标目录里跑，否则会问到别的仓库；实际：{seen}")
 
 
+class NoNeedlessBackupTest(unittest.TestCase):
+    """远端那个头已经在本地里时：不动、**也不打备份分支**。
+
+    实测暴露的脏点：副本上多跑一次更新就多一条 backup/before-update-…，什么都没改。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-nobackup-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_no_backup_branch_when_remote_head_is_already_local(self):
+        bare = self.tmp / "mine.git"
+        git("init", "-q", "--bare", str(bare), cwd=self.tmp)
+        work = make_repo(self.tmp / "work", message="第一版")
+        git("remote", "add", "origin", str(bare), cwd=work)
+        git("push", "-q", "-u", "origin", "main", cwd=work)
+        (work / "RE_本地又写了一点.md").write_text("本地\n", encoding="utf-8")
+        git("add", "-A", cwd=work)
+        git("commit", "-q", "-m", "本地又在前面走了一步", cwd=work)   # 本地比远端新
+        before = git("rev-parse", "HEAD", cwd=work)
+        source = gi.UpdateSource(kind="mine", label="从你的仓库更新（me）", remote="origin",
+                                 branch="main", reachable=True)
+        result = gi.update_from(work, source)
+        self.assertTrue(result.ok, result.error)
+        self.assertFalse(result.changed, "远端没有新东西，就不该改本地")
+        self.assertEqual(git("rev-parse", "HEAD", cwd=work), before)
+        branches = git("branch", "--list", "backup/*", cwd=work).strip()
+        self.assertEqual(branches, "", "什么都没改就不该留下备份分支")
+
+
 class StatusUnknownGateTest(unittest.TestCase):
     """git status 跑不出来时**绝不能**当成"工作区干净"继续更新。
 

@@ -700,6 +700,14 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
         return UpdateResult(ok=True, changed=False, before=info.short,
                             after=info.short, strategy="ff")
 
+    # 远端这个头**已经在你本地里了**（你比它新，或上次已经合过它）——同样是"没有新东西"，
+    # 说清楚就走，别再去打一条 backup/… 分支。实测暴露的脏点：副本上多合一次就多一条
+    # backup/before-update-…，什么都没改却留下一堆分支。
+    code, _out, _err = run_git(["merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD"], path)
+    if code == 0:
+        return UpdateResult(ok=True, changed=False, before=info.short,
+                            after=info.short, strategy="ff")
+
     if not fast_forward and strategy == "ff":
         return UpdateResult(ok=False, behind=behind, strategy="ff", error=(
             "不是快进关系（你本地有自己的提交），已中止，你的文件没有被改动。"))
