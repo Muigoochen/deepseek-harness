@@ -1184,15 +1184,29 @@ def _spawn_browser(exe: str, url: str) -> str:
     return "失败：未知错误"
 
 
-def web_command(pnpm: str, project: Path) -> str:
+def web_command(pnpm: str, project: Path, log=log_line) -> str:
     """`dsh web` 的启动命令（`.CMD` 必须经 cmd 用 call 执行）。
 
     **必带 `--no-open`**：`dsh web` 默认自己会去开浏览器（web-app 的 `openBrowser`
     默认 true），而它跑在我们**登记进 Job 的进程树**里——那个浏览器会继承 Job，于是
     用户关掉小助手时，连整台浏览器（含他所有标签页）一起被杀。关掉它的自动开页，
     改由小助手自己开（`_spawn_browser`，会显式 breakaway），行为一样但不牵连用户的浏览器。
+
+    **为什么优先走构建产物入口**：`pnpm dsh` 执行的是仓库根脚本
+    `node --import tsx/esm apps/cli/src/bin.ts`，也就是**源码启动**；而 tsx 会按 tsconfig 的
+    `paths` 把 `@deepseek-ai/dsh-*` 解析到 `src/*.ts`，插件图却从 `lib/*.js` 加载 ——
+    **同一个包被求值两次、包内 `Symbol` 身份分裂**。0.1.6-alpha.2 真机实测表现：
+    **只要对话调用工具就整轮失败**，报 `Cannot read properties of undefined (reading 'prepare')`
+    （工具服务 `ToolRuntime` 来自 `lib`，agent-loop 的 `TOOL_RUNTIME_SCHEDULER` 来自 `src`）。
+    改用产物入口 `apps/cli/lib/bin.js` 后整条链都在 `lib` 平面，实测工具正常执行并返回结果。
+    产物不在（还没构建）时退回源码启动并**写明原因**，不静默降级。
     """
-    cmdline = f'call "{pnpm}" dsh web --no-open'
+    built = project / "apps" / "cli" / "lib" / "bin.js"
+    if built.exists():
+        cmdline = f'node "{built}" web --no-open'
+    else:
+        log(f"  · 没找到 {built}（也许还没构建），先用源码方式启动 dsh web")
+        cmdline = f'call "{pnpm}" dsh web --no-open'
     overlay = web_clock_overlay(project)
     if overlay is not None:
         cmdline += f' --patch "{overlay}"'

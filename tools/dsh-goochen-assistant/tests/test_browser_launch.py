@@ -11,7 +11,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,6 +37,36 @@ class WebCommandTest(unittest.TestCase):
         with mock.patch.object(installer, "web_clock_overlay", lambda _p: overlay):
             cmdline = installer.web_command("pnpm.cmd", Path(r"D:\dsh"))
         self.assertIn(f'--patch "{overlay}"', cmdline)
+
+    def test_prefers_the_built_entrypoint(self):
+        """有构建产物时**必须**用它启动 —— 源码启动会让同一个包被求值两次。
+
+        真机实证（0.1.6-alpha.2）：源码启动（`node --import tsx/esm apps/cli/src/bin.ts`）下，
+        工具服务 ToolRuntime 来自 `lib`，而 agent-loop 的 `TOOL_RUNTIME_SCHEDULER` 来自 `src`
+        （tsx 按 tsconfig `paths` 改写），两个 Symbol 身份不同 ⇒ 每次工具调用都报
+        `Cannot read properties of undefined (reading 'prepare')`；改用产物入口
+        `apps/cli/lib/bin.js` 后工具正常执行并返回结果。
+        """
+        tmp = Path(tempfile.mkdtemp(prefix="dsh-webcmd-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        built = tmp / "apps" / "cli" / "lib" / "bin.js"
+        built.parent.mkdir(parents=True)
+        built.write_text("// built entry\n", encoding="utf-8")
+        with mock.patch.object(installer, "web_clock_overlay", lambda _p: None):
+            cmdline = installer.web_command("pnpm.cmd", tmp, log=lambda _m: None)
+        self.assertIn(str(built), cmdline, "有构建产物就该走产物入口")
+        self.assertNotIn("pnpm.cmd", cmdline, "走产物入口时不该再经 pnpm")
+        self.assertIn("--no-open", cmdline, "--no-open 这条不变量任何时候都不能丢")
+
+    def test_falls_back_to_source_launch_and_says_why(self):
+        tmp = Path(tempfile.mkdtemp(prefix="dsh-webcmd-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        logs: list[str] = []
+        with mock.patch.object(installer, "web_clock_overlay", lambda _p: None):
+            cmdline = installer.web_command("pnpm.cmd", tmp, log=logs.append)
+        self.assertIn("pnpm.cmd", cmdline, "没有产物时退回源码启动")
+        self.assertIn("--no-open", cmdline)
+        self.assertTrue(any("没找到" in line for line in logs), f"降级必须写清原因：{logs}")
 
 
 class SpawnBrowserTest(unittest.TestCase):
