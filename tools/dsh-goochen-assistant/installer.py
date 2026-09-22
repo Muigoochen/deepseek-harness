@@ -2549,6 +2549,8 @@ class App(tk.Tk):
             how = {"ff": "快进", "merge": "合并", "rebase": "变基"}.get(res.strategy,
                                                                       res.strategy)
             self._log_work(f"[更新] 已{how} {res.before} → {res.after}：{res.subject}")
+            if getattr(res, "note", ""):
+                self._log_work(f"[更新] ⚠ {res.note}")
             if res.backup:
                 self._log_work(f"[更新] 万一有问题可以退回去："
                                f"git reset --hard {res.backup}")

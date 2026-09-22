@@ -760,6 +760,47 @@ class StatusUnknownGateTest(unittest.TestCase):
         self.assertIn("查不出工作区状态", result.error)
 
 
+class LocalOfficialFallbackTest(unittest.TestCase):
+    """远端取不到时，本地已有的官方引用要能顶上。
+
+    真机踩过：直连官方的大包传输卡在 0 字节（协商只报 refs/heads/*，服务器每次从 fork 点
+    重算、白下 52 MB），而本地其实已经有完整官方历史——干等着毫无意义。用哪一份必须说清楚。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-fallback-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.work = make_repo(self.tmp / "work", message="我们的第一版")
+        # 在本地造出"官方那个提交"：真实情形就是这样——以前 fetch 回来过，对象已经在本地了
+        git("checkout", "-q", "-b", "official-tmp", cwd=self.work)
+        (self.work / "OFFICIAL.md").write_text("官方往前走了一步\n", encoding="utf-8")
+        git("add", "-A", cwd=self.work)
+        git("commit", "-q", "-m", "官方往前走了一步", cwd=self.work)
+        self.official_sha = git("rev-parse", "HEAD", cwd=self.work).strip()
+        git("checkout", "-q", "-", cwd=self.work)
+        git("update-ref", "refs/remotes/upstream/master", self.official_sha, cwd=self.work)
+        self.url = "git@example.invalid:deepseek-ai/deepseek-harness.git"
+        git("remote", "add", "upstream", self.url, cwd=self.work)
+        self.source = gi.UpdateSource(kind="official", label="从官方更新", remote="upstream",
+                                      url=self.url, branch="master", reachable=True)
+
+    def test_uses_the_local_official_ref_when_the_fetch_fails(self):
+        with mock.patch.object(gi, "LOCAL_FALLBACK_FETCH_TIMEOUT", 5):
+            res = gi.update_from(self.work, self.source, timeout=5)
+        self.assertTrue(res.ok, res.error)
+        self.assertTrue(res.changed, "官方那个提交应当被合进来")
+        self.assertIn("改用手上已取回的", res.note)
+        self.assertIn("不是远端此刻的最新", res.note, "用哪一份必须说清楚")
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.work).strip(), self.official_sha)
+
+    def test_no_fallback_when_there_is_no_local_official_ref(self):
+        git("update-ref", "-d", "refs/remotes/upstream/master", cwd=self.work)
+        with mock.patch.object(gi, "LOCAL_FALLBACK_FETCH_TIMEOUT", 5):
+            res = gi.update_from(self.work, self.source, timeout=5)
+        self.assertFalse(res.ok, "本地没有官方那份时不能假装成功")
+        self.assertIn("取不到远端更新", res.error)
+
+
 class SshKeepaliveTest(unittest.TestCase):
     """SSH 必须有连接超时与保活：真机踩过一次 fetch 卡死 4 分钟、一个字节没收到。"""
 

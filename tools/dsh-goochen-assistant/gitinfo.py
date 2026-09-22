@@ -37,6 +37,9 @@ LS_REMOTE_TIMEOUT = 45
 # 官方那条路要先花几秒 `ls-remote` 探活：真机实测连不上 github 时，全量 fetch 会一直挂到
 # 超时（十分钟都不返回），用户看到的就是"更新卡死"。探不到就直接说清楚，不耗着。
 GIT_FETCH_TIMEOUT = 600
+#: 本地已经有官方引用时（取不到也能顶上），官方 fetch 只等这么久：
+#: 真机踩过一次卡死的传输，而本地其实已有完整官方历史，为它干等十分钟毫无意义。
+LOCAL_FALLBACK_FETCH_TIMEOUT = 120
 # 撤销（merge --abort / rebase --abort）是本地操作，但目录可能有 node_modules，给宽一点
 GIT_UNDO_TIMEOUT = 120
 #: 官方发布 tag 的前缀：`dsh-v0.1.6-alpha.2` → 版本号 `0.1.6-alpha.2`。
@@ -488,6 +491,7 @@ class UpdateResult:
     strategy: str = ""
     backup: str = ""
     conflict: bool = False
+    note: str = ""            # 需要用户知道但不算失败的事（例如"改用了本地已取回的那份"）
     error: str = ""
 
 
@@ -635,6 +639,20 @@ def _unrelated_hint(shallow: bool) -> str:
 DEPENDENCY_MARKERS = ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc")
 
 
+def local_official_ref(path: Path, source: UpdateSource) -> str:
+    """本地是否已经有这个远端的同名引用（`refs/remotes/<远端>/<分支>`）；有就返回短名。
+
+    只对**官方来源**用：它代表"以前完整取回过官方这条分支"，对象都躺在本地。
+    真机踩过：直连官方的大包传输卡在 0 字节（git 协商只报 refs/heads/*，服务器因此
+    每次从 fork 点重算、白下 52 MB），而本地其实已经有完整官方历史——干等着毫无意义。
+    """
+    if source.kind != "official" or not source.remote or not source.branch:
+        return ""
+    ref = f"refs/remotes/{source.remote}/{source.branch}"
+    code, out, _err = run_git(["rev-parse", "--verify", "--quiet", ref], path)
+    return f"{source.remote}/{source.branch}" if code == 0 and out.strip() else ""
+
+
 def changed_paths(path: Path, before: str, after: str) -> Optional[list[str]]:
     """`before..after` 之间改了哪些文件；**查不出来返回 None**（调用方据此走保守路线）。"""
     if not before or not after:
@@ -694,6 +712,11 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
 
     problems: list[str] = []
     fetched = False
+    fallback_note = ""
+    # 本地已有官方引用时，官方 fetch 只等 LOCAL_FALLBACK_FETCH_TIMEOUT：反正取不到也能顶上
+    has_local_official = bool(local_official_ref(path, source))
+    official_wait = (LOCAL_FALLBACK_FETCH_TIMEOUT if has_local_official
+                     else GIT_FETCH_TIMEOUT)
     for target in targets:
         is_official = target not in mirrors and source.kind == "official"
         label = ("国内镜像" if target in mirrors
@@ -708,11 +731,25 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
                                 f"（{_first_line(err_probe) or code_probe}）")
                 continue
         code, _out, err = run_git(["fetch", target, source.branch], path,
-                                  timeout=GIT_FETCH_TIMEOUT if is_official else timeout)
+                                  timeout=official_wait if is_official else timeout)
         if code == 0:
             fetched = True
             break
         problems.append(f"{label}（{target}）：{_first_line(err) or code}")
+    if not fetched:
+        # 取不到远端时，如果本地已经有官方那条引用（以前完整取回来过），就用它——对象都在
+        # 本地，合起来是瞬间的事。真机踩过：直连官方的大包传输卡在 0 字节，可本地其实已经
+        # 有完整的官方历史，干等毫无意义。用哪一份**必须说清楚**，绝不让用户以为合上了最新。
+        local = local_official_ref(path, source)
+        if local:
+            code, _out, err = run_git(
+                ["fetch", ".", f"refs/remotes/{source.remote}/{source.branch}"], path)
+            if code == 0:
+                fetched = True
+                fallback_note = (f"远端这次取不到（{'；'.join(problems)}），"
+                                 f"改用手上已取回的 {local} —— 它不是远端此刻的最新")
+            else:
+                problems.append(f"本地那份 {local} 也用不上：{_first_line(err) or code}")
     if not fetched:
         return UpdateResult(ok=False, error="取不到远端更新：\n  " + "\n  ".join(problems))
 
@@ -815,7 +852,7 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
     subject = _first_line(out) if code == 0 else ""
     return UpdateResult(ok=True, changed=after != info.short, before=info.short,
                         after=after, subject=subject, behind=behind, strategy=used,
-                        backup=backup_branch)
+                        backup=backup_branch, note=fallback_note)
 
 
 def push_branch(path: Path, remote: str, branch: str = "",
