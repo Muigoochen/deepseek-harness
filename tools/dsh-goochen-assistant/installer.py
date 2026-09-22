@@ -213,22 +213,35 @@ def version_ok(version: str) -> bool:
 def pnpm_execpath() -> str:
     """pnpm 的 JS 入口路径（就是 `npm_execpath` 该有的值）。
 
-    构建脚本要拿它再调 `pnpm run build:lib` / `build:web`：`scripts/build.ts` 把
-    `pnpmInvocation()` 的结果交给 `spawnSync`，而这个值**只有 pnpm 自己跑脚本时才注入**。
-    小助手是用 `pnpm run build` 起的没错，但进程环境里未必有（干净机器上就没有，
-    实测构建直接报 "npm_execpath is unavailable" 退出 1）。所以缺了就在这里补：
-    全局装的 pnpm，入口在 `<npm root -g>/pnpm/bin/pnpm.mjs`（老版本是 pnpm.cjs）。
+    构建脚本 `scripts/build.ts` 拿它来再调 pnpm 子脚本，缺了就抛
+    "pnpm invocation: npm_execpath is unavailable; invoke the script through pnpm run."
+    （`scripts/pnpm-invocation.ts` 只在**空或没有**时抛这句）。真机更新就死在这里。
+
+    顺序按"哪条更可能在 GUI 进程里成功"排：先看 `pnpm` 自己在哪（PATH 上的 shim 旁边就是
+    它的真入口，实测 `C:\\Users\\<用户>\\AppData\\Roaming\\npm\\node_modules\\pnpm\\bin\\pnpm.mjs`），
+    再看 `%APPDATA%\\npm`（Windows 全局安装的固定位置），最后才用 `npm root -g`
+    ——最后这条要起一个 npm.cmd 子进程，又慢又可能因为 PATH 不全而失败，不能当主力。
     取不到就返回空串，交给上层如常报错。
     """
+    candidates: list[Path] = []
+    shim = find_pnpm()
+    if shim:
+        beside = Path(shim).parent / "node_modules" / "pnpm" / "bin"
+        candidates += [beside / "pnpm.mjs", beside / "pnpm.cjs"]
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        where = Path(appdata) / "npm" / "node_modules" / "pnpm" / "bin"
+        candidates += [where / "pnpm.mjs", where / "pnpm.cjs"]
     npm = find_npm()
-    if npm is None:
-        return ""
-    try:
-        root = run_text([npm, "root", "-g"]).strip()
-    except Exception:                # noqa: BLE001  查不到就当作补不了
-        return ""
-    for name in ("pnpm.mjs", "pnpm.cjs"):
-        candidate = Path(root) / "pnpm" / "bin" / name
+    if npm is not None:
+        try:
+            root = run_text([npm, "root", "-g"]).strip()
+        except Exception:              # noqa: BLE001  npm 起不来就跳过这条
+            root = ""
+        if root:
+            candidates += [Path(root) / "pnpm" / "bin" / "pnpm.mjs",
+                           Path(root) / "pnpm" / "bin" / "pnpm.cjs"]
+    for candidate in candidates:
         if candidate.exists():
             return str(candidate)
     return ""
@@ -298,14 +311,20 @@ def build_variables(project: Path, log=log_line,
     current = os.environ if base is None else base
     extras: dict[str, str] = {}
     entry = current.get("npm_execpath", "")
-    # 没有、或者指向一个已经不存在的文件（pnpm 装在别处、store 被清过），都补成
-    # 这台机器上现在这个 pnpm 的真实入口——构建脚本拿它去调 pnpm 子脚本。
+    # 只在"没有"或"指向的文件已经不在了"时才替换：构建脚本要用的是**启动它的那个 pnpm**，
+    # 它可能来自项目本地或 corepack，版本和全局那份未必相同；能用就别动它。
+    # 真机那次构建报 "npm_execpath is unavailable"，根因是 pnpm_execpath() 找不到入口
+    # （原来只靠 `npm root -g`，在 GUI 进程里不可靠），所以修的是"入口查找"，
+    # 而不是无脑覆盖调用方的选择。
     if not entry or not Path(entry).exists():
         resolved = pnpm_execpath()
         if resolved and resolved != entry:
             extras["npm_execpath"] = resolved
             log(f"  补齐 npm_execpath = {resolved}"
-                + (f"（原值不可用：{entry}）" if entry else ""))
+                + (f"（原值不可用：{entry}）" if entry else "（原环境里没有）"))
+        elif not resolved:
+            log("  ⚠ 找不到 pnpm 的入口；构建脚本 scripts/pnpm-invocation.ts 可能报"
+                " npm_execpath is unavailable")
     if not (project / ".git").exists():
         marker = commit_marker or (SOURCE_ARCHIVE.parent / "source-commit.txt")
         raw = ""
@@ -2383,10 +2402,18 @@ class App(tk.Tk):
         if ok:
             self._log_work(f"[回退] ✓ {detail}")
             self._set_label(self.git_note, f"✓ {detail}", "#1a6b1a")
-            messagebox.showinfo("回退完成",
-                                f"{detail}\n\n建议再点一次【重新构建】，"
-                                "让依赖和产物跟上旧版本。",
-                                parent=self)
+            # 回退只动源码：node_modules 和构建产物还留着"更新后"那一版，两边对不上就会
+            # 起不来。真机就是"回退后运行不了，重启小助手才行"——所以这里主动问一句。
+            rebuild = messagebox.askyesno(
+                "回退完成，顺手把依赖和构建修正吗？",
+                f"{detail}\n\n"
+                "代码已经回到更新前了，但 node_modules 和构建产物可能还是更新后的那一版——"
+                "刚才运行不起来多半就是因为这个。\n\n"
+                "现在重装依赖并重新构建吗？（推荐，首次几分钟）",
+                parent=self)
+            self._schedule_git_refresh(200)
+            if rebuild:
+                self.after(300, self.on_rebuild)
         else:
             self._log_work(f"[回退] ✗ {detail}")
             self._set_label(self.git_note, "回退失败（见日志）", "#b00000")

@@ -875,6 +875,49 @@ class TransientRetryTest(unittest.TestCase):
         self.assertIn("--offline", seen[0], "『离线安装』模式仍然严格不联网")
 
 
+class PnpmExecpathTest(unittest.TestCase):
+    """构建报 "npm_execpath is unavailable" 的根：小助手自己没把 pnpm 入口补对。
+
+    `scripts/pnpm-invocation.ts` 只在 npm_execpath **空或没有**时抛那句话，而真机更新就死在
+    这句上。原实现只靠 `npm root -g` 去找 pnpm，那条路要起一个 npm.cmd 子进程，在 GUI 进程里
+    不可靠（PATH 不全会失败）。现在按"PATH 上 pnpm shim 的同级目录 → %APPDATA%\\npm →
+    npm root -g"的顺序找。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-execpath-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_prefers_the_entry_beside_the_pnpm_shim(self):
+        bin_dir = self.tmp / "node_modules" / "pnpm" / "bin"
+        bin_dir.mkdir(parents=True)
+        entry = bin_dir / "pnpm.mjs"
+        entry.write_text("// pnpm entry\n", encoding="utf-8")
+        with mock.patch.object(installer, "find_pnpm", lambda: str(self.tmp / "pnpm.CMD")), \
+                mock.patch.object(installer, "find_npm", lambda: None):
+            self.assertEqual(installer.pnpm_execpath(), str(entry),
+                             "PATH 上的 pnpm shim 旁边就是它的真入口")
+
+    def test_no_candidate_means_empty_not_a_lie(self):
+        with mock.patch.object(installer, "find_pnpm", lambda: None), \
+                mock.patch.object(installer, "find_npm", lambda: None), \
+                mock.patch.dict(installer.os.environ, {"APPDATA": str(self.tmp)}):
+            self.assertEqual(installer.pnpm_execpath(), "",
+                             "找不到就如实返回空串，别编一个假路径")
+
+    def test_build_variables_replaces_a_stale_entry(self):
+        """环境里那个值指向一个已经不在的文件时，必须补成这台机器上真存在的入口。
+
+        真机那次构建抛 "npm_execpath is unavailable"，根因就是入口没找到——
+        这里锁住"过期值一定要换掉"，同时不碰"可用值"（那条由老测试守着）。
+        """
+        extras = installer.build_variables(self.tmp, log=lambda _m: None,
+                                           base={"npm_execpath": r"C:\stale\pnpm.mjs"})
+        self.assertIn("npm_execpath", extras)
+        self.assertTrue(Path(extras["npm_execpath"]).exists(),
+                        "补进去的必须是真存在的入口")
+
+
 class DepsChangeTest(unittest.TestCase):
     """依赖清单变了才重装依赖；只改源码就别再花几分钟装一遍。
 
