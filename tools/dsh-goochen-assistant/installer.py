@@ -38,6 +38,7 @@ import fetch as fetcher        # 取件层：离线包 → 国内镜像 → 官�
 from contextlib import contextmanager
 import plugin_store as pstore  # 插件管理原语（同目录模块）
 import gitinfo as ginfo        # 真 git 命令层（识别/校验/版本/更新）
+import sessiondata as sdata    # 会话数据冷备份（唯一一个 git 救不回来的东西）
 
 __version__ = "0.1.0"
 
@@ -1613,6 +1614,23 @@ class App(tk.Tk):
                                   font=("Microsoft YaHei UI", 8), justify="left",
                                   wraplength=WRAP_LEFT)
         self.git_note.pack(anchor="w", pady=(4, 0))
+        # 会话数据是**唯一**一个 git 救不回来的东西：代码坏了 reset 就回来了，会话被迁移
+        # 坏了（0.1.2→0.1.6 会把格式从 v0 升到 v3，单向）只有这份备份能救。所以这一组
+        # 按钮不带任何条件，一直显示。
+        srow = ttk.Frame(gbox)
+        srow.pack(fill="x", pady=(6, 0))
+        self.btn_sess_backup = ttk.Button(srow, text="备份会话数据",
+                                          command=self.on_backup_sessions)
+        self.btn_sess_backup.pack(side="left")
+        self.btn_sess_restore = ttk.Button(srow, text="还原…", width=8,
+                                           command=self.on_restore_sessions)
+        self.btn_sess_restore.pack(side="left", padx=(6, 0))
+        self.sess_note = ttk.Label(gbox, text="会话数据不在 git 里；更新前会自动备份一份",
+                                   foreground="#888", font=("Microsoft YaHei UI", 8),
+                                   justify="left", wraplength=WRAP_LEFT)
+        self.sess_note.pack(anchor="w", pady=(2, 0))
+        self._wrap_labels.append(self.sess_note)
+        self.after(200, self._refresh_session_note)
         self._wrap_labels.append(self.git_note)
 
         # 安装方式（可折叠：装好之后基本不用动；标题上始终显示当前选择）
@@ -2292,6 +2310,100 @@ class App(tk.Tk):
                 f"{detail}\n\n网络慢的时候可以配**国内镜像**（配置项 gitMirror 或环境变量 "
                 "DSH_GIT_MIRROR）再试。", parent=self)
 
+    def _refresh_session_note(self) -> None:
+        """显示"最近一份会话备份是什么时候的、放哪儿"——用户最想知道的就是这个。"""
+        try:
+            snaps = sdata.list_snapshots()
+        except Exception as exc:  # noqa: BLE001  读备份目录失败不该影响别的功能
+            self._set_label(self.sess_note, f"读不出备份目录：{exc}", "#b00000")
+            return
+        root = sdata.default_backup_root()
+        if not snaps:
+            self._set_label(self.sess_note,
+                            f"还没有备份（更新前会自动备份一份）；备份会放在 {root}", "#888")
+            return
+        newest = snaps[0]
+        self._set_label(self.sess_note,
+                        f"最近备份：{newest.created_at}（{newest.size_text}）· "
+                        f"共 {len(snaps)} 份 · {root}", "#1a6b1a")
+
+    def on_backup_sessions(self) -> None:
+        """手动备份会话数据（更新前会自动做一次，这里给自己想备份时用）。"""
+        if self.git_busy or self.busy:
+            return
+        self.git_busy = True
+        self._set_git_buttons(False)
+        self._set_label(self.sess_note, "正在备份会话数据…", "#a05a00")
+        try:
+            threading.Thread(target=self._backup_worker, args=("手动备份",),
+                             daemon=True).start()
+        except RuntimeError as exc:                 # 线程起不来也要把按钮放回去
+            self._post(self._backup_done, sdata.BackupResult(ok=False, error=str(exc)))
+
+    def _backup_worker(self, label: str) -> None:
+        target = self._effective_dir()
+        info = ginfo.repo_info(target)
+        res = sdata.snapshot(label=label, app_version=info.version, app_commit=info.short,
+                             log=self._append)
+        self._post(self._backup_done, res)
+
+    def _backup_done(self, res) -> None:
+        self.git_busy = False
+        self._set_git_buttons(True)
+        self._refresh_session_note()
+        if res.ok:
+            return
+        self._append(f"[会话备份] ✗ 失败：{res.error}")
+        messagebox.showerror("备份会话数据失败", res.error, parent=self)
+
+    def _backup_before_update(self, target: Path, source) -> bool:
+        """更新前冷备份会话数据。**失败就不更新**——没备份就动这个仓库，不划算。
+
+        放在更新动作之前、而不是之后：这次跨越会把会话格式从 v0 升到 v3，迁移是单向的，
+        等出事再备份已经晚了。
+        """
+        info = ginfo.repo_info(target)
+        res = sdata.snapshot(
+            label=f"{source.label}之前（本地 {info.version or '读不到版本'}）",
+            app_version=info.version, app_commit=info.short, log=self._append)
+        if res.ok:
+            return True
+        self._append(f"[更新] ✗ 会话数据没备份成功，已停止更新：{res.error}")
+        return False
+
+    def on_restore_sessions(self) -> None:
+        """从备份还原会话数据。**必须先停服务**：服务在写日志时覆盖只会得到半截数据。"""
+        snaps = sdata.list_snapshots()
+        if not snaps:
+            messagebox.showinfo("还没有备份",
+                                f"还没备份过。备份目录：{sdata.default_backup_root()}",
+                                parent=self)
+            return
+        if port_in_use():
+            messagebox.showwarning(
+                "先停服务",
+                f"127.0.0.1:{WEB_PORT} 上还有服务在跑。\n\n"
+                "服务正在写会话日志，这时候覆盖文件只会得到半截数据。\n"
+                "请先停止服务，再回来还原。",
+                parent=self)
+            return
+        newest = snaps[0]
+        others = len(snaps) - 1
+        tail = (f"\n\n另外还有 {others} 份更旧的备份，都在 {sdata.default_backup_root()} 里，"
+                "要选别的可以直接改「会话备份目录」后手动复制。" if others else "")
+        if not messagebox.askyesno(
+                "还原会话数据？",
+                f"要还原最近这份备份吗？\n\n  时间：{newest.created_at}\n"
+                f"  体量：{newest.size_text}\n  位置：{newest.path}{tail}",
+                parent=self):
+            return
+        ok, detail = sdata.restore(newest.path, log=self._append)
+        self._refresh_session_note()
+        if ok:
+            messagebox.showinfo("还原完成", detail, parent=self)
+        else:
+            messagebox.showerror("还原失败", detail, parent=self)
+
     def on_update_from(self, kind: str) -> None:
         """从「官方」或「你自己的仓库」更新：能快进就快进，分叉就合并 + 自动备份。
 
@@ -2373,6 +2485,12 @@ class App(tk.Tk):
         try:
             if source is None:
                 self._post(self._update_done, False, "没有可用的更新来源", was_running)
+                return
+            # 备份**先做**：这次更新会把会话格式从 v0 升到 v3，迁移是单向的；
+            # 没备份成功就不动这个仓库（代码坏了能 reset，会话坏了只有备份能救）。
+            if not self._backup_before_update(target, source):
+                self._post(self._update_done, False,
+                           "会话数据备份失败（没备份就不更新）", was_running)
                 return
             eng = Engine(mode="auto", use_mirror=mirror, log=self._append)
             # 配置里是 (名字, 地址) 二元组，这里只要地址：传元组会让 Popen 直接抛 TypeError

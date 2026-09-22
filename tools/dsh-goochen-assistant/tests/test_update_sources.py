@@ -416,12 +416,19 @@ class UpdateWorkerTest(unittest.TestCase):
             self._update_sources = sources
             self.log: list[str] = []
             self.posted: list[tuple] = []
+            self.backed_up: list[str] = []      # 会话备份被叫过几次、对谁
+            self.backup_ok = True               # 想验"备份失败就不更新"时置 False
 
         def _append(self, msg):
             self.log.append(str(msg))
 
         def _update_done(self, ok, detail, was_running):
             """工作线程会把它当回调交给 _post；替身里只要存在即可（_post 只记录）。"""
+
+        def _backup_before_update(self, target, source):
+            """真 App 这里会真备份会话数据、失败就拒绝更新；替身只记一笔并放行。"""
+            self.backed_up.append(str(target))
+            return self.backup_ok
 
         def _post(self, func, *args):
             self.posted.append((getattr(func, "__name__", str(func)), args))
@@ -439,6 +446,22 @@ class UpdateWorkerTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_update_is_refused_when_the_session_backup_fails(self):
+        """会话数据没备份成功就不更新。
+
+        代码坏了 `git reset` 就回来了，会话被迁移坏了（v0→v3 单向）只有备份能救，
+        所以"没备份成就照常更新"是不能接受的。
+        """
+        fake = self._Fake([self.source])
+        fake.backup_ok = False
+        installer.App._update_worker(fake, self.target, False, True, self.source)
+        self.assertEqual(fake.backed_up, [str(self.target)], "更新前必须先备份会话数据")
+        self.assertTrue(fake.posted, "应当报告失败")
+        name, args = fake.posted[0]
+        self.assertEqual(name, "_update_done")
+        self.assertFalse(args[0], "失败就该报 ok=False")
+        self.assertIn("会话数据备份失败", args[1])
 
     def _run_worker(self, result, *, kind="official",
                     mirrors=(("国内镜像1", "https://mirror/x.git"),), source=None):
