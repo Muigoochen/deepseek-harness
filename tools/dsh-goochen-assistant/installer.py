@@ -59,6 +59,24 @@ BUILD_MARK = ".dsh-build/client-build-environment.json"
 WEB_URL = "http://127.0.0.1:3080"
 WEB_PORT = 3080                  # dsh web 默认端口；"有没有在跑"一律按它认定
 
+def git_proxy() -> str:
+    """让 git 走代理：环境变量 `DSH_GIT_PROXY` 优先，其次配置项 `gitProxy`。
+
+    真机实测这个网络直连 github 不通（https 被重置、全量 fetch 十分钟不返回），
+    官方那一路要靠代理或镜像。配了就把值写进环境变量——`gitinfo.run_git` 每次调用都读它。
+    写法就是 git 认的那种：`http://127.0.0.1:7890`、`socks5h://127.0.0.1:1080`。
+    """
+    value = os.environ.get("DSH_GIT_PROXY", "").strip()
+    if not value:
+        try:
+            value = str(load_config().get("gitProxy", "") or "").strip()
+        except Exception:            # noqa: BLE001  配置读不出来就当没配
+            value = ""
+        if value:
+            os.environ["DSH_GIT_PROXY"] = value      # gitinfo 只认环境变量
+    return value
+
+
 def git_mirrors() -> list[tuple[str, str]]:
     """用户自己配的 git 镜像（可留空）：环境变量 `DSH_GIT_MIRROR` 优先，其次配置项。
 
@@ -1599,6 +1617,10 @@ class App(tk.Tk):
         self.btn_update_mine = ttk.Button(grow, text="从你的仓库更新", width=18,
                                           command=lambda: self.on_update_from("mine"))
         self._update_sources: list = []     # 检查更新时探测到的来源，按钮据此显示
+        # 浅克隆（在线安装的默认形态）跟官方没有共同祖先，合并会被拒绝——这是"补齐历史"的
+        # 入口，只在仓库确实是浅克隆时才出现。所谓根治：以后装出来的浅克隆也有救。
+        self.btn_deepen = ttk.Button(grow, text="补齐历史", width=10,
+                                     command=self.on_deepen)
         self.git_note = ttk.Label(gbox, text="检查更新需要联网", foreground="#888",
                                   font=("Microsoft YaHei UI", 8), justify="left",
                                   wraplength=WRAP_LEFT)
@@ -2107,7 +2129,7 @@ class App(tk.Tk):
     def _set_git_buttons(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
         for btn in (self.btn_git_refresh, self.btn_git_update,
-                    self.btn_update_official, self.btn_update_mine):
+                    self.btn_update_official, self.btn_update_mine, self.btn_deepen):
             try:
                 btn.configure(state=state)
             except Exception:  # noqa: BLE001  同上：窗口可能已销毁
@@ -2125,6 +2147,7 @@ class App(tk.Tk):
                          daemon=True).start()
 
     def _check_update_worker(self, target: Path) -> None:
+        git_proxy()          # 有代理就先让 git 用上，不然官方那一路连不通
         try:
             status = ginfo.check_update(target)
         except Exception as exc:  # noqa: BLE001  git 层意外 → 如实显示失败原因
@@ -2135,14 +2158,21 @@ class App(tk.Tk):
             sources, error = ginfo.update_sources(target, mirrors=git_mirrors())
         except Exception as exc:  # noqa: BLE001  探测失败不该让检查更新整个失败
             sources, error = [], str(exc)
-        self._post(self._refresh_update_buttons, sources, error)
+        self._post(self._refresh_update_buttons, sources, error,
+                   ginfo.repo_info(target).shallow)
 
-    def _refresh_update_buttons(self, sources, error: str = "") -> None:
+    def _refresh_update_buttons(self, sources, error: str = "",
+                                shallow: bool = False) -> None:
         """按探测到的来源显示 1 个还是 2 个更新按钮；没有来源就都不显示并说明原因。
 
         文字用来源自己的 label（官方＝「从官方更新」，自己的＝「从你的仓库更新（owner）」）。
         远端探不到（比如网络不通）也照常显示按钮——点下去会如实报错，比藏起来更让人明白。
+        `shallow` 为真时多出一个「补齐历史」：浅克隆跟官方没有共同祖先，不补就合不了。
         """
+        if shallow:
+            self.btn_deepen.pack(side="left", padx=(6, 0))
+        else:
+            self.btn_deepen.pack_forget()
         self._update_sources = list(sources)
         by_kind = {source.kind: source for source in sources}
         for kind, btn in (("official", self.btn_update_official),
@@ -2194,6 +2224,70 @@ class App(tk.Tk):
                          "不会把你带到官方版本。要跟官方，得自己把官方并进来，例如：\n"
                          "        git fetch upstream && git rebase upstream/master\n"
                          "       （有本地提交时不能快进，工具不会替你合并，避免覆盖你的东西）")
+
+    def on_deepen(self) -> None:
+        """补齐浅克隆的历史（`git fetch --unshallow`）——补完才可能跟官方合并。
+
+        线上安装用的是 `git clone --depth 1`（快、省流量），但历史被截断：跟官方合并时
+        两边找不到共同祖先，git 会直接拒绝。这个按钮就是给这种情况的出路，只补历史，
+        不动用户的任何文件和提交。
+        """
+        if self.git_busy or self.busy or self._closing:
+            return
+        target = self._effective_dir()
+        info = ginfo.repo_info(target)
+        if not info.shallow:
+            messagebox.showinfo("不用补", "这个目录的历史是完整的，不需要补齐。", parent=self)
+            return
+        remote = ginfo.tracking_remote(info)
+        if not messagebox.askyesno(
+                "补齐历史",
+                f"目录：{target}\n\n"
+                "这个目录是「浅克隆」（历史不完整），所以跟官方合并时会因为找不到共同祖先"
+                "而被拒绝。\n\n"
+                f"接下来从 {remote} 把完整历史取下来（可能比较久、也比较吃流量），"
+                "只补历史，不动你的任何文件和提交。\n\n继续吗？", parent=self):
+            return
+        self.git_busy = True
+        self._set_git_buttons(False)
+        self._set_label(self.git_note, "正在补齐历史…（进度见下方日志）", "#a05a00")
+        try:
+            threading.Thread(target=self._deepen_worker, args=(target, remote),
+                             daemon=True).start()
+        except RuntimeError as exc:                # 线程起不来也要把按钮放回去
+            self._append(f"[补齐] 起不了后台线程：{exc}")
+            self._post(self._deepen_done, False, str(exc))
+
+    def _deepen_worker(self, target: Path, remote: str) -> None:
+        try:
+            git_proxy()                            # 有代理先让 git 用上
+            self._append(f"[补齐] 正在从 {remote} 取完整历史（可能要几分钟）…")
+            code, _out, err = ginfo.run_git(["fetch", "--unshallow", remote], target,
+                                            timeout=ginfo.GIT_FETCH_TIMEOUT)
+            if code != 0:
+                self._post(self._deepen_done, False, err.strip()[:300]
+                           or f"git 退出码 {code}")
+                return
+            still = ginfo.repo_info(target).shallow
+            self._post(self._deepen_done, not still,
+                       "历史已补齐" if not still else "取完了，但还是浅克隆（远端历史本身不全）")
+        except Exception as exc:                   # noqa: BLE001  如实报告，别静默
+            self._post(self._deepen_done, False, str(exc))
+
+    def _deepen_done(self, ok: bool, detail: str) -> None:
+        self.git_busy = False
+        self._set_git_buttons(True)
+        if ok:
+            self._append(f"[补齐] {detail}；现在可以试【从官方更新】了。")
+            self._set_label(self.git_note, detail, "#1a6b1a")
+            self.on_check_update()
+        else:
+            self._append(f"[补齐] 失败：{detail}")
+            self._set_label(self.git_note, "补齐历史失败（见日志）", "#b00020")
+            messagebox.showerror(
+                "补齐历史失败",
+                f"{detail}\n\n网络不好时可以配代理（配置项 gitProxy 或环境变量 DSH_GIT_PROXY）"
+                "或镜像（gitMirror）再试。", parent=self)
 
     def on_update_from(self, kind: str) -> None:
         """从「官方」或「你自己的仓库」更新：能快进就快进，分叉就合并 + 自动备份。
@@ -2268,6 +2362,7 @@ class App(tk.Tk):
             if source is None:
                 self._post(self._update_done, False, "没有可用的更新来源", was_running)
                 return
+            git_proxy()          # 有代理就先让 git 用上
             eng = Engine(mode="auto", use_mirror=mirror, log=self._append)
             # 配置里是 (名字, 地址) 二元组，这里只要地址：传元组会让 Popen 直接抛 TypeError
             mirror_urls = [url for _name, url in git_mirrors()]

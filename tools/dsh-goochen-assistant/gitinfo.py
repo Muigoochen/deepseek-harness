@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -51,13 +52,27 @@ def git_exe() -> Optional[str]:
         return None
 
 
+def git_proxy() -> str:
+    """用户配的代理（可留空）：环境变量 `DSH_GIT_PROXY`。
+
+    写法就是 git 认的那种，例如 `http://127.0.0.1:7890`、`socks5h://127.0.0.1:1080`。
+    真机实测这个网络直连 github 是不通的（https 被重置、全量 fetch 十分钟不返回），
+    官方那一路要靠它才走得通。
+    """
+    return os.environ.get("DSH_GIT_PROXY", "").strip()
+
+
 def run_git(args: Sequence[str], cwd: Optional[Path] = None, *,
             timeout: int = DEFAULT_TIMEOUT) -> tuple[int, str, str]:
     """跑一条 git，返回 `(退出码, stdout, stderr)`；不抛异常。"""
     exe = git_exe()
     if exe is None:
         return GIT_MISSING, "", "未检测到 git（请先安装 Git for Windows）"
-    argv = [exe] + (["-C", str(cwd)] if cwd is not None else []) + list(args)
+    proxy = git_proxy()
+    # -c 必须放在**子命令前面**。对所有联网动作（fetch/ls-remote/clone）生效，本地操作不受影响，
+    # 所以统一在这里加一次，免得漏掉某个调用点。
+    pre = (["-c", f"http.proxy={proxy}", "-c", f"https.proxy={proxy}"] if proxy else [])
+    argv = [exe] + pre + (["-C", str(cwd)] if cwd is not None else []) + list(args)
     try:
         # 经 childproc 跑：句柄登记在册，关窗时能连同子孙一起结束（fetch 可能跑很久）
         proc = childproc.run(argv, text=True, encoding="utf-8", timeout=timeout)
