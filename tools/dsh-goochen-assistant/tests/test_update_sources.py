@@ -283,6 +283,24 @@ class UpdateButtonsGuiTest(unittest.TestCase):
         self.app.update()
         self.assertEqual(self._shown(), [("mine", "从你的仓库更新（Muigoochen）")])
 
+    def test_asks_to_push_back_only_when_mine_exists(self):
+        """合完官方之后，只有"用户还有自己的仓库"时才问要不要推回去。"""
+        calls: list = []
+        self.app._update_sources = [gi.UpdateSource(kind="mine", label="从你的仓库更新（me）",
+                                                    remote="origin", branch="plugins")]
+        with mock.patch.object(type(self.app), "_maybe_push_to_mine",
+                               lambda _self, mine, was_running:
+                               calls.append(mine) or False):
+            self.app._update_done(True, "a → b", False)
+        self.assertEqual(len(calls), 1, "有自己仓库就该问一句")
+        calls.clear()
+        self.app._update_sources = []
+        with mock.patch.object(type(self.app), "_maybe_push_to_mine",
+                               lambda _self, mine, was_running:
+                               calls.append(mine) or False):
+            self.app._update_done(True, "a → b", False)
+        self.assertEqual(calls, [], "没有自己仓库就别问")
+
     def test_deepen_button_only_when_shallow(self):
         """浅克隆要能看到「补齐历史」；历史完整时不该出现（免得误导）。"""
         self.app._refresh_update_buttons([], "", True)
@@ -531,6 +549,63 @@ class OfficialStatusCwdTest(unittest.TestCase):
         self.assertTrue(seen, "应当真的问过远端")
         self.assertEqual(set(seen), {str(target)},
                          f"ls-remote 必须站在目标目录里跑，否则会问到别的仓库；实际：{seen}")
+
+
+class PushToOwnRepoTest(unittest.TestCase):
+    """把你自己的仓库也更新到同一个状态：本地合完官方之后推回自己的远端。
+
+    没有这一步，"有自己仓库"的用户永远是"本地新、仓库旧"，别的机器从仓库更新拿不到官方。
+    只做普通推送，绝不强推；远端比本地新时必须拒绝并说清楚。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-push-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pair(self):
+        bare = self.tmp / "mine.git"
+        git("init", "-q", "--bare", str(bare), cwd=self.tmp)
+        work = make_repo(self.tmp / "work", message="第一版")
+        git("remote", "add", "origin", str(bare), cwd=work)
+        git("push", "-q", "-u", "origin", "main", cwd=work)
+        return bare, work
+
+    def test_pushes_the_new_commit_to_my_repo(self):
+        bare, work = self._pair()
+        (work / "RE_新东西.md").write_text("新\n", encoding="utf-8")
+        git("add", "-A", cwd=work)
+        git("commit", "-q", "-m", "本地新提交", cwd=work)
+        ok, error = gi.push_branch(work, "origin", "main")
+        self.assertTrue(ok, error)
+        self.assertEqual(git("rev-parse", "main", cwd=bare),
+                         git("rev-parse", "HEAD", cwd=work),
+                         "你自己仓库的分支应当和本地一致了")
+
+    def test_refuses_when_my_repo_is_ahead_instead_of_force_pushing(self):
+        bare, work = self._pair()
+        other = self.tmp / "other"
+        git("clone", "-q", str(bare), str(other), cwd=self.tmp)
+        (other / "RE_别处.md").write_text("别处\n", encoding="utf-8")
+        git("add", "-A", cwd=other)
+        git("commit", "-q", "-m", "别处提交", cwd=other)
+        git("push", "-q", "origin", "main", cwd=other)     # 远端先往前走了一步
+        (work / "RE_我这边.md").write_text("我这边\n", encoding="utf-8")
+        git("add", "-A", cwd=work)
+        git("commit", "-q", "-m", "本地新提交", cwd=work)
+        before = git("rev-parse", "main", cwd=bare)
+        ok, error = gi.push_branch(work, "origin", "main")
+        self.assertFalse(ok)
+        self.assertIn("远端比本地新", error)
+        self.assertEqual(git("rev-parse", "main", cwd=bare), before,
+                         "被拒绝时远端一个字节都不能动（绝不强推）")
+
+    def test_missing_remote_is_reported(self):
+        _, work = self._pair()
+        ok, error = gi.push_branch(work, "", "main")
+        self.assertFalse(ok)
+        self.assertIn("远端", error)
 
 
 if __name__ == "__main__":

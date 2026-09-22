@@ -2307,9 +2307,11 @@ class App(tk.Tk):
                   "合并前会先自动打一个备份分支（backup/before-update-…），",
                   "万一冲突会整体撤销、你的文件一个都不动。",
                   "",
-                  "之后：重装依赖 → 重新构建（首次较慢）",
-                  "",
-                  "继续吗？"]
+                  "之后：重装依赖 → 重新构建（首次较慢）"]
+        if any(s.kind == "mine" for s in self._update_sources):
+            lines += ["", "合完之后会问你一句：要不要顺手把结果推回你自己的仓库"
+                          "（只做普通推送，绝不强推）。"]
+        lines += ["", "继续吗？"]
         if not messagebox.askyesno(source.label, "\n".join(lines), parent=self):
             return
         # 服务在跑就先停：Windows 上 node_modules 里的文件被占用时无法被替换
@@ -2386,6 +2388,67 @@ class App(tk.Tk):
         self._append(f"[更新] ✓ 更新完成：{detail}")
         self._set_label(self.git_note, f"✓ 更新完成（{detail}）", "#1a6b1a")
         self._schedule_git_refresh(200)
+        # 有自己仓库的用户，光本地合了官方还不够：他的仓库还停在旧版本，
+        # 别的机器从它更新拿不到官方那部分。所以问一句要不要顺手推回去。
+        mine = next((s for s in self._update_sources if s.kind == "mine"), None)
+        if mine is not None and self._maybe_push_to_mine(mine, was_running):
+            return                     # 推完由 _push_done 收尾（包括重启服务）
+        if was_running:
+            self._append("[更新] 服务原本在运行，正在重新启动 …")
+            self.on_terminal()
+
+    def _maybe_push_to_mine(self, mine, was_running: bool) -> bool:
+        """问一句要不要把合并结果推回用户自己的仓库；返回"是否去推了"。
+
+        只做普通推送，绝不强推；远端比本地新时会被拒绝，那就如实报并让他先去那边处理。
+        """
+        if not messagebox.askyesno(
+                "推回你的仓库？",
+                f"本地已经更新好了。\n\n"
+                f"要不要顺手把这次结果推回你自己的仓库"
+                f"（{mine.remote}／{mine.branch}）？\n\n"
+                "推回去之后，你的仓库也带上官方这次的更新——别的机器从你的仓库更新"
+                "就能拿到；不推的话只有这台机器是新的。\n\n"
+                "（只做普通推送，绝不强推。远端比本地新时会被拒绝，那就先去那边处理。）",
+                parent=self):
+            return False
+        self.git_busy = True
+        self._set_git_buttons(False)
+        self._set_label(self.git_note, "正在推回你的仓库…", "#a05a00")
+        try:
+            threading.Thread(target=self._push_worker,
+                             args=(self._effective_dir(), mine.remote, mine.branch,
+                                   was_running), daemon=True).start()
+        except RuntimeError as exc:                # 线程起不来也要把按钮放回去
+            self._append(f"[推送] 起不了后台线程：{exc}")
+            self._post(self._push_done, False, str(exc), mine.remote, mine.branch,
+                       was_running)
+        return True
+
+    def _push_worker(self, target: Path, remote: str, branch: str,
+                     was_running: bool) -> None:
+        try:
+            ok, error = ginfo.push_branch(target, remote, branch)
+        except Exception as exc:                   # noqa: BLE001  推送失败也要说清楚
+            ok, error = False, str(exc)
+        self._post(self._push_done, ok, error, remote, branch, was_running)
+
+    def _push_done(self, ok: bool, error: str, remote: str, branch: str,
+                   was_running: bool) -> None:
+        self.git_busy = False
+        self._set_git_buttons(True)
+        if ok:
+            self._append(f"[推送] ✓ 已推回你的仓库：{remote}/{branch}"
+                         "（别的机器从它更新就能拿到这次的内容）")
+            self._set_label(self.git_note, f"✓ 已推回 {remote}/{branch}", "#1a6b1a")
+        else:
+            self._append(f"[推送] ✗ 推回失败：{error}")
+            self._set_label(self.git_note, "推回你的仓库失败（见日志）", "#b00000")
+            messagebox.showerror(
+                "推回你的仓库失败",
+                f"{error}\n\n本机已经更新好了，这一步失败不影响本机使用。\n"
+                f"想手动推，就在这个目录里跑：\n    git push {remote} {branch}",
+                parent=self)
         if was_running:
             self._append("[更新] 服务原本在运行，正在重新启动 …")
             self.on_terminal()

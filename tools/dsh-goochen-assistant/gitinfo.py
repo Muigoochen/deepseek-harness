@@ -732,6 +732,25 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
                         backup=backup_branch)
 
 
+def push_branch(path: Path, remote: str, branch: str = "",
+                timeout: int = GIT_FETCH_TIMEOUT) -> tuple[bool, str]:
+    """把当前分支推到指定远端，返回 `(成功, 错误说明)`。**永不 force**。
+
+    什么时候用：本地已经合进官方之后，把你自己的仓库也更新到同一个状态。否则别的机器
+    从你的仓库更新时永远看不到官方那部分（你的仓库还停在旧版本）。
+    远端比本地新时 git 会拒绝——那就如实报，绝不硬推。
+    """
+    if not remote:
+        return False, "不知道往哪个远端推"
+    code, _out, err = run_git(["push", remote, branch or "HEAD"], path, timeout=timeout)
+    if code == 0:
+        return True, ""
+    if "rejected" in err or "non-fast-forward" in err or "fetch first" in err:
+        return False, ("远端比本地新，推送被拒绝（不是本地的问题）——先去你的仓库那边把它"
+                       "多出来的提交拉下来处理，别硬推。")
+    return False, _first_line(err) or f"git 退出码 {code}"
+
+
 def update_repo(path: Path, *, remote: str = "") -> UpdateResult:
     """把安装目录**快进**到远端最新。只走 fast-forward，绝不产生合并提交。
 
