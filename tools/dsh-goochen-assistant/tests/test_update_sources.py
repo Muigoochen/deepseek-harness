@@ -918,6 +918,54 @@ class PnpmExecpathTest(unittest.TestCase):
                         "补进去的必须是真存在的入口")
 
 
+class BuildRetryTest(unittest.TestCase):
+    """构建报 npm_execpath 缺失时，换一条不经过 cmd shim 的路再试一次。
+
+    真机连续两次死在这句话上，而管道本身验过是通的；shim 那层是最可疑的一段，
+    所以失败就改用 `node <pnpm 入口> run build` 重试，并把两边的事实写进日志文件。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-buildretry-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_retries_through_the_pnpm_entrypoint(self):
+        calls: list[list[str]] = []
+
+        def fake(argv, cwd=None, **kwargs):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                return installer.subprocess.CompletedProcess(
+                    argv, 1, b"", b"Error: pnpm invocation: npm_execpath is unavailable")
+            return installer.subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        entry = str(self.tmp / "pnpm.mjs")
+        eng = installer.Engine("auto", use_mirror=True, log=lambda _m: None)
+        with mock.patch.object(installer, "run_cli", side_effect=fake), \
+                mock.patch.object(installer, "pnpm_execpath", lambda: entry), \
+                mock.patch.object(installer, "build_variables", lambda *a, **k: {}):
+            eng.build(self.tmp, force=True)
+        self.assertEqual(len(calls), 2, "应该重试一次")
+        self.assertEqual(calls[0][:2], ["pnpm", "run"])
+        self.assertEqual(calls[1][:2], ["node", entry], "重试要走 node 直跑 pnpm 入口")
+
+    def test_does_not_retry_other_failures(self):
+        calls: list[list[str]] = []
+
+        def fake(argv, cwd=None, **kwargs):
+            calls.append(list(argv))
+            return installer.subprocess.CompletedProcess(argv, 1, b"", b"TypeError: other")
+
+        entry = str(self.tmp / "pnpm.mjs")
+        eng = installer.Engine("auto", use_mirror=True, log=lambda _m: None)
+        with mock.patch.object(installer, "run_cli", side_effect=fake), \
+                mock.patch.object(installer, "pnpm_execpath", lambda: entry), \
+                mock.patch.object(installer, "build_variables", lambda *a, **k: {}):
+            with self.assertRaises(installer.InstallError):
+                eng.build(self.tmp, force=True)
+        self.assertEqual(len(calls), 1, "不是这个问题就别浪费时间重试")
+
+
 class DepsChangeTest(unittest.TestCase):
     """依赖清单变了才重装依赖；只改源码就别再花几分钟装一遍。
 

@@ -1488,10 +1488,33 @@ class Engine:
             self.log("⑥ 构建产物已存在，跳过 pnpm run build")
             return
         self.log("⑥ 编译项目（本地编译、不联网；首次约 5–15 分钟）…")
-        with temporary_environment(build_variables(project, self.log)):
+        extras = build_variables(project, self.log)
+        # 真机连续两次死在构建脚本那句 "npm_execpath is unavailable"（脚本只在它空/缺失时抛），
+        # 而管道本身在别的机器上验过是通的。所以这里把**两边的事实都写进日志文件**：
+        # 我们准备传什么、进程环境里当时是什么。下次失败就不用再猜是哪一层丢的。
+        entry = pnpm_execpath()
+        log_line(f"[构建] npm_execpath 准备值 = {extras.get('npm_execpath') or '（没准备）'}；"
+                 f"环境当时 = {os.environ.get('npm_execpath') or '（空）'}；"
+                 f"当前 pnpm 入口 = {entry or '（找不到）'}")
+        with temporary_environment(extras):
             proc = run_cli(["pnpm", "run", "build"], cwd=project)
+        text = decode_proc(proc)
+        if proc.returncode != 0 and "npm_execpath is unavailable" in text and entry:
+            # 换一条不经过 cmd 的 pnpm shim 的路：直接用 node 跑 pnpm 的入口。
+            # pnpm 无论是被谁启动，都会给自己的脚本注入 npm_execpath（实测过），
+            # 而 shim 那层在真机上正是可疑的一段。
+            self.log("  构建报 npm_execpath 缺失，改用 node 直跑 pnpm 入口再试一次…")
+            with temporary_environment(extras):
+                proc = run_cli(["node", entry, "run", "build"], cwd=project)
+            text = decode_proc(proc)
+            log_line(f"[构建] 直跑 pnpm 入口重试后退出码 = {proc.returncode}")
         if proc.returncode != 0:
-            raise InstallError(f"构建失败：\n{decode_proc(proc)}")
+            # 把这台机器上的两个事实一起报出去：真机连续两次死在这句话上，光看报错看不出
+            # 是哪一层丢的值。弹窗里带上它，用户截个图就能定位，不必再去翻日志。
+            where = (f"\n\n（诊断）准备传的 npm_execpath = {extras.get('npm_execpath') or '（没准备）'}"
+                     f"\n（诊断）进程环境里当时 = {os.environ.get('npm_execpath') or '（空）'}"
+                     f"\n（诊断）本机 pnpm 入口 = {entry or '（找不到）'}")
+            raise InstallError(f"构建失败：\n{text}{where}")
         self.log("  构建完成 ✓")
 
     def start(self, project: Path) -> None:
@@ -2300,7 +2323,7 @@ class App(tk.Tk):
         try:
             self._log_work("[构建] 开始：重装依赖（缓存优先，缺的联网补）…")
             eng = Engine(mode=self.mode.get(), use_mirror=self.mirror.get(),
-                         log=self._append)
+                         log=self._log_work)
             eng.install_deps(target, force=True)
             self._log_work("[构建] 依赖好了，开始编译 …")
             eng.build(target, force=True)
@@ -2827,7 +2850,7 @@ class App(tk.Tk):
                 self._post(self._update_done, False,
                            "会话数据备份失败（没备份就不更新）", was_running)
                 return
-            eng = Engine(mode="auto", use_mirror=mirror, log=self._append)
+            eng = Engine(mode="auto", use_mirror=mirror, log=self._log_work)
             # 配置里是 (名字, 地址) 二元组，这里只要地址：传元组会让 Popen 直接抛 TypeError
             mirror_urls = [url for _name, url in git_mirrors()]
             self._log_work(f"[更新] 来源：{source.label}（{source.url}，分支 {source.branch}）")
