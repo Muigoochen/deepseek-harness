@@ -59,24 +59,6 @@ BUILD_MARK = ".dsh-build/client-build-environment.json"
 WEB_URL = "http://127.0.0.1:3080"
 WEB_PORT = 3080                  # dsh web 默认端口；"有没有在跑"一律按它认定
 
-def git_proxy() -> str:
-    """让 git 走代理：环境变量 `DSH_GIT_PROXY` 优先，其次配置项 `gitProxy`。
-
-    真机实测这个网络直连 github 不通（https 被重置、全量 fetch 十分钟不返回），
-    官方那一路要靠代理或镜像。配了就把值写进环境变量——`gitinfo.run_git` 每次调用都读它。
-    写法就是 git 认的那种：`http://127.0.0.1:7890`、`socks5h://127.0.0.1:1080`。
-    """
-    value = os.environ.get("DSH_GIT_PROXY", "").strip()
-    if not value:
-        try:
-            value = str(load_config().get("gitProxy", "") or "").strip()
-        except Exception:            # noqa: BLE001  配置读不出来就当没配
-            value = ""
-        if value:
-            os.environ["DSH_GIT_PROXY"] = value      # gitinfo 只认环境变量
-    return value
-
-
 def git_mirrors() -> list[tuple[str, str]]:
     """用户自己配的 git 镜像（可留空）：环境变量 `DSH_GIT_MIRROR` 优先，其次配置项。
 
@@ -2147,7 +2129,6 @@ class App(tk.Tk):
                          daemon=True).start()
 
     def _check_update_worker(self, target: Path) -> None:
-        git_proxy()          # 有代理就先让 git 用上，不然官方那一路连不通
         try:
             status = ginfo.check_update(target)
         except Exception as exc:  # noqa: BLE001  git 层意外 → 如实显示失败原因
@@ -2260,7 +2241,6 @@ class App(tk.Tk):
 
     def _deepen_worker(self, target: Path, remote: str) -> None:
         try:
-            git_proxy()                            # 有代理先让 git 用上
             self._append(f"[补齐] 正在从 {remote} 取完整历史（可能要几分钟）…")
             code, _out, err = ginfo.run_git(["fetch", "--unshallow", remote], target,
                                             timeout=ginfo.GIT_FETCH_TIMEOUT)
@@ -2286,8 +2266,8 @@ class App(tk.Tk):
             self._set_label(self.git_note, "补齐历史失败（见日志）", "#b00020")
             messagebox.showerror(
                 "补齐历史失败",
-                f"{detail}\n\n网络不好时可以配代理（配置项 gitProxy 或环境变量 DSH_GIT_PROXY）"
-                "或镜像（gitMirror）再试。", parent=self)
+                f"{detail}\n\n网络慢的时候可以配**国内镜像**（配置项 gitMirror 或环境变量 "
+                "DSH_GIT_MIRROR）再试。", parent=self)
 
     def on_update_from(self, kind: str) -> None:
         """从「官方」或「你自己的仓库」更新：能快进就快进，分叉就合并 + 自动备份。
@@ -2362,7 +2342,6 @@ class App(tk.Tk):
             if source is None:
                 self._post(self._update_done, False, "没有可用的更新来源", was_running)
                 return
-            git_proxy()          # 有代理就先让 git 用上
             eng = Engine(mode="auto", use_mirror=mirror, log=self._append)
             # 配置里是 (名字, 地址) 二元组，这里只要地址：传元组会让 Popen 直接抛 TypeError
             mirror_urls = [url for _name, url in git_mirrors()]

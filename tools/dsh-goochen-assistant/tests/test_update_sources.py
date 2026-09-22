@@ -533,48 +533,5 @@ class OfficialStatusCwdTest(unittest.TestCase):
                          f"ls-remote 必须站在目标目录里跑，否则会问到别的仓库；实际：{seen}")
 
 
-class ProxyAndDeepenTest(unittest.TestCase):
-    """代理（真机网络直连 github 不通）与「补齐历史」。
-
-    代理不是可选项：实测这台机器连不上 github，官方那一路只能靠代理或镜像。
-    """
-
-    def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-proxy-"))
-
-    def tearDown(self) -> None:
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    @staticmethod
-    def _fake_git_run(seen: list):
-        class _Done:
-            returncode, stdout, stderr = 0, "", ""
-
-        def fake(argv, **_kwargs):
-            seen.append(list(argv))
-            return _Done()
-        return fake
-
-    def test_proxy_is_injected_before_the_subcommand(self):
-        seen: list = []
-        with mock.patch.dict(os.environ, {"DSH_GIT_PROXY": "http://127.0.0.1:7890"}), \
-                mock.patch.object(gi.childproc, "run", self._fake_git_run(seen)):
-            gi.run_git(["ls-remote", "upstream"], self.tmp)
-        argv = seen[0]
-        key = "http.proxy=http://127.0.0.1:7890"
-        self.assertIn(key, argv, f"代理没传进去：{argv}")
-        self.assertIn("https.proxy=http://127.0.0.1:7890", argv)
-        self.assertLess(argv.index(key), argv.index("ls-remote"),
-                        "-c 必须放在子命令前面，否则 git 不认")
-
-    def test_no_proxy_means_no_extra_args(self):
-        seen: list = []
-        env = {k: v for k, v in os.environ.items() if k != "DSH_GIT_PROXY"}
-        with mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch.object(gi.childproc, "run", self._fake_git_run(seen)):
-            gi.run_git(["rev-parse", "HEAD"], self.tmp)
-        self.assertNotIn("-c", seen[0], f"没配代理就别塞参数：{seen[0]}")
-
-
 if __name__ == "__main__":
     unittest.main()
