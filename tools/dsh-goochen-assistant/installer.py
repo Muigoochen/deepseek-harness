@@ -1598,9 +1598,11 @@ class App(tk.Tk):
         #   只有官方远端（直接从官方克隆）→ 只显示「从官方更新」
         #   官方之外还有你自己的远端（fork/镜像）→ 再多一条「从你的仓库更新（owner）」
         #   两个都不显示 = 这个目录没有 DSH 远端（离线装出来的目录就是这种）
-        self.btn_update_official = ttk.Button(grow, text="从官方更新", width=12,
+        # 宽度**不写死**：标签里带 owner 名字（"从你的仓库更新（Muigoochen）"），写死宽度
+        # 会把名字截断——真机上用户看到的就是"从你的仓库更新(Muig"。
+        self.btn_update_official = ttk.Button(grow, text="从官方更新",
                                               command=lambda: self.on_update_from("official"))
-        self.btn_update_mine = ttk.Button(grow, text="从你的仓库更新", width=18,
+        self.btn_update_mine = ttk.Button(grow, text="从你的仓库更新",
                                           command=lambda: self.on_update_from("mine"))
         self._update_sources: list = []     # 检查更新时探测到的来源，按钮据此显示
         # 浅克隆（在线安装的默认形态）跟官方没有共同祖先，合并会被拒绝——这是"补齐历史"的

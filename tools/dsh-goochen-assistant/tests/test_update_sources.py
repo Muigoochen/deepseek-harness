@@ -301,6 +301,20 @@ class UpdateButtonsGuiTest(unittest.TestCase):
             self.app._update_done(True, "a → b", False)
         self.assertEqual(calls, [], "没有自己仓库就别问")
 
+    def test_mine_button_is_not_width_capped(self):
+        """「从你的仓库更新（owner）」带 owner 名字，宽度写死会把名字截断。
+
+        真机上用户看到的就是"从你的仓库更新(Muig"——所以这个按钮的宽度必须是自适应（0）。
+        """
+        self.app._refresh_update_buttons([
+            gi.UpdateSource(kind="mine", label="从你的仓库更新（Muigoochen）",
+                            reachable=True)])
+        self.app.update()
+        self.assertIn(self.app.btn_update_mine.cget("width"), ("", 0, "0"),
+                      "宽度不能写死，否则长名字被截断")
+        self.assertEqual(self.app.btn_update_mine.cget("text"),
+                         "从你的仓库更新（Muigoochen）")
+
     def test_deepen_button_only_when_shallow(self):
         """浅克隆要能看到「补齐历史」；历史完整时不该出现（免得误导）。"""
         self.app._refresh_update_buttons([], "", True)
