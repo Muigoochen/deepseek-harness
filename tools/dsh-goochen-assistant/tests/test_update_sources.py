@@ -520,8 +520,10 @@ class UpdateWorkerTest(unittest.TestCase):
         self.assertIn(("build", True), calls, "成功后要重新构建")
         self.assertEqual([p[0] for p in fake.posted], ["_update_done"])
         self.assertTrue(fake.posted[0][1][0], "应当报告成功")
-        self.assertTrue(any("可以退回去" in line for line in fake.log),
-                        "有备份分支就要告诉用户怎么退回去")
+        self.assertTrue(any("回退到更新前" in line for line in fake.log),
+                        "有备份分支就要告诉用户**点哪个按钮**退回去（不是让他敲 git）")
+        self.assertTrue(any("git reset --hard" in line for line in fake.log),
+                        "命令行也留着，给会用的人一个等价说法")
 
     def test_mine_update_never_uses_the_official_mirrors(self):
         result = gi.UpdateResult(ok=True, changed=True, before="a", after="b",
@@ -669,6 +671,45 @@ class OfficialStatusCwdTest(unittest.TestCase):
         self.assertTrue(seen, "应当真的问过远端")
         self.assertEqual(set(seen), {str(target)},
                          f"ls-remote 必须站在目标目录里跑，否则会问到别的仓库；实际：{seen}")
+
+
+class RollbackTest(unittest.TestCase):
+    """回退到更新前：普通用户不该被要求去敲 git 命令，工具要一键做完。
+
+    真机踩过：更新出问题时工具只打印一句 `git reset --hard backup/…`——用户不会用。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsh-rollback-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = make_repo(self.tmp / "repo", message="第一版")
+        self.keep = f"{gi.BACKUP_PREFIX}20260922-155952"
+        git("branch", self.keep, cwd=self.repo)
+        (self.repo / "RE_更新带来的.md").write_text("更新带来的\n", encoding="utf-8")
+        git("add", "-A", cwd=self.repo)
+        git("commit", "-q", "-m", "模拟更新之后的提交", cwd=self.repo)
+
+    def test_lists_backups_newest_first(self):
+        git("branch", f"{gi.BACKUP_PREFIX}20260101-000000", cwd=self.repo)
+        names = gi.update_backups(self.repo)
+        self.assertEqual(names[0], self.keep, "最新的排在最前面")
+        self.assertEqual(len(names), 2)
+
+    def test_no_backups_on_a_fresh_repo(self):
+        fresh = make_repo(self.tmp / "fresh", message="干净的")
+        self.assertEqual(gi.update_backups(fresh), [])
+
+    def test_reset_brings_the_tree_back(self):
+        ok, detail = gi.reset_to(self.repo, self.keep)
+        self.assertTrue(ok, detail)
+        self.assertFalse((self.repo / "RE_更新带来的.md").exists(),
+                         "硬回退应当把更新带来的文件收走")
+        self.assertEqual(git("status", "--porcelain", cwd=self.repo).strip(), "")
+
+    def test_refuses_an_unknown_backup(self):
+        ok, detail = gi.reset_to(self.repo, f"{gi.BACKUP_PREFIX}不存在的")
+        self.assertFalse(ok, "名字不对就别动手")
+        self.assertIn("找不到备份分支", detail)
 
 
 class DepsChangeTest(unittest.TestCase):

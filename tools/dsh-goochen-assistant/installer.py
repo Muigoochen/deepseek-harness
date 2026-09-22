@@ -1631,6 +1631,17 @@ class App(tk.Tk):
         self.sess_note.pack(anchor="w", pady=(2, 0))
         self._wrap_labels.append(self.sess_note)
         self.after(200, self._refresh_session_note)
+        # 「回退到更新前」：**绝不让用户自己去敲 git 命令**。
+        # 更新会自动打 backup/before-update-… 备份分支，这里就是它的一键入口；
+        # 有备份时才出现（没有备份时点它只会吓人）。真机踩过：出问题时工具只是打印
+        # 一句 git reset --hard …，普通用户根本不会用。
+        rrow = ttk.Frame(gbox)
+        rrow.pack(fill="x", pady=(4, 0))
+        self.btn_rollback = ttk.Button(rrow, text="回退到更新前", width=14,
+                                       command=self.on_rollback)
+        self.roll_note = ttk.Label(rrow, text="", foreground="#888",
+                                   font=("Microsoft YaHei UI", 8))
+        self.roll_note.pack(side="left", padx=(8, 0))
         self._wrap_labels.append(self.git_note)
 
         # 安装方式（可折叠：装好之后基本不用动；标题上始终显示当前选择）
@@ -2130,6 +2141,95 @@ class App(tk.Tk):
         lines.append(f"依据：{ident.evidence}")
         color = {"official": "#1a6b1a", "unofficial": "#a05a00"}.get(ident.tier, "#666")
         self._set_label(self.git_info_lbl, "\n".join(lines), color)
+        self._refresh_rollback_button(ginfo.update_backups(info.root) if info.root else [])
+
+    def _refresh_rollback_button(self, backups: list) -> None:
+        """有备份分支才显示【回退到更新前】，并写出最近一份是什么时候的。"""
+        try:
+            if backups:
+                if not self.btn_rollback.winfo_manager():
+                    self.btn_rollback.pack(side="left")
+                newest = str(backups[0]).replace(ginfo.BACKUP_PREFIX, "")
+                tail = f"（共 {len(backups)} 份）" if len(backups) > 1 else ""
+                self._set_label(self.roll_note, f"备份：{newest} {tail}", "#888")
+            else:
+                self.btn_rollback.pack_forget()
+                self._set_label(self.roll_note, "", "#888")
+        except Exception:  # noqa: BLE001  窗口可能已销毁
+            pass
+
+    def on_rollback(self) -> None:
+        """一键回退到更新前的备份分支。
+
+        用户说得对：让用户自己去敲 git 命令是不合格的。这里全部代劳：
+        先停服务（文件正在被用时不该动）→ 确认工作区干净（硬回退会丢改动）→ 再 reset。
+        """
+        if self.git_busy or self.busy:
+            return
+        target = self._effective_dir()
+        info = ginfo.repo_info(target)
+        backups = ginfo.update_backups(target)
+        if not backups:
+            messagebox.showinfo(
+                "没有可回退的备份",
+                "这个目录里没有 backup/before-update-… 备份分支。\n\n"
+                "备份分支是「从官方更新／从你的仓库更新」在合并之前自动打的；"
+                "没更新过就没有它。",
+                parent=self)
+            return
+        if info.dirty:
+            messagebox.showwarning(
+                "先处理本地改动",
+                f"工作区有 {info.dirty} 处本地改动。\n\n"
+                "回退是**硬回退**，会丢掉这些改动；请先提交或撤销它们再回退。",
+                parent=self)
+            return
+        if port_in_use() and not self.ensure_port_free(
+                "回退会把源码换回旧版本，需要先停掉正在运行的服务。"):
+            self._append("[回退] 端口没空出来（或你选择不结束它），已取消回退。")
+            return
+        newest = backups[0]
+        more = len(backups) - 1
+        detail = (f"\n\n（还有 {more} 份更早的备份；这次用最新那份）" if more else "")
+        if not messagebox.askyesno(
+                "回退到更新前？",
+                f"要把代码回退到这次更新之前吗？\n\n"
+                f"  备份分支：{newest}\n"
+                f"  当前版本：{info.version or '读不到'}（{info.short}）{detail}\n\n"
+                "回退之后依赖和产物可能对不上，建议再点一次【重新构建】。",
+                parent=self):
+            return
+        self.git_busy = True
+        self._set_git_buttons(False)
+        self._set_label(self.git_note, "正在回退…", "#a05a00")
+        try:
+            threading.Thread(target=self._rollback_worker, args=(target, newest),
+                             daemon=True).start()
+        except RuntimeError as exc:                 # 线程起不来也要把按钮放回去
+            self._post(self._rollback_done, False, str(exc))
+
+    def _rollback_worker(self, target: Path, ref: str) -> None:
+        try:
+            ok, detail = ginfo.reset_to(target, ref)
+        except Exception as exc:  # noqa: BLE001  回退失败也必须让用户看到原因
+            ok, detail = False, str(exc)
+        self._post(self._rollback_done, ok, detail)
+
+    def _rollback_done(self, ok: bool, detail: str) -> None:
+        self.git_busy = False
+        self._set_git_buttons(True)
+        if ok:
+            self._log_work(f"[回退] ✓ {detail}")
+            self._set_label(self.git_note, f"✓ {detail}", "#1a6b1a")
+            messagebox.showinfo("回退完成",
+                                f"{detail}\n\n建议再点一次【重新构建】，"
+                                "让依赖和产物跟上旧版本。",
+                                parent=self)
+        else:
+            self._log_work(f"[回退] ✗ {detail}")
+            self._set_label(self.git_note, "回退失败（见日志）", "#b00000")
+            messagebox.showerror("回退失败", detail, parent=self)
+        self._schedule_git_refresh(200)
 
     def _set_label(self, widget, text: str, color: str) -> None:
         try:
@@ -2140,7 +2240,8 @@ class App(tk.Tk):
     def _set_git_buttons(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
         for btn in (self.btn_git_refresh, self.btn_git_update,
-                    self.btn_update_official, self.btn_update_mine, self.btn_deepen):
+                    self.btn_update_official, self.btn_update_mine, self.btn_deepen,
+                    self.btn_rollback):
             try:
                 btn.configure(state=state)
             except Exception:  # noqa: BLE001  同上：窗口可能已销毁
@@ -2552,8 +2653,8 @@ class App(tk.Tk):
             if getattr(res, "note", ""):
                 self._log_work(f"[更新] ⚠ {res.note}")
             if res.backup:
-                self._log_work(f"[更新] 万一有问题可以退回去："
-                               f"git reset --hard {res.backup}")
+                self._log_work(f"[更新] 万一有问题：点界面上的【回退到更新前】就能回来"
+                               f"（等价于 git reset --hard {res.backup}）")
             # 依赖/构建**按需做**。官方这类更新常常连 lock 一起改（实测这次 3482 个提交里
             # 有 332 个依赖清单、pnpm-lock.yaml 变了 8071 行）——那必须重装；但如果只改了
             # 源码、清单一个没动，就没必要再花几分钟装一遍。查不出改了哪些文件时走保守路线。
@@ -2583,10 +2684,12 @@ class App(tk.Tk):
         self._op_target = None
         self._set_git_buttons(True)
         if not ok:
-            self._append(f"[更新] ✗ 更新失败：{detail}")
+            self._log_work(f"[更新] ✗ 更新失败：{detail}")
+            self._log_work("[更新] 要退回去就点界面上的【回退到更新前】"
+                           "（没有备份时它会告诉你为什么退不了）")
             if was_running:
-                self._append("[更新] 服务已停止（更新前在运行）；"
-                             "处理完上面的问题后点【运行】重新启动。")
+                self._log_work("[更新] 服务已停止（更新前在运行）；"
+                               "处理完上面的问题后点【运行】重新启动。")
             self._set_label(self.git_note, f"更新失败：{detail}", "#b00000")
             return
         self._append(f"[更新] ✓ 更新完成：{detail}")

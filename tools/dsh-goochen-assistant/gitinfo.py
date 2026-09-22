@@ -855,6 +855,38 @@ def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = ()
                         backup=backup_branch, note=fallback_note)
 
 
+BACKUP_PREFIX = "backup/before-update-"
+
+
+def update_backups(path: Path) -> list[str]:
+    """更新前自动打的备份分支，**新的在前**（名字里带时间戳，按名字排即可）。"""
+    code, out, _err = run_git(
+        ["branch", "--list", f"{BACKUP_PREFIX}*", "--format=%(refname:short)"], path)
+    if code != 0:
+        return []
+    names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    names.sort(reverse=True)
+    return names
+
+
+def reset_to(path: Path, ref: str) -> tuple[bool, str]:
+    """把当前分支**硬回退**到 ref，返回 `(成功, 说明)`。
+
+    只给"回退到更新前"用：ref 必须是本仓库真实存在的备份分支，否则直接拒绝，
+    免得手滑传进来一个假名字。**先确认引用存在，再 reset。**
+    """
+    if not ref:
+        return False, "没有指定要回退到哪个备份"
+    code, out, _err = run_git(["rev-parse", "--verify", "--quiet", f"refs/heads/{ref}"], path)
+    if code != 0 or not out.strip():
+        return False, f"找不到备份分支 {ref}（可能已经被删了）"
+    target = out.strip()[:7]
+    code, _out, err = run_git(["reset", "--hard", ref], path, timeout=GIT_UNDO_TIMEOUT)
+    if code != 0:
+        return False, f"回退失败：{_first_line(err) or code}"
+    return True, f"已回退到 {ref}（{target}）"
+
+
 def push_branch(path: Path, remote: str, branch: str = "",
                 timeout: int = GIT_FETCH_TIMEOUT) -> tuple[bool, str]:
     """把当前分支推到指定远端，返回 `(成功, 错误说明)`。**永不 force**。
