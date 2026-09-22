@@ -315,6 +315,37 @@ class UpdateButtonsGuiTest(unittest.TestCase):
         self.assertEqual(self.app.btn_update_mine.cget("text"),
                          "从你的仓库更新（Muigoochen）")
 
+    def test_port_dialog_does_not_contradict_itself(self):
+        """端口弹窗里「谁占着」和「是不是本窗口启动的」必须一致。
+
+        真机踩过：上一句说"正被本窗口启动的服务占用"，下一句却说"这个服务不是本窗口
+        启动的"——用户一眼就看出来了。
+        """
+        seen: list = []
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None          # 本窗口启动的服务还活着
+        self.app.web_proc = fake_proc
+        with mock.patch.object(installer, "port_in_use", lambda: True), \
+                mock.patch.object(installer.childproc, "port_owner_pids",
+                                  lambda _port: [1234]), \
+                mock.patch.object(installer.messagebox, "askyesno",
+                                  lambda *a, **k: seen.append(a[1]) or False):
+            self.assertFalse(self.app.ensure_port_free("测试用途：启动点什么"))
+        self.assertTrue(seen, "端口被占就该弹窗")
+        self.assertIn("本窗口启动的服务", seen[0])
+        self.assertNotIn("不是本窗口启动的", seen[0], "不能自相矛盾")
+
+        seen.clear()
+        self.app.web_proc = None                    # 换成别人的进程占着
+        with mock.patch.object(installer, "port_in_use", lambda: True), \
+                mock.patch.object(installer.childproc, "port_owner_pids",
+                                  lambda _port: [1234]), \
+                mock.patch.object(installer.messagebox, "askyesno",
+                                  lambda *a, **k: seen.append(a[1]) or False):
+            self.assertFalse(self.app.ensure_port_free("测试用途：启动点什么"))
+        self.assertIn("PID 1234", seen[0])
+        self.assertIn("不是本窗口启动的", seen[0])
+
     def test_official_half_survives_a_failed_tracked_check(self):
         """跟踪远端查失败时，官方那一半（单独问到的）必须照样显示。
 
@@ -606,6 +637,39 @@ class OfficialStatusCwdTest(unittest.TestCase):
         self.assertTrue(seen, "应当真的问过远端")
         self.assertEqual(set(seen), {str(target)},
                          f"ls-remote 必须站在目标目录里跑，否则会问到别的仓库；实际：{seen}")
+
+
+class DepsChangeTest(unittest.TestCase):
+    """依赖清单变了才重装依赖；只改源码就别再花几分钟装一遍。
+
+    实测依据（本地 0.1.2 → 官方 0.1.6）：3482 个提交、10459 个改动路径里有 332 个依赖清单，
+    pnpm-lock.yaml 变了 8071 行——那一次重装是必需的，不是因为"更新了就该装"。
+    """
+
+    def test_manifest_changes_need_reinstall(self):
+        self.assertTrue(gi.deps_touched(["pnpm-lock.yaml"]))
+        self.assertTrue(gi.deps_touched(["pnpm-workspace.yaml"]))
+        self.assertTrue(gi.deps_touched(["packages/core/agent/package.json"]))
+        self.assertTrue(gi.deps_touched(["patches/some.patch"]))
+
+    def test_source_only_changes_skip_reinstall(self):
+        self.assertFalse(gi.deps_touched(["packages/core/agent/src/loop.ts", "README.md",
+                                          "docs/architecture.md"]))
+
+    def test_changed_paths_reads_the_real_diff(self):
+        tmp = Path(tempfile.mkdtemp(prefix="dsh-changed-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        repo = make_repo(tmp / "repo", message="第一版")
+        before = git("rev-parse", "HEAD", cwd=repo).strip()   # 助手带换行，拼范围前必须去掉
+        (repo / "package.json").write_text('{"name":"x"}\n', encoding="utf-8")
+        git("add", "-A", cwd=repo)
+        git("commit", "-q", "-m", "改清单", cwd=repo)
+        after = git("rev-parse", "HEAD", cwd=repo).strip()
+        paths = gi.changed_paths(repo, before, after)
+        self.assertEqual(paths, ["package.json"])
+        self.assertTrue(gi.deps_touched(paths))
+        self.assertIsNone(gi.changed_paths(repo, "", ""),
+                          "取不到就返回 None，别让调用方当成「没变」")
 
 
 class NoNeedlessBackupTest(unittest.TestCase):

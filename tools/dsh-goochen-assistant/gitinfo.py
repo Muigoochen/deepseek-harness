@@ -613,6 +613,33 @@ def _unrelated_hint(shallow: bool) -> str:
             "你的文件没有被改动。")
 
 
+# 只有这些文件变了才需要重新 `pnpm install`。实测（本地 0.1.2 → 官方 0.1.6）：
+# 3482 个提交、10459 个改动路径里有 332 个依赖清单，pnpm-lock.yaml 变了 8071 行——
+# 所以那一次必须重装；反过来只改源码时就不该再花几分钟装一遍。
+DEPENDENCY_MARKERS = ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc")
+
+
+def changed_paths(path: Path, before: str, after: str) -> Optional[list[str]]:
+    """`before..after` 之间改了哪些文件；**查不出来返回 None**（调用方据此走保守路线）。"""
+    if not before or not after:
+        return None
+    code, out, _err = run_git(["diff", "--name-only", "-z", f"{before}..{after}"], path,
+                              timeout=GIT_FETCH_TIMEOUT)
+    if code != 0:
+        return None
+    return [p for p in out.split("\0") if p.strip()]
+
+
+def deps_touched(paths: Sequence[str]) -> bool:
+    """这批改动里有没有依赖清单：有就得重新装依赖，没有就没必要浪费那几分钟。"""
+    for p in paths:
+        if p.rsplit("/", 1)[-1] in DEPENDENCY_MARKERS:
+            return True
+        if p.startswith("patches/"):        # pnpm 的 patch 补丁也要重新应用
+            return True
+    return False
+
+
 def update_from(path: Path, source: UpdateSource, *, mirrors: Sequence[str] = (),
                 strategy: str = "merge", backup: bool = True,
                 timeout: int = FETCH_TIMEOUT) -> UpdateResult:

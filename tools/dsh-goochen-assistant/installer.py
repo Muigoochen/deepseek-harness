@@ -2323,9 +2323,7 @@ class App(tk.Tk):
         # 那种情况下更新流程停不掉它：源码被换掉、进程还跑着旧的，紧接着重装依赖、重建
         # 又会跟它抢文件。所以动手前先确认端口能空出来，空不出来就别开始。
         if not self.ensure_port_free(
-                "更新会重装依赖并重新构建，需要先停掉正在运行的服务。",
-                detail=("这个服务不是本窗口启动的，更新流程不会自动停它；"
-                        "它不停，更新中途会拿到半新半旧的代码。")):
+                "更新会换掉源码；先停掉正在运行的服务，才能安全地重装依赖、重新构建。"):
             self._append("[更新] 端口没空出来（或你选择不结束它），已取消更新。")
             return
         lines = [f"目标：{source.label}",
@@ -2397,8 +2395,23 @@ class App(tk.Tk):
             if res.backup:
                 self._append(f"[更新] 万一有问题可以退回去："
                              f"git reset --hard {res.backup}")
-            self._append("[更新] 源码有变化，重新装依赖并重新构建 …")
-            eng.install_deps(target, force=True)
+            # 依赖/构建**按需做**。官方这类更新常常连 lock 一起改（实测这次 3482 个提交里
+            # 有 332 个依赖清单、pnpm-lock.yaml 变了 8071 行）——那必须重装；但如果只改了
+            # 源码、清单一个没动，就没必要再花几分钟装一遍。查不出改了哪些文件时走保守路线。
+            touched = ginfo.changed_paths(target, res.before, res.after)
+            if touched is None:
+                self._append("[更新] 查不出这次改了哪些文件，稳妥起见还是重装依赖并重新构建 …")
+                need_deps = True
+            else:
+                need_deps = ginfo.deps_touched(touched)
+                if need_deps:
+                    self._append(f"[更新] 这次改了 {len(touched)} 个文件，其中有依赖清单，"
+                                 "需要重装依赖；然后重新构建 …")
+                else:
+                    self._append(f"[更新] 这次改了 {len(touched)} 个文件，依赖清单没动，"
+                                 "跳过重装依赖，直接重新构建 …")
+            if need_deps:
+                eng.install_deps(target, force=True)
             eng.build(target, force=True)
             clear_interrupted(target)   # 更新跑完了，取消「上次被打断」的标记
         except Exception as exc:  # noqa: BLE001  依赖/构建失败原因要如实报给用户
@@ -2566,7 +2579,7 @@ class App(tk.Tk):
             return
         self._launch_web()
 
-    def ensure_port_free(self, purpose: str, *, detail: str = "") -> bool:
+    def ensure_port_free(self, purpose: str) -> bool:
         """确认真实端口是空的；被占就先问用户，同意则结束占用者。返回能否继续。
 
         `self.web_proc` 只是"我启动过什么"的记账，端口才是"现在到底有没有人在跑"的事实；
@@ -2578,11 +2591,16 @@ class App(tk.Tk):
         mine = self.web_proc is not None and self.web_proc.poll() is None
         who = ("本窗口启动的服务" if mine
                else ("、".join(f"PID {p}" for p in pids) if pids else "未知进程"))
+        # 这句必须跟着 who 走。真机踩过：文案里写死了"这个服务不是本窗口启动的"，
+        # 上面却刚说完"正被本窗口启动的服务占用"——自相矛盾，用户一眼就看出来了。
+        owner = ("它是本窗口启动的（就是下面那个服务），会被连同子进程一起停掉。"
+                 if mine else
+                 "它不是本窗口启动的（可能是你自己敲的命令，或上次没关干净）；"
+                 "小助手不会自动停它，要在这里结束掉才行。")
         if not messagebox.askyesno(
                 f"端口 {WEB_PORT} 已被占用",
-                f"{purpose}\n\n127.0.0.1:{WEB_PORT} 正被{who}占用。\n"
-                + (detail or "再启动一个只会报 EADDRINUSE。")
-                + "\n\n要先结束它再继续吗？（结束它会连它的子进程一起结束）",
+                f"{purpose}\n\n127.0.0.1:{WEB_PORT} 正被{who}占用。\n{owner}\n\n"
+                "要先结束它再继续吗？（结束它会连它的子进程一起结束）",
                 parent=self):
             return False
         if mine:
