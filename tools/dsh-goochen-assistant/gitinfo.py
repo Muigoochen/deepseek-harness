@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -51,12 +52,27 @@ def git_exe() -> Optional[str]:
         return None
 
 
+def _ensure_ssh_keepalive() -> None:
+    """给 SSH 补上连接超时与保活，避免 fetch 无限挂着。
+
+    真机踩过：直连官方的一次 fetch 卡死 4 分钟——临时包一个字节没收到、CPU 为零，
+    git 就那么等着。加上这两个选项后：连不上 15 秒内失败；连接假死约 30 秒断开，
+    让 git 报错退出（界面能显示原因），而不是让用户干等十分钟。
+    只在自己没配 SSH 命令时补上；**不加 BatchMode**——那会让带口令的密钥没法用。
+    """
+    if os.environ.get("GIT_SSH_COMMAND") or os.environ.get("GIT_SSH"):
+        return
+    os.environ["GIT_SSH_COMMAND"] = (
+        "ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3")
+
+
 def run_git(args: Sequence[str], cwd: Optional[Path] = None, *,
             timeout: int = DEFAULT_TIMEOUT) -> tuple[int, str, str]:
     """跑一条 git，返回 `(退出码, stdout, stderr)`；不抛异常。"""
     exe = git_exe()
     if exe is None:
         return GIT_MISSING, "", "未检测到 git（请先安装 Git for Windows）"
+    _ensure_ssh_keepalive()
     argv = [exe] + (["-C", str(cwd)] if cwd is not None else []) + list(args)
     try:
         # 经 childproc 跑：句柄登记在册，关窗时能连同子孙一起结束（fetch 可能跑很久）

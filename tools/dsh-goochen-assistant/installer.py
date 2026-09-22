@@ -2310,6 +2310,38 @@ class App(tk.Tk):
                 f"{detail}\n\n网络慢的时候可以配**国内镜像**（配置项 gitMirror 或环境变量 "
                 "DSH_GIT_MIRROR）再试。", parent=self)
 
+    def _log_work(self, msg: str) -> None:
+        """工作线程专用日志：**同时**写 installer.log 和界面日志区。
+
+        为什么单独一个方法：真机踩过一次——更新线程卡在 fetch 上，界面一片安静，
+        事后翻 installer.log 里也**没有任何记录**，只能靠进程快照反推当时在干什么。
+        更新这种"可能几分钟没动静"的流程，每一行都必须留痕。
+        """
+        log_line(str(msg))
+        self._append(msg)
+
+    def _watch_fetch(self, target: Path) -> threading.Event:
+        """fetch 期间每 10 秒报一次进度，返回用来停止它的 Event。
+
+        真机踩过：直连官方这次连接卡死，4 分钟一个字节没收到、界面上一行日志都没有，
+        用户只能干看着"正在更新"猜是不是死了。有这行心跳就一眼能看出：还在等，还是收到了多少。
+        """
+        stop = threading.Event()
+        pack_dir = Path(target) / ".git" / "objects" / "pack"
+
+        def watch() -> None:
+            started = time.monotonic()
+            while not stop.wait(10.0):
+                try:
+                    got = sum(p.stat().st_size for p in pack_dir.glob("tmp_pack_*"))
+                except OSError:
+                    got = 0
+                self._log_work(f"[更新] 还在取远端更新…已等 {int(time.monotonic() - started)} 秒，"
+                               f"已收到 {got / 1024 / 1024:.1f} MB")
+
+        threading.Thread(target=watch, daemon=True).start()
+        return stop
+
     def _refresh_session_note(self) -> None:
         """显示"最近一份会话备份是什么时候的、放哪儿"——用户最想知道的就是这个。"""
         try:
@@ -2344,7 +2376,7 @@ class App(tk.Tk):
         target = self._effective_dir()
         info = ginfo.repo_info(target)
         res = sdata.snapshot(label=label, app_version=info.version, app_commit=info.short,
-                             install_dir=target, log=self._append)
+                             install_dir=target, log=self._log_work)
         self._post(self._backup_done, res)
 
     def _backup_done(self, res) -> None:
@@ -2366,10 +2398,10 @@ class App(tk.Tk):
         res = sdata.snapshot(
             label=f"{source.label}之前（本地 {info.version or '读不到版本'}）",
             app_version=info.version, app_commit=info.short, install_dir=target,
-            log=self._append)
+            log=self._log_work)
         if res.ok:
             return True
-        self._append(f"[更新] ✗ 会话数据没备份成功，已停止更新：{res.error}")
+        self._log_work(f"[更新] ✗ 会话数据没备份成功，已停止更新：{res.error}")
         return False
 
     def on_restore_sessions(self) -> None:
@@ -2497,39 +2529,44 @@ class App(tk.Tk):
             eng = Engine(mode="auto", use_mirror=mirror, log=self._append)
             # 配置里是 (名字, 地址) 二元组，这里只要地址：传元组会让 Popen 直接抛 TypeError
             mirror_urls = [url for _name, url in git_mirrors()]
-            self._append(f"[更新] 来源：{source.label}（{source.url}，分支 {source.branch}）")
-            res = ginfo.update_from(
-                target, source,
-                mirrors=mirror_urls if source.kind == "official" else (),
-                strategy="merge")
+            self._log_work(f"[更新] 来源：{source.label}（{source.url}，分支 {source.branch}）")
+            # fetch 期间每 10 秒报一次进度，别让界面长时间一片安静
+            stop_watch = self._watch_fetch(target)
+            try:
+                res = ginfo.update_from(
+                    target, source,
+                    mirrors=mirror_urls if source.kind == "official" else (),
+                    strategy="merge")
+            finally:
+                stop_watch.set()
             if not res.ok:
                 self._post(self._update_done, False, res.error, was_running)
                 return
             if not res.changed:
-                self._append("[更新] 已是最新，无需更新。")
+                self._log_work("[更新] 已是最新，无需更新。")
                 self._post(self._update_done, True, "已是最新", was_running)
                 return
             how = {"ff": "快进", "merge": "合并", "rebase": "变基"}.get(res.strategy,
                                                                       res.strategy)
-            self._append(f"[更新] 已{how} {res.before} → {res.after}：{res.subject}")
+            self._log_work(f"[更新] 已{how} {res.before} → {res.after}：{res.subject}")
             if res.backup:
-                self._append(f"[更新] 万一有问题可以退回去："
-                             f"git reset --hard {res.backup}")
+                self._log_work(f"[更新] 万一有问题可以退回去："
+                               f"git reset --hard {res.backup}")
             # 依赖/构建**按需做**。官方这类更新常常连 lock 一起改（实测这次 3482 个提交里
             # 有 332 个依赖清单、pnpm-lock.yaml 变了 8071 行）——那必须重装；但如果只改了
             # 源码、清单一个没动，就没必要再花几分钟装一遍。查不出改了哪些文件时走保守路线。
             touched = ginfo.changed_paths(target, res.before, res.after)
             if touched is None:
-                self._append("[更新] 查不出这次改了哪些文件，稳妥起见还是重装依赖并重新构建 …")
+                self._log_work("[更新] 查不出这次改了哪些文件，稳妥起见还是重装依赖并重新构建 …")
                 need_deps = True
             else:
                 need_deps = ginfo.deps_touched(touched)
                 if need_deps:
-                    self._append(f"[更新] 这次改了 {len(touched)} 个文件，其中有依赖清单，"
-                                 "需要重装依赖；然后重新构建 …")
+                    self._log_work(f"[更新] 这次改了 {len(touched)} 个文件，其中有依赖清单，"
+                                   "需要重装依赖；然后重新构建 …")
                 else:
-                    self._append(f"[更新] 这次改了 {len(touched)} 个文件，依赖清单没动，"
-                                 "跳过重装依赖，直接重新构建 …")
+                    self._log_work(f"[更新] 这次改了 {len(touched)} 个文件，依赖清单没动，"
+                                   "跳过重装依赖，直接重新构建 …")
             if need_deps:
                 eng.install_deps(target, force=True)
             eng.build(target, force=True)

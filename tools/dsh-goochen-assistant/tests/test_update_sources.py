@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading as _threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -425,6 +426,14 @@ class UpdateWorkerTest(unittest.TestCase):
         def _update_done(self, ok, detail, was_running):
             """工作线程会把它当回调交给 _post；替身里只要存在即可（_post 只记录）。"""
 
+        def _log_work(self, msg):
+            """工作线程用的日志（真 App 会额外写 installer.log）；替身只记一笔。"""
+            self.log.append(str(msg))
+
+        def _watch_fetch(self, target):
+            """fetch 心跳（真 App 会每 10 秒报进度）；替身里不起线程。"""
+            return _threading.Event()
+
         def _backup_before_update(self, target, source):
             """真 App 这里会真备份会话数据、失败就拒绝更新；替身只记一笔并放行。"""
             self.backed_up.append(str(target))
@@ -749,6 +758,33 @@ class StatusUnknownGateTest(unittest.TestCase):
             result = gi.update_from(self.repo, source)
         self.assertFalse(result.ok, "查不出工作区状态就不该动手")
         self.assertIn("查不出工作区状态", result.error)
+
+
+class SshKeepaliveTest(unittest.TestCase):
+    """SSH 必须有连接超时与保活：真机踩过一次 fetch 卡死 4 分钟、一个字节没收到。"""
+
+    def setUp(self) -> None:
+        self._cmd = os.environ.pop("GIT_SSH_COMMAND", None)
+        self._ssh = os.environ.pop("GIT_SSH", None)
+
+    def tearDown(self) -> None:
+        for name, value in (("GIT_SSH_COMMAND", self._cmd), ("GIT_SSH", self._ssh)):
+            os.environ.pop(name, None)
+            if value is not None:
+                os.environ[name] = value
+
+    def test_sets_connect_timeout_and_keepalive(self):
+        gi._ensure_ssh_keepalive()
+        cmd = os.environ.get("GIT_SSH_COMMAND", "")
+        self.assertIn("ConnectTimeout=15", cmd)
+        self.assertIn("ServerAliveInterval=10", cmd)
+        self.assertIn("ServerAliveCountMax=3", cmd)
+        self.assertNotIn("BatchMode", cmd, "别禁掉交互提示，否则带口令的密钥就用不了了")
+
+    def test_respects_a_user_configured_ssh(self):
+        os.environ["GIT_SSH_COMMAND"] = "my-own-ssh -v"
+        gi._ensure_ssh_keepalive()
+        self.assertEqual(os.environ["GIT_SSH_COMMAND"], "my-own-ssh -v")
 
 
 class PushToOwnRepoTest(unittest.TestCase):
