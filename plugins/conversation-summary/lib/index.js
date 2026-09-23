@@ -626,53 +626,61 @@ function patchFilePath() {
 }
 
 /**
- * Rewrite the `conversation-summary` item's `config:` block in the patch file,
- * keeping every other row, insert list, and top comment untouched. Missing rows
- * are appended as a new insert list. Only config keys that differ from the
- * plugin's code defaults are written, so reverting a toggle to its default
- * removes the line instead of leaving stale values.
- * @returns {boolean} whether the file was actually rewritten.
+ * Rewrite this plugin's profile-layer patch entry in `cordis.patch.yml`.
+ *
+ * The profile patch layer (`- id: X` with an optional `config:`) overrides the
+ * row that this package's own bundle patch inserts; because the bundle already
+ * inserts the row, this function must never append a competing `- insert:`. An
+ * insert-shaped entry left by the pre-bundle installer is rewritten in place.
+ *
+ * Only config keys that differ from the plugin's code defaults are written, so
+ * reverting a toggle to its default removes the line instead of leaving a stale
+ * value behind.
+ * @param patchPath - absolute path of the profile's cordis.patch.yml.
+ * @param next - fully resolved config (draft merged over defaults).
+ * @returns whether the file content changed.
  */
-function persistPatchRow(patchPath, next) {
+export function persistPatchRow(patchPath, next) {
   const defaults = resolveConfig({})
   const keys = PERSIST_MAP
     .filter(([property]) => next[property] !== defaults[property])
-    .map(([property, yamlKey]) => `        ${yamlKey}: ${yamlScalar(next[property])}`)
-  const itemStart = '    - id: conversation-summary'
-  const itemHead = [
-    itemStart,
+    .map(([property, yamlKey]) => [yamlKey, yamlScalar(next[property])])
+  const flatHead = ['- id: conversation-summary']
+  const insertHead = [
+    '    - id: conversation-summary',
     "      name: '@dsh-user/conversation-summary'",
-    '      config:',
   ]
-  const itemLines = keys.length === 0 ? itemHead : [...itemHead, ...keys]
-  let text = readFileSync(patchPath, 'utf8')
-  const lines = text.replace(/\r\n/g, '\n').split('\n')
-  // Strip a single trailing empty entry from a final newline before splicing.
+  const buildEntry = (head, configIndent, keyIndent) => (keys.length === 0
+    ? head
+    : [...head, `${configIndent}config:`, ...keys.map(([key, value]) => `${keyIndent}${key}: ${value}`)])
+  const original = readFileSync(patchPath, 'utf8')
+  const lines = original.replace(/\r\n/g, '\n').split('\n')
   if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
   let start = -1
-  let end = -1
   for (let index = 0; index < lines.length; index += 1) {
-    if (lines[index] === itemStart) {
-      start = index
-      end = index + 1
-      while (end < lines.length) {
-        const line = lines[end]
-        if (line.length === 0
-          || line.startsWith('- insert:')
-          || line.startsWith('    - id:')) break
-        end += 1
-      }
-      break
-    }
+    if (lines[index] === flatHead[0] || lines[index] === insertHead[0]) { start = index; break }
   }
-  if (start !== -1) {
-    const nextLines = [...lines.slice(0, start), ...itemLines, ...lines.slice(end)]
-    text = `${nextLines.join('\n')}\n`
+  let text
+  if (start === -1) {
+    text = `${lines.join('\n')}\n\n${buildEntry(flatHead, '  ', '    ').join('\n')}\n`
   } else {
-    const trimmed = text.endsWith('\n') ? text : `${text}\n`
-    text = `${trimmed}\n- insert:\n${itemLines.join('\n')}\n`
+    const flat = lines[start] === flatHead[0]
+    const entry = buildEntry(
+      flat ? flatHead : insertHead,
+      flat ? '  ' : '      ',
+      flat ? '    ' : '        ',
+    )
+    let end = start + 1
+    while (end < lines.length) {
+      const line = lines[end]
+      // Stop at a blank separator, the next top-level operation, or the next
+      // item of an enclosing `- insert:` list.
+      if (line.trim() === '' || line.startsWith('- ') || line.startsWith('    - ')) break
+      end += 1
+    }
+    text = `${[...lines.slice(0, start), ...entry, ...lines.slice(end)].join('\n')}\n`
   }
-  if (text === readFileSync(patchPath, 'utf8')) return false
+  if (text === original) return false
   writeFileSync(patchPath, text, 'utf8')
   return true
 }
