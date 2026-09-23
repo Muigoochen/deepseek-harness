@@ -217,6 +217,25 @@ function runBridge(bridge, args, timeoutMs = 240_000) {
 // batched parallel. Protocol: request/reply JSON lines over stdio.
 const liveClients = new Map() // bridge -> Map(projectLower -> state)
 
+// Ports this profile reserves for the user's own editor LSP (every enginePorts
+// entry in the settings store, across projects and engines). Forwarded to the
+// checker so an engine it spawns never binds one of them. Godot opens its DAP
+// listener on every `--editor` instance — default 6006, independently of
+// `--lsp-port` — which is how one of our own headless engines once squatted the
+// port a user had reserved for their editor.
+let reservedPorts = []
+/** Replace the reserved-port set (called whenever the settings store reloads). */
+export function setReservedPorts(ports) {
+  reservedPorts = Array.isArray(ports) ? [...new Set(ports.filter((n) => Number.isInteger(n) && n > 0 && n <= 65535))] : []
+}
+/** Current reserved-port set (diagnostics/tests). */
+export function getReservedPorts() {
+  return [...reservedPorts]
+}
+function reserveArgs() {
+  return reservedPorts.length ? ['--reserve-ports', reservedPorts.join(',')] : []
+}
+
 function ensureClientd(bridge, project, role = 'main', editorPort) {
   const byProject = liveClients.get(bridge) || new Map()
   liveClients.set(bridge, byProject)
@@ -249,6 +268,7 @@ function ensureClientd(bridge, project, role = 'main', editorPort) {
   }
   const args = [bridge, 'clientd', '--project', project]
   if (editorPort) args.push('--editor-port', String(editorPort))
+  args.push(...reserveArgs())
   const child = spawn(process.execPath, args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
@@ -330,6 +350,7 @@ export function stopClientd(bridge, project) {
 export function ensureHost(bridge, project, editorPort) {
   const args = ['host', '--project', project]
   if (editorPort) args.push('--editor-port', String(editorPort))
+  args.push(...reserveArgs())
   return runBridge(bridge, args)
 }
 
@@ -394,7 +415,7 @@ export async function checkFiles(bridge, project, files, timeoutMs = 120_000, ro
     const tmpOut = path.join(runtimeRoot(), `.tmp-check-${safeName(project)}-${role}-${process.pid}-${Date.now()}.json`)
     const sweepArgs = role === 'baseline' ? ['--sweep'] : []
     const portArgs = editorPort ? ['--editor-port', String(editorPort)] : []
-    const r = await runBridge(bridge, ['check', ...sweepArgs, ...portArgs, ...files, '--project', project, '--out', tmpOut], timeoutMs)
+    const r = await runBridge(bridge, ['check', ...sweepArgs, ...portArgs, ...reserveArgs(), ...files, '--project', project, '--out', tmpOut], timeoutMs)
     if (r.fatal) {
       try { fs.unlinkSync(tmpOut) } catch { /* best effort */ }
       throw new Error(r.stderr.trim() || r.stdout.trim() || 'bridge check failed')

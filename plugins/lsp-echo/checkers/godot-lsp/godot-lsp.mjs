@@ -153,17 +153,29 @@ function resolveGodot(flags) {
 }
 
 // ---------- ports / process tree ----------
-function freePort() {
+// OS-chosen free port, retried while it lands inside `exclude`. The kernel hands
+// out ephemeral ports, so colliding with a reserved low port is unlikely but not
+// impossible — and a reserved port is exactly the one that must never be taken.
+function freePort(exclude = []) {
   return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.once('error', reject);
-    srv.listen(0, '127.0.0.1', () => {
-      const p = srv.address().port;
-      srv.close(() => resolve(p));
-    });
+    const tryOnce = (attempt) => {
+      const srv = net.createServer();
+      srv.once('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        const p = srv.address().port;
+        srv.close(() => {
+          if (!exclude.includes(p) || attempt >= 20) resolve(p);
+          else tryOnce(attempt + 1);
+        });
+      });
+    };
+    tryOnce(0);
   });
 }
 function portOpen(port) {
+  // net.connect throws synchronously on an out-of-range port; a stale settings
+  // value must not take the whole check down with an unrelated RangeError.
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return Promise.resolve(false);
   return new Promise((resolve) => {
     const sock = net.connect({ host: '127.0.0.1', port });
     sock.setTimeout(800);
@@ -404,6 +416,26 @@ function editorProbePorts(flags) {
   }
   return DEFAULT_EDITOR_PORTS;
 }
+/** Parse a comma-separated port list coming from a CLI flag. */
+function parsePortList(value) {
+  return String(value == null ? '' : value)
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n) && n > 0 && n <= 65535);
+}
+/**
+ * Ports our own headless engine must never bind: every port the profile reserves
+ * for a user editor (all `enginePorts` entries, forwarded by the host as
+ * `--reserve-ports`) plus this project's editor probe ports. `--lsp-port` alone
+ * does not cover this, because a Godot `--editor` instance independently opens
+ * its DAP listener — default 6006 — which is how an engine of ours once squatted
+ * the port a user had reserved for their editor LSP.
+ * @param {object} flags parsed CLI flags
+ * @returns {number[]} reserved ports, deduplicated
+ */
+function reservedPorts(flags) {
+  return [...new Set([...parsePortList(flags && flags['reserve-ports']), ...editorProbePorts(flags)])];
+}
 // Godot editor LSP serves ONE client session. Probing it with extra LSP
 // handshakes kicks the active session (the editor logs "Connection Taken" /
 // "Disconnected" per probe), so an editor is selected by TCP reachability
@@ -444,6 +476,12 @@ function writeHostState(project, state) {
     // the user-facing warning. Expiry is decided where they are read.
     if (state.badEditor === undefined && previous.badEditor) carried.badEditor = previous.badEditor;
     if (state.warn === undefined && previous.warn) carried.warn = previous.warn;
+    // `ownPorts`/`ownPid` describe the engine we last spawned. They must survive a
+    // mode switch (attaching to an editor stops that engine but the record still
+    // explains who held a port), because the attach-failure path uses them to tell
+    // "our own engine took this port" from "a foreign program did".
+    if (state.ownPorts === undefined && previous.ownPorts) carried.ownPorts = previous.ownPorts;
+    if (state.ownPid === undefined && previous.ownPid) carried.ownPid = previous.ownPid;
   }
   fs.writeFileSync(tmp, JSON.stringify({ ...state, ...carried }, null, 2), 'utf8');
   try { fs.renameSync(tmp, p); } catch { try { fs.unlinkSync(tmp); } catch { /* best effort */ } }
@@ -597,13 +635,19 @@ async function ensureHost(project, godotBin, flags) {
 
     if (locked && locked.mode !== MODE_EDITOR && isAlive(locked.pid)) killTree(locked.pid); // stale headless, clean up
 
-    const port = await freePort();
+    const reserved = reservedPorts(flags);
+    const port = await freePort(reserved);
+    const dapPort = await freePort([...reserved, port]);
+    // Which reserved ports were already busy before we started: the guard below
+    // uses this to tell "our engine took it" from "it was taken all along".
+    const reservedBusyBefore = new Set();
+    for (const rp of reserved) if (await portOpen(rp)) reservedBusyBefore.add(rp);
     const logStream = fs.createWriteStream(paths.hostLog, { flags: 'a' });
-    logStream.write(`\n=== start ${new Date().toISOString()} ${godotBin} port=${port} ===\n`);
-    log(`starting headless Godot LSP: ${godotBin} --path "${project}" --editor --headless --no-window --lsp-port ${port}`);
+    logStream.write(`\n=== start ${new Date().toISOString()} ${godotBin} port=${port} dap=${dapPort} ===\n`);
+    log(`starting headless Godot LSP: ${godotBin} --path "${project}" --editor --headless --no-window --lsp-port ${port} --dap-port ${dapPort}`);
     const child = spawn(
       godotBin,
-      ['--path', project, '--editor', '--headless', '--no-window', '--lsp-port', String(port)],
+      ['--path', project, '--editor', '--headless', '--no-window', '--lsp-port', String(port), '--dap-port', String(dapPort)],
       { detached: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }
     );
     child.stdout.on('data', (d) => logStream.write(d));
@@ -629,12 +673,38 @@ async function ensureHost(project, godotBin, flags) {
       killTree(child.pid);
       throw new Error(`LSP port ${port} never opened within ${BOOT_TIMEOUT_MS / 1000}s; see ${paths.hostLog}`);
     }
+    // A reserved port that was closed before this start and is open now is most
+    // likely ours (an engine build that ignores --dap-port opens the DAP default).
+    // This is ADVISORY, never fatal: the same observation is produced by the user's
+    // editor coming up inside this boot window, and by the in-project addon, which
+    // binds a port of its own from its configured range. Killing a healthy engine
+    // on that guess would cost the user all diagnostics, so the engine is kept and
+    // the collision is logged and surfaced instead.
+    const bridgeBase = configuredBridgePort(flags) || DEFAULT_BRIDGE_PORT;
+    const bridgeRange = new Set(Array.from({ length: 16 }, (_, i) => bridgeBase + i)); // mirrors the addon's PORT_SCAN_COUNT
+    const squatted = [];
+    for (const rp of reserved) {
+      if (bridgeRange.has(rp)) continue // the addon occupies a port here by design
+      if (reservedBusyBefore.has(rp)) continue // already busy before we started: not ours
+      if (await portOpen(rp)) squatted.push(rp);
+    }
     writeHostState(project, {
       mode: MODE_HEADLESS, pid: child.pid, port,
+      // Ports this engine was told to bind, so a later run can tell "the peer on
+      // this port is our own engine" from "a foreign program took it".
+      ownPorts: [port, dapPort],
+      ownPid: child.pid,
       project: path.resolve(project), godot: godotBin,
       startedAt: new Date().toISOString(),
     });
-    log(`host ready pid=${child.pid} port=${port} (headless)`);
+    if (squatted.length) {
+      log(`warning: reserved port(s) ${squatted.join(', ')} became busy while our engine started; an engine build that ignores --dap-port may be holding them`);
+      try {
+        const s = readHostState(project);
+        if (s) writeHostState(project, { ...s, warn: { ports: squatted, at: Date.now(), reason: 'engine-took-reserved-port' } });
+      } catch { /* best effort */ }
+    }
+    log(`host ready pid=${child.pid} port=${port} dap=${dapPort} (headless)`);
     return { pid: child.pid, port, mode: MODE_HEADLESS, reused: false };
   } finally {
     if (typeof lock === 'function') lock();
@@ -841,16 +911,39 @@ async function attachClient(project, godotBin, flags) {
       try { client.sock.destroy(); } catch { /* gone */ }
       if (h.mode !== MODE_EDITOR || attempt > 0) throw e;
       const badPort = h.port;
+      const prevState = readHostState(project);
+      // `ownPorts`/`ownPid` record what the engine we last spawned was told to
+      // bind (they survive the mode switch that wrote this editor record). The port
+      // is ours only when that engine is still alive AND its own LSP port is still
+      // open — otherwise the pid may have been recycled, and blaming or killing an
+      // unrelated process would be worse than the misattribution being fixed.
+      const ownPid = prevState && Number.isInteger(prevState.ownPid) ? prevState.ownPid : 0;
+      const ownLspOpen = prevState && Number.isInteger(prevState.port) ? await portOpen(prevState.port) : false;
+      const wasOurs = !!(prevState && Array.isArray(prevState.ownPorts)
+        && prevState.ownPorts.includes(badPort) && ownPid && ownLspOpen && isAlive(ownPid));
       // The reason decides the user-facing warning label and whether a retry is
-      // plausibly useful: a wrong-project peer and an unresponsive one differ.
-      const why = /serves .*, not /.test(String((e && e.message) || '')) ? 'wrong-project' : 'editor-lsp-unresponsive';
-      log(`editor LSP on ${badPort} rejected (${(e && e.message) || e}); blacklisting and falling back to headless`);
-      writeHostState(project, {
-        mode: MODE_EDITOR, pid: 0, port: badPort,
-        project: path.resolve(project), godot: '(user editor)',
-        badEditor: { port: badPort, at: Date.now() },
-        startedAt: new Date().toISOString(),
-      });
+      // plausibly useful: a wrong-project peer, our own engine squatting the port,
+      // and an unresponsive foreign peer are three different situations.
+      const why = /serves .*, not /.test(String((e && e.message) || ''))
+        ? 'wrong-project'
+        : (wasOurs ? 'own-engine-port-conflict' : 'editor-lsp-unresponsive');
+      if (wasOurs) {
+        // Release the port at once instead of blacklisting the editor: the editor
+        // is fine, our engine took the port the profile reserved for it. A fresh
+        // engine is spawned below with an explicit --dap-port, so it cannot take
+        // it again.
+        log(`editor port ${badPort} is held by our own headless pid=${ownPid}; stopping it so the port is released`);
+        if (ownPid) killTree(ownPid);
+        writeHostState(project, {});
+      } else {
+        log(`editor LSP on ${badPort} rejected (${(e && e.message) || e}); blacklisting and falling back to headless`);
+        writeHostState(project, {
+          mode: MODE_EDITOR, pid: 0, port: badPort,
+          project: path.resolve(project), godot: '(user editor)',
+          badEditor: { port: badPort, at: Date.now() },
+          startedAt: new Date().toISOString(),
+        });
+      }
       h = await ensureHost(project, godotBin, flags); // spawns/reuses our headless
       if (h.mode === MODE_HEADLESS) {
         // Surface the dead editor port to the host (toast) via host-state warn.

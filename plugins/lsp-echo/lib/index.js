@@ -19,7 +19,7 @@ import fs from 'node:fs'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { engines, markers, matchExtension } from './checkers.js'
-import { ensureHost, stopHost, status, checkFiles, runtimeRoot, stopClientd, diagnosticsPath, pruneSnapshot, rescanEngine } from './manager.js'
+import { ensureHost, stopHost, status, checkFiles, runtimeRoot, stopClientd, diagnosticsPath, pruneSnapshot, rescanEngine, setReservedPorts } from './manager.js'
 import { ADDON_ID, discoverBridgePortAsync, installAddonInto, probeEngineBridge, rescanPortOf } from './addon.js'
 import { dependentsOf } from './dependents.js'
 import { ProjectWatcher, normalizeSkipEntry, sameSkipEntry, scanFiles } from './watcher.js'
@@ -397,7 +397,11 @@ export function apply(ctx, config) {
       tLine('toast.enginePort.title', { name: eng.name }),
       warn.reason === 'wrong-project'
         ? tLine('toast.enginePort.wrongProject', { ports: warn.ports.join(', ') })
-        : tLine('toast.enginePort.noReply', { ports: warn.ports.join(', ') }),
+        : warn.reason === 'own-engine-port-conflict'
+          ? tLine('toast.enginePort.ownConflict', { ports: warn.ports.join(', ') })
+          : warn.reason === 'engine-took-reserved-port'
+            ? tLine('toast.enginePort.engineHoldsPort', { ports: warn.ports.join(', ') })
+            : tLine('toast.enginePort.noReply', { ports: warn.ports.join(', ') }),
       `lsp-echo-engwarn:${key}`,
       8000,
     )
@@ -430,7 +434,17 @@ export function apply(ctx, config) {
       enginePorts: v && Array.isArray(v.enginePorts) ? v.enginePorts : [],
     }
   }
+  /**
+   * Tell the manager which editor ports this profile reserves, so a headless
+   * engine it starts never binds one. Every configured port counts, not just this
+   * project's: Godot opens the DAP default (6006) on any `--editor` instance, and
+   * another project's reserved port must not be squatted either.
+   */
+  const syncReservedPorts = () => {
+    setReservedPorts((store.enginePorts || []).map((x) => Number(x && x.port)))
+  }
   let store = readStore()
+  syncReservedPorts()
   const persist = async () => {
     if (!scope) return
     const out = { discovered: store.discovered, manual: store.manual, enginePorts: store.enginePorts }
@@ -438,6 +452,7 @@ export function apply(ctx, config) {
     if (typeof store.autoInstallAddon === 'boolean') out.autoInstallAddon = store.autoInstallAddon
     await scope.replace(out)
     store = readStore() // refresh local snapshot after the durable commit
+    syncReservedPorts()
   }
   /** Auto-install the engine bridge addon: settings toggle when set, else on. */
   const globalAutoAddon = () => (typeof store.autoInstallAddon === 'boolean' ? store.autoInstallAddon : true)
@@ -1981,6 +1996,7 @@ export function apply(ctx, config) {
         prevKnown.set(k, { path: r.path, exts: [...boundExtensions(r)].sort().join(',') })
       }
       store = readStore()
+      syncReservedPorts()
       seedKnown()
       // drop watchers for projects that left the effective set; live ones are
       // lazily rebuilt by ensureWatcher when their extension set changes

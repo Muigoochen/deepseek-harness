@@ -91,6 +91,14 @@
     "The language server on port {ports} serves a different project, not the one being checked, so it cannot diagnose this project. Its empty replies would pass off as \"0 errors\".",
     "The plugin switched to its own engine. Once you switch the editor back to this project, that port is retried after its 5-minute blacklist expires."
   ],
+  "toast.enginePort.ownConflict": [
+    "Port {ports} was taken by this plugin's own headless engine: starting it also opens Godot's debug adapter (DAP) default port, which collided with the editor LSP port you reserved in the settings. Your editor is not at fault.",
+    "The plugin stopped that engine and now starts it with arguments that avoid reserved ports, so the port is free again for your editor."
+  ],
+  "toast.enginePort.engineHoldsPort": [
+    "Port {ports} became busy after this plugin started its engine, and the engine is the likely holder: this Godot build may not know --dap-port, so it opened the DAP default (6006).",
+    "The engine keeps running, so diagnostics still work. To free that port for your editor, set the editor LSP port to something other than 6006 (6008, say), or use Godot 4.3+ which honours --dap-port."
+  ],
   "toast.enginePort.noReply": [
     "Port {ports} accepts connections but does not answer LSP requests: the process holding it is not that language's editor LSP, or the editor LSP is stuck.",
     "The plugin switched to its own engine; check that port."

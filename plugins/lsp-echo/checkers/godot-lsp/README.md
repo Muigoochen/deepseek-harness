@@ -16,7 +16,10 @@
 ## 2. 方案定论:不做编辑器插件,做一个 LSP 客户端
 
 - 报错本体是 **Godot 引擎自带的语言服务器(LSP)**,不是编辑器 UI;原生编辑器面板和 VSCode godot-tools 是同一个 LSP 的不同客户端。
-- Godot 4.2+ 官方支持 `--lsp-port` 启动 **Headless(无窗口)编辑器实例专职当语言服务器**(godot-vscode-plugin 的 `godotTools.lsp.headless` 即此用法,见 [ClientConnectionManager.ts](https://github.com/godotengine/godot-vscode-plugin/blob/master/src/lsp/ClientConnectionManager.ts))。
+- Godot 4.2+ 官方支持 `--lsp-port` 启动 **Headless(无窗口)编辑器实例专职当语言服务器**(godot-vscode-plugin 的 `godotTools.lsp.headless` 即此用法,见 [ClientConnectionManager.ts](https://github.com/godotengine/godot-vscode-plugin/blob/master/src/lsp/ClientConnectionManager.ts))。本桥还额外传
+  `--dap-port`(Godot 4.3+):`--editor` 实例总会打开调试适配器(DAP)监听,默认端口 **6006**;
+  不显式指定时,若用户把编辑器 LSP 端口设为 6006,引擎就会把它占掉。两个端口都避开
+  `--reserve-ports`(由插件按 settings 里的编辑器端口传入)且不取预留值。
 - 因此原生编辑器用户、VSCode 用户、纯 AI 改文件场景**全部通吃**;不需要 Godot 源码、不需要改引擎。
 
 | 旧痛点 | 本方案 |
@@ -48,7 +51,7 @@ godot-lsp-tooling/
 node godot-lsp.mjs check <file...> [--project <dir>] [--godot <exe>] [--out <json>] [--once]
 node godot-lsp.mjs smoke <file>    [--project <dir>] [--godot <exe>]   # 自检(不改磁盘文件)
 node godot-lsp.mjs watch           [--project <dir>] [--godot <exe>] [--out <json>]
-node godot-lsp.mjs host | stop     [--project <dir>] [--godot <exe>]
+node godot-lsp.mjs host | stop     [--project <dir>] [--godot <exe>] [--reserve-ports <csv>]
 ```
 
 自动发现(全部可被 `--xxx` 或配置文件覆盖):

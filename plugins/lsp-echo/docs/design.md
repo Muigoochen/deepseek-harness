@@ -11,8 +11,12 @@
 
 ## 2. 分层:引擎 + 管理
 
-- **引擎(checkers/godot-lsp/)**:headless Godot 编辑器 `--editor --headless --no-window --lsp-port` 作
+- **引擎(checkers/godot-lsp/)**:headless Godot 编辑器
+  `--editor --headless --no-window --lsp-port <free> --dap-port <free>` 作
   LSP 宿主(全工程 `class_name` 注册、语义级诊断),零依赖 Node 桥负责拉起/客户端/落盘。
+  `--dap-port` 必须显式给:任何 `--editor` 实例都会顺带打开调试适配器(DAP)监听,默认端口
+  6006,而 6006 常被用户当作编辑器 LSP 端口 —— 不指定就会由本插件自己的引擎占掉它。
+  两个端口都由 `freePort()` 选定,并避开 `--reserve-ports` 里设置的预留端口。
   可被任何 agent 独立调用(`host|status|stop|check|smoke|watch`)。
 - **管理(harness 插件 lib/)**:生命周期、项目自动判定、变更侦测、自动注入、GUI API 钩子。
   存储用 **harness settings 命名空间 `lsp-echo`**(非自建文件)。
