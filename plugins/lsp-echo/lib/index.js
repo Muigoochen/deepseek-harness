@@ -478,11 +478,14 @@ export function apply(ctx, config) {
    * A project whose addon files exist but whose project.godot never enabled them is
    * repaired here too: that half-state leaves a running editor invisible to this
    * plugin (it cannot report its LSP port), and an existence check alone finds
-   * nothing to do. A failure is retried only after ADDON_REPAIR_COOLDOWN_MS, so an
-   * unwritable or malformed project.godot cannot make every check re-copy, re-toast
-   * and restart the engine. Overlapping triggers (a conversation opening while a
-   * check runs) share one attempt per project: the copy writes a fixed temp path, so
-   * two interleaved attempts would race the rename and report a spurious failure.
+   * nothing to do. A repair that only re-writes the enable entry leaves the project's
+   * running engine alone; only a freshly copied addon stops it, because that engine
+   * cannot load an addon that did not exist when it started. A failure is retried only
+   * after ADDON_REPAIR_COOLDOWN_MS, so an unwritable or malformed project.godot cannot
+   * make every check re-copy, re-toast and restart the engine. Overlapping triggers (a
+   * conversation opening while a check runs) share one attempt per project: the copy
+   * writes a fixed temp path, so two interleaved attempts would race the rename and
+   * report a spurious failure.
    * @param {{ path: string, lsp?: Array<{ engine: string }> }} rec project record
    * @returns {Promise<boolean>} true when the addon was installed or enabled this call
    */
@@ -523,11 +526,18 @@ export function apply(ctx, config) {
       } else {
         showToast('success', tLine('toast.addon.title'), tLine('toast.addon.body', { path: rec.path }), 'lsp-echo-addon', 9000)
       }
-      // A headless engine already running predates the addon; stop it so the
-      // next check starts one that loads the addon. The user's editor is never
-      // touched — its addon loads when the editor restarts.
-      await stopHost(eng.bridge, rec.path).catch(() => {})
-      stopClientd(eng.bridge, rec.path)
+      // Only a freshly copied addon requires the engine restart: a headless engine that
+      // started before the addon existed cannot load it, and the trigger that installed
+      // it is a check path which starts a new engine right after (the baseline) or needs
+      // one for the check that follows. A project that merely lost its project.godot
+      // entry — a running Godot editor rewrites the file from the copy it loaded before
+      // the entry existed — must NOT have its engine stopped here: nothing is guaranteed
+      // to start it again (the badge would read "stopped"), and the next natural start
+      // loads the addon anyway.
+      if (!installed) {
+        await stopHost(eng.bridge, rec.path).catch(() => {})
+        stopClientd(eng.bridge, rec.path)
+      }
       return true
     } catch (error) {
       trace('addon', `${rec.path}: auto install threw: ${(error && error.message) || error}`)
