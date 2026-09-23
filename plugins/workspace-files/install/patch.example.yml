@@ -1,10 +1,14 @@
 # workspace-files - a profile-layer entry for $DSH_HOME/profiles/<name>/cordis.patch.yml.
 #
+# The loader id is `dsh-workspace-files`: the web bundle already mounts
+# `workspace-files` (@deepseek-ai/dsh-api-workspace-files), so this plugin cannot
+# use that id.
+#
 # Do NOT write a second `- insert:` for this id. The row already comes from the
 # package's own cordis.patch.yml (a bundle layer), and two inserts of the same id
 # are a fatal `duplicate loader entry id` at boot. An entry carrying only `- id:`
 # patches the row the bundle inserted.
 #
 # workspace-files has no config, so the useful override is to turn it off here:
-- id: workspace-files
+- id: dsh-workspace-files
   disabled: true

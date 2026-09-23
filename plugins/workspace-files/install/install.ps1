@@ -31,7 +31,7 @@ if (-not (Test-Path (Join-Path $PluginSource 'cordis.patch.yml'))) { throw "miss
 $patchPath = Join-Path $PluginSource 'cordis.patch.yml'
 $patchText = [System.IO.File]::ReadAllText($patchPath)
 if ($patchText -notmatch '(?m)^-\s+insert:') { throw "cordis.patch.yml has no top-level '- insert:' operation: $patchPath" }
-if ($patchText -notmatch [regex]::Escape('- id: workspace-files')) { throw "cordis.patch.yml does not insert the id 'workspace-files': $patchPath" }
+if ($patchText -notmatch [regex]::Escape('- id: dsh-workspace-files')) { throw "cordis.patch.yml does not insert the id 'dsh-workspace-files': $patchPath" }
 
 # ---------- locate profile ----------
 if (-not $ProfileRoot) {

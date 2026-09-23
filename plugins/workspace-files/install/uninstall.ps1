@@ -58,7 +58,9 @@ if (Test-Path $dest) {
 # pointing at a package that is no longer installed.
 if (Test-Path $patchFile) {
   $lines = [System.IO.File]::ReadAllLines($patchFile)
-  $idNeedle = "(?m)^\s*- id: workspace-files\s*$"
+  # Also matches the pre-rename id `workspace-files`, so profiles patched before the
+  # rename still get their row removed.
+  $idNeedle = "(?m)^\s*- id: (?:dsh-)?workspace-files\s*$"
   $nameNeedle = "name: '@dsh-user/workspace-files'"
   $ops = New-Object System.Collections.Generic.List[object]
   for ($i = 0; $i -lt $lines.Count; $i++) {
