@@ -896,15 +896,19 @@ export function apply(ctx, config) {
     if (syncing || config.autoDiscover === false) return
     const svc = ctx.get('workspaceRegistry')
     if (!svc || typeof svc.list !== 'function') return
-    let wsList = []
-    try {
-      wsList = await svc.list()
-    } catch (error) {
-      console.warn(`[lsp-echo] workspaceRegistry.list failed: ${(error && error.message) || error}`)
-      return
-    }
+    // Single-flight: claimed before the first await so the enable-time call and
+    // an agent/created call cannot both scan and persist the same set. A trigger
+    // arriving while a sync is in flight is dropped, not queued; the next
+    // agent/created retries it.
     syncing = true
     try {
+      let wsList = []
+      try {
+        wsList = await svc.list()
+      } catch (error) {
+        console.warn(`[lsp-echo] workspaceRegistry.list failed: ${(error && error.message) || error}`)
+        return
+      }
       const currentKeys = new Set(
         wsList
           .map((w) => (w && w.id) || (w && w.path ? `path:${path.resolve(w.path)}` : undefined))
@@ -932,20 +936,38 @@ export function apply(ctx, config) {
         changed = true
       }
       if (changed) {
+        const previousDiscovered = store.discovered
         store.discovered = nextDiscovered
-        await persist()
+        try {
+          await persist()
+        } catch (error) {
+          // Best effort, not a guarantee: a settings write that started while this
+          // one was in flight already carries nextDiscovered and commits it after
+          // this failure. Restoring still keeps memory and disk agreeing in the
+          // ordinary case (persist() refreshes the local snapshot only after the
+          // durable write).
+          store.discovered = previousDiscovered
+          throw error
+        }
         seedKnown()
         const newly = nextDiscovered.filter((d) => !beforeKeys.has(d.key) && d.projects.length)
         if (newly.length) {
           showToast('success', tLine('toast.discovered.title'), `${tLine('toast.discovered.body')}\n${newly.map((d) => d.title || d.path).join('\n')}`, 'lsp-echo-discover', 6000)
         }
       }
+    } catch (error) {
+      // Both callers are fire-and-forget (the enable-time call and the `void` in
+      // the agent/created listener), so a failure must be reported here instead
+      // of surfacing as an unhandled rejection, which stops the process.
+      console.warn(`[lsp-echo] workspace sync failed: ${(error && error.message) || error}`)
     } finally {
       syncing = false
     }
   }
-  if (config.autoDiscover !== false) syncWorkspaces() // fire and forget at enable
-  ctx.on('agent/session-start', () => syncWorkspaces())
+  if (config.autoDiscover !== false) void syncWorkspaces() // fire and forget at enable
+  // A workspace entering DSH is judged once (design §5). The listener stays off
+  // the serial creation dispatch: `void` keeps discovery from holding it.
+  ctx.on('agent/created', () => { void syncWorkspaces() })
 
   // ---- tool surface -------------------------------------------------------
   // Full-project baseline across EVERY engine bound to the project: each
@@ -1576,7 +1598,7 @@ export function apply(ctx, config) {
     try { fs.appendFileSync(traceLog, `${new Date().toISOString()} ${parts.join(' ')}\n`) } catch { /* never break the step */ }
   }
   const lastInjected = new Map()
-  let baselineStarter = null // assigned once startBaselineFor exists below
+  let baselineStarter = null // assigned the guarded startBaseline below
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
     if (!decision || decision.kind === 'reject' || (signal && signal.aborted)) return decision
@@ -1608,9 +1630,10 @@ export function apply(ctx, config) {
       if (eng) boundEngines.push(eng)
     }
     if (!boundEngines.length) { trace('pre-step', agentId, `skip: no engine bound to ${rec.path}`); return decision }
-    // Fallback: opening an idle conversation does not start an agent, so the
-    // session-start trigger may be missed. Start the one-time full baseline on
-    // this project's first real step instead.
+    // Fallback: the agent/created trigger can miss (a session resumed under a
+    // project whose discovery had not finished yet, or a plugin reload mid
+    // session). Start the one-time full baseline on this project's first real
+    // step instead.
     if (typeof baselineStarter === 'function') baselineStarter(agent)
     // Before any watcher work: a project missing the engine bridge addon cannot
     // be asked to rescan, and its didSave path has no unsaved-changes guard.
@@ -1770,10 +1793,11 @@ export function apply(ctx, config) {
     return { ...decision, messages: [...(decision.messages || []), msg] }
   }, { prepend: true })
 
-  // ---- one-time per-process full-project baseline scan (user-facing) ------
-  // Triggered by the first top-level session that enters a workspace
-  // (agent/session-start, source startup|resume — i.e. the user opens that
-  // workspace's conversation). Runs once per process run as a sweep request
+  // ---- one-time per-mount full-project baseline scan (user-facing) --------
+  // Triggered when a session's agent is announced (agent/created — the user
+  // opens that workspace's conversation, before typing; common sources are
+  // startup and resume, and the listener does not filter on it). Runs once per
+  // plugin mount and project as a sweep request
   // on the project's single shared clientd (requests are serialized inside
   // the bridge). Progress + completion are announced through the pre-step
   // channel (both shown, also when the project is clean).
@@ -1843,11 +1867,11 @@ export function apply(ctx, config) {
       const n = (baselineAttempts.get(cwdLower) || 0) + 1
       baselineAttempts.set(cwdLower, n)
       trace('baseline', 'miss-retry', agent && agent.id, `attempt ${n}`, hdr.cwd)
-      if (n <= 6) setTimeout(() => startBaselineFor(agent), n * 1500)
+      if (n <= 6) setTimeout(() => startBaseline(agent), n * 1500)
       return
     }
     const key = baselineKey(rec)
-    if (baseline.has(key)) return // once per process run
+    if (baseline.has(key)) return // once per mount
     const boundEngines = []
     for (const x of rec.lsp || []) {
       const eng = engine(x.engine)
@@ -1948,12 +1972,30 @@ export function apply(ctx, config) {
       showToast('error', tLine('toast.baseline.failed.title'), (e && e.message) || String(e), `lsp-echo-baseline-done:${key}`, 6000)
     })
   }
-  ctx.on('agent/session-start', ({ agent, source }) => {
+  // Every call site is a timer callback or the pre-step waterfall listener, where
+  // a synchronous throw would become an uncaught exception or fail the step, so
+  // the trigger goes through one guard.
+  const startBaseline = (agent) => {
+    try {
+      startBaselineFor(agent)
+    } catch (error) {
+      trace('baseline', 'start failed', (error && error.message) || error)
+    }
+  }
+  // Opening a conversation announces the session's agent (source=resume for a
+  // stored conversation, startup for a new one) before the first message, so
+  // the full sweep overlaps the user typing. Any later re-creation (clear,
+  // compact) is harmless: the sweep is once per mount and per project.
+  ctx.on('agent/created', ({ agent, source }) => {
     const hdr = agent && agent.session && agent.session.header
-    if (hdr && hdr.cwd) trace('session-start', agent && agent.id, String(source || '?'), hdr.cwd)
-    startBaselineFor(agent)
+    if (hdr && hdr.cwd) trace('created', agent && agent.id, String(source || '?'), hdr.cwd)
+    // Deferred: agent/created is serial and awaited, and startBaselineFor enumerates
+    // the project synchronously before its first await — on a large project that
+    // would delay the creation dispatch, i.e. the conversation opening itself.
+    // Starting once per mount and per project makes the deferral free.
+    setTimeout(() => startBaseline(agent), 0)
   })
-  baselineStarter = startBaselineFor
+  baselineStarter = startBaseline
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
     if (!decision || decision.kind === 'reject' || (signal && signal.aborted)) return decision

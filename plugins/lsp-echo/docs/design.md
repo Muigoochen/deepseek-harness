@@ -78,11 +78,13 @@
 
 ## 6. 触发机制(实测定稿,2026-09-05)
 
-- **点开会话 = `agent/session-start source=resume`**(每个被点开的对话都会发,含 fork 副本);
+- **点开会话 = `agent/created source=resume`**(每个被点开的对话都会发,含 fork 副本;新建会话是 `source=startup`);
+  该事件在首条消息之前发出(网页端打开会话即 `session.follow` → 后台激活 agent);触发器在 creation 派发之后异步开始,
+  所以扫描与用户打字并行(枚举全树的同步部分不占用打开会话的那一刻);
 - **fork 子会话带 `parentSession`** —— 初版"仅顶层用户会话"守则误拦了 fork 副本
   (现象:「熟悉道具」永不触发而「现场验收」触发,与最近活跃/先后无关)。
   **结论:基线/注入的门槛只按会话工作区 cwd 判定,不看 parentSession**;
-- **自动全量基线**:进程内每项目首触发一次(任一命中工作区的会话 resume 即启动),
+- **自动全量基线**:每次装载后每项目首触发一次(任一命中工作区的会话 `agent/created` 即启动,常见 `startup`/`resume`;行热重载会重新武装),
   扫描跑独立 clientd 角色(role=baseline),开始/完成/失败以插件消息 + toast 播报(完成也播报"0 错误");
 - **全量扫描快路径(sweep)**:一次性 didOpen 全部文件 + 无 settle 税(实测 501 文件
   从 ~60s 降到 ~4.7s);`.gdshader` 引擎不发 LSP 诊断,立即记空结果不空等(带 `engine_note`);
@@ -98,7 +100,7 @@
   (实测 138 ms socket 往返,不含桥进程启动)再检查。现象:父类方法已改成 `-> bool`,
   子类仍报 `Parent signature is "… -> void"`;我们自起的 headless 引擎无此窗口(依赖从磁盘读取,
   实测"先打开过依赖"与"从未打开"两种变体都立刻反映);
-- 调试观测:`$DSH_HOME/lsp-echo-runtime/lsp-echo-trace.log`(pre-step/session-start/baseline 全记录)。
+- 调试观测:`$DSH_HOME/lsp-echo-runtime/lsp-echo-trace.log`(pre-step/created/baseline/addon/rescan 全记录)。
 
 ## 7. 自动注入与日志
 

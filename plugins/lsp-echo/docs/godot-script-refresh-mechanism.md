@@ -378,5 +378,5 @@ pid/启动时间/项目路径,读方据此校验),只有身份不可得时才退
 `mtimeMs`,`drain()` 还包含 `.gdshader`),因此既可能误开(touch 或重写同内容),也可能漏开
 (内容变了而 mtime 未变/精度不足)。实现时应改用内容哈希,或明确接受该近似。
 
-注 2:baseline 路径(`lib/index.js:1482-1608` `startBaselineFor`)不看 watcher diff、直接全树 sweep,
+注 2:baseline 路径(`lib/index.js` 的 `startBaselineFor`,约 1850 行起)不看 watcher diff、直接全树 sweep,
 因此"改完的第一轮恰好是 baseline 轮"时 didSave 没有输入集合,需要另行定义或接受该轮缺省。
