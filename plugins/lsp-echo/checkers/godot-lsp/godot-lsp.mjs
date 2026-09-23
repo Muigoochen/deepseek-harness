@@ -493,7 +493,14 @@ async function waitForPort(port, timeoutMs) {
 async function alignEditorTarget(project, flags) {
   const target = editorProbePorts(flags)[0];
   const instance = await findProjectInstance(project, flags);
-  if (instance === undefined || instance.kind !== 'editor') return undefined;
+  if (instance === undefined || instance.kind !== 'editor') {
+    // No editor instance we can talk to: the editor is not running, or the copy of the
+    // bridge addon inside it predates the `state` command and cannot report its ports.
+    // Fall back to plain reachability on the configured port — without facts that is
+    // all a caller can know, and refusing to attach would strand every editor whose
+    // addon has not been updated yet.
+    return probeEditorPort(project, flags);
+  }
   const actual = Number(instance.state.lspPort);
   if (Number.isInteger(actual) && actual === target && await portOpen(target)) return target;
   let chosen = target;

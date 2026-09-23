@@ -92,7 +92,7 @@
     "已自动改用独立引擎;把编辑器切回本项目后,该端口会在 5 分钟黑名单到期后重新尝试。"
   ],
   "toast.enginePort.ownConflict": [
-    "端口 {ports} 是被本插件自己的 headless 引擎占用的 —— 它启动时顺带开了 Godot 的调试适配器(DAP)默认端口,和你在设置里给编辑器 LSP 预留的端口撞了。不是你的编辑器有问题。",
+    "端口 {ports} 是被本插件自起的引擎占用的 —— 它启动时顺带开了 Godot 的调试适配器(DAP)默认端口,和你在设置里给编辑器 LSP 预留的端口撞了。不是你的编辑器有问题。",
     "本插件已停掉那个引擎,并改用不会碰预留端口的启动参数;该端口已释放,你的编辑器可以正常监听它。"
   ],
   "toast.enginePort.engineHoldsPort": [
@@ -137,7 +137,7 @@
   "overlay.start.running": "引擎已在运行",
   "overlay.stop": "停止",
   "overlay.stopping": "停止中…",
-  "overlay.stop.title": "停止引擎(无头模式)",
+  "overlay.stop.title": "停止引擎(独立引擎)",
   "overlay.stop.off": "引擎未在运行",
   "addon.err.noProject": "project.godot 不存在",
   "addon.err.badPluginSection": "project.godot 的 [editor_plugins] 段无法解析(enabled 列表缺少右括号)",
@@ -147,8 +147,8 @@
   "settings.bridge.err.unsupported": "该项目的引擎不支持 Godot 引擎桥(engine.json 未声明 rescan/addon)",
   "settings.bridge.err.noRescan": "该项目没有声明 rescan 能力的引擎",
   "overlay.mode.engine": "引擎 …",
-  "overlay.mode.editor": "编辑器已接入",
-  "overlay.mode.headless": "无头运行",
+  "overlay.mode.editor": "已接入你的编辑器",
+  "overlay.mode.headless": "独立引擎",
   "overlay.mode.off": "已停止",
   "overlay.mode.running": "运行中",
   "overlay.summary": "{files} 文件 · {err} 错误 · {warn} 警告",
