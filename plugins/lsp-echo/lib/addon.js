@@ -253,11 +253,12 @@ function samePath(a, b) {
 /**
  * Ask a control port which project its addon serves.
  *
- * The published port file holds one slot, so a port found by probing must be
- * confirmed to belong to the project being checked — another project's addon
- * sits in the same scan range. An addon older than the `whoami` command answers
- * `err unknown command`, which still proves something is listening there; that
- * is reported as an empty path.
+ * A port found by probing must be confirmed to belong to the project being
+ * checked: another project's addon sits in the same scan range, and the record
+ * file cannot settle it — a slot is only as fresh as its instance's last publish,
+ * and a slot whose instance exited is ignored rather than removed. An addon older
+ * than the `whoami` command answers `err unknown command`, which still proves
+ * something is listening there; that is reported as an empty path.
  * @param {number} port control port
  * @param {number} [timeoutMs] reply timeout
  * @returns {Promise<string|undefined>} absolute project path, '' when the addon
@@ -292,11 +293,13 @@ export function askBridgeProject(port, timeoutMs = 700) {
 /**
  * Port of the addon serving this project, found without configuration.
  *
- * `discoverBridgePort` reads the published file, which holds a single instance's
- * record: a second engine opening the project overwrites it, and the first
- * instance's record is gone even though that engine is still listening. Probing
- * the range an addon scans (base .. base+15) recovers that case; `whoami` keeps
- * the probe from latching onto another project's addon in the same range.
+ * `discoverBridgePort` reads the published file, which names at most one instance
+ * per kind: two headless engines serving one project share the `engine` slot, so
+ * the second overwrites the first's record although that engine still listens, and
+ * a slot whose instance exited is ignored rather than removed. Probing the range an
+ * addon scans (base .. base+15) recovers an instance that is listening but not
+ * named; `whoami` keeps the probe from latching onto another project's addon in the
+ * same range.
  * @param {string} project project root
  * @param {{ rescanPort?: number }} [eng] engine record supplying the scan base
  * @returns {Promise<number|undefined>} the port, or undefined when no addon is running

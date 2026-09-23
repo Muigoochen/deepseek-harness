@@ -278,7 +278,8 @@ connected external editor")。
 
 - 三组对照**每格 n=1**,且人在同一台机器上操作(Godot 窗口焦点事件可能发生),因此 §7.2 的结论
   是"支持"而非"证明"。
-- **rescan 打到了哪个实例未能自证**:端口公布文件是单槽的,且插件路径上显式端口优先级最高
+- **rescan 打到了哪个实例未能自证**:该实验当时依赖单槽的端口公布文件(此后已按 editor/engine 分槽,
+  见 §9.2),且插件路径上显式端口优先级最高
   (`lib/index.js:418` → `lib/manager.js:350-353` → `godot-lsp.mjs:1245`),桥内部的
   `discoveredBridgePort`(`godot-lsp.mjs:226-240`)在该路径上是死代码;editor 模式的 host state
   记 `pid: 0`(`godot-lsp.mjs:502-506`、`567-571`),LSP 对端不告知 pid。本次实验是**手工指定
@@ -286,7 +287,7 @@ connected external editor")。
 - 若要事后复核,需要采集:运行实例中**实时**的 `get_open_scripts()`/`get_unsaved_scripts()` 与自身 pid、
   每步 a 的内容哈希与 mtime、窗口焦点时间线、每次 `publishDiagnostics` 的原始快照,以及一个
   **负对照**(只 touch mtime 不改内容)。现有清单缺这些量,其中"addon 实际端口"目前也不可持久采集
-  (`plugin.gd:64` 只 `print_debug`,唯一落盘物是会被覆盖/删除的单槽文件)。
+  (`plugin.gd` 只 `print_debug`,唯一落盘物是那份会被覆盖的公布文件)。
 
 ## 8. 方案评估
 
@@ -334,11 +335,16 @@ connected external editor")。
 
 四处都要改,否则真实错误仍会被静默吞掉。
 
-### 9.2 桥端口公布文件是单槽的,协议没有实例身份
+### 9.2 桥端口公布文件的实例身份(已修)
 
-`<project>/.godot/dsh_echo_bridge.json` 只有一份,**任何**退出的实例按 pid 匹配就会删它
-(`plugin.gd:67-82`),于是"编辑器正在监听 6090"可能被一个已退出的 headless 实例抹掉。根因是
-**单槽文件 + 协议无实例身份**。相关实现分布:
+**当时的事实**:`<project>/.godot/dsh_echo_bridge.json` 只有一份,**任何**退出的实例按 pid 匹配就会删它,
+于是"编辑器正在监听 6090"可能被一个已退出的 headless 实例抹掉。根因是**单槽文件 + 协议无实例身份**。
+
+**现状**(2026-09-23,`STATE_VERSION` 3):文件按 editor/engine **分槽**写入,各方只写自己那一格,退出时
+**不再删文件**(死掉的那一格由读取方按 pid 忽略),协议也补上了身份——`whoami` 回项目路径、`state` 回
+pid/端口/版本,读取方据此校验。残留限制:同一种实例(两个 headless 引擎)仍共用一格,后写者覆盖先写者;
+`discoverBridgePortAsync` 的端口探测是"身份不可得"时的兜底。相关实现分布(**当时**的行号,此后代码已有
+变动,仅作历史参考):
 
 - 读取该文件的**两处**:`checkers/godot-lsp/godot-lsp.mjs:226-240` 与 `lib/addon.js:34-48`
   (没有第三处);

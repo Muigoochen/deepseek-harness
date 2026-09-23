@@ -18,9 +18,10 @@ extends EditorPlugin
 ##   ping   -> pong
 ##   whoami -> project:<absolute project path>
 ##     Which project this instance serves. The caller probes the port range this
-##     addon scans when the published file is missing or stale (the file holds a
-##     single slot, so a second engine's record replaces it), and must not latch
-##     onto another project's addon found in the same range.
+##     addon scans when the published file is missing or names no live instance (the
+##     file carries one slot per kind of instance, so a second engine replaces the
+##     first engine's slot), and must not latch onto another project's addon found in
+##     the same range.
 ##   rescan -> ok   (after the filesystem scan was triggered)
 ##   unsaved:<res path> -> yes | no
 ##     Whether that script has unsaved changes in the script editor. The caller
@@ -145,11 +146,11 @@ func _exit_tree() -> void:
 	# machine-chosen port.
 	if _installed_override:
 		_restore_lsp_override()
-	# The published file is deliberately left behind. It holds one instance's
-	# record, and another engine opening this project overwrites it: removing it
-	# here would take that other instance's only record with it, which is how a
-	# still-listening editor becomes undiscoverable. Readers ignore a record
-	# whose pid is gone.
+	# The published file is deliberately left behind. It carries one slot per kind
+	# of instance, and another instance *of the same kind* opening this project
+	# overwrites that slot: removing the file here would also take an editor's
+	# record with it, which is how a still-listening editor becomes undiscoverable.
+	# Readers ignore a record whose pid is gone.
 
 
 ## 每帧轮询控制 socket;EditorPlugin 在主循环里自动调用本方法。
@@ -382,7 +383,7 @@ func _probe_state() -> void:
 ## 把端口事实写进 .godot/dsh_echo_bridge.json,DSH 侧默认从这里读。
 ##
 ## 只写自己那一格,并把另一格原样带过去:编辑器与本插件自起的引擎会同时服务同一个
-## 项目,单槽文件会让后写的那方抹掉先写的那方(调用方随后就分不清两个会话,编辑器
+## 项目,单槽的旧文件曾让后写的那方抹掉先写的那方(调用方随后就分不清两个会话,编辑器
 ## 甚至直接消失)。已退出的实例留下的那格由读取方忽略,不在这里清理(见 _read_slot)。
 ## @return: void
 func _publish_state() -> void:
