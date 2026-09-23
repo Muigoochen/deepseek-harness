@@ -287,7 +287,8 @@ connected external editor")。
 - 若要事后复核,需要采集:运行实例中**实时**的 `get_open_scripts()`/`get_unsaved_scripts()` 与自身 pid、
   每步 a 的内容哈希与 mtime、窗口焦点时间线、每次 `publishDiagnostics` 的原始快照,以及一个
   **负对照**(只 touch mtime 不改内容)。现有清单缺这些量,其中"addon 实际端口"目前也不可持久采集
-  (`plugin.gd` 只 `print_debug`,唯一落盘物是那份会被覆盖的公布文件)。
+  (`plugin.gd` 只 `print_debug`,当时唯一的落盘物是那份会被覆盖的公布文件;此后桥在落盘编辑器 LSP 端口时
+  还会写 `project.godot`,见 §9.2/§11)。
 
 ## 8. 方案评估
 

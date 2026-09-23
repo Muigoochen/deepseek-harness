@@ -113,9 +113,14 @@
     "已在 {path} 的 project.godot 里补上启用项 —— 之前 addon 文件在,但 Godot 从未加载它,所以编辑器里的实例无法上报端口。",
     "重启该项目的 Godot 编辑器后生效。"
   ],
+  "toast.addon.updated.title": "引擎桥已更新",
+  "toast.addon.updated.body": [
+    "项目 {path} 里的桥副本与插件自带的版本不一致,已覆盖为当前版本。",
+    "重启该项目的 Godot 编辑器后新版本才生效;插件自起的 headless 引擎下次启动即用新版。"
+  ],
   "toast.addon.failed.title": "引擎桥启用失败",
   "toast.addon.failed.body": [
-    "已把 addon 复制到 {path},但没能写进 project.godot 的启用项:{reason}",
+    "项目 {path} 的引擎桥没有装好(复制 addon 或写启用项失败):{reason}",
     "编辑器里的实例因此在修好之前不会上报端口;修好后(或在 Godot「项目设置 → 插件」里手动启用)插件会重试,5 分钟内不再重复尝试。"
   ],
   "toast.ready.title": "lsp-echo 已就绪",
@@ -218,7 +223,7 @@
   "note.engine.saving": "保存中…",
   "note.engine.save.title": "保存端口设置(留空 = 恢复默认)",
   "note.engine.save.needEdit": "先修改端口再保存",
-  "note.engine.port.project.title": "连接这个项目自己的 Godot 编辑器时用的端口。留空并保存,就改用「全部项目」里的值,再回落到默认的 6005。",
+  "note.engine.port.project.title": "连接这个项目自己的 Godot 编辑器时用的端口。留空并保存,就改用「全部项目」里的值,再回落到默认的 6005。编辑器不在这个端口上时,桥会把它搬过来:搬到这个端口就把它写进项目的 project.godot(项目级覆盖),编辑器下次启动直接用它;若这个端口被别的进程占着、只能先搬到替代端口,那就只对本次会话生效,不写项目文件。",
   "note.engine.port.fallback.title": "没有单独设置端口的项目,都按这个端口去连它们的 Godot 编辑器。默认是 6005。改过 Godot 的「编辑器设置 → Network → Language Server → Remote Port」的话,在这里填上并保存。",
   "note.bridge.installed": "Godot 引擎桥已安装到 {path}{enabled}{restart}",
   "note.bridge.enabled": ",并已在 project.godot 启用",

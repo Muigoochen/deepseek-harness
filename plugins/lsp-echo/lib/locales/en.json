@@ -113,9 +113,14 @@
     "Added the enable entry to project.godot in {path}: the addon files were there, but Godot never loaded them, so the editor instance could not report its ports.",
     "Restart that project's Godot editor to activate it."
   ],
+  "toast.addon.updated.title": "Engine bridge updated",
+  "toast.addon.updated.body": [
+    "The bridge copy in {path} did not match the version this plugin ships; it has been replaced.",
+    "Restart that project's Godot editor to load it; an engine this plugin starts uses the new copy on its next start."
+  ],
   "toast.addon.failed.title": "Could not enable the engine bridge",
   "toast.addon.failed.body": [
-    "The addon was copied into {path}, but its enable entry could not be written to project.godot: {reason}",
+    "The engine bridge in {path} is not in place (copying the addon or writing its enable entry failed): {reason}",
     "The editor instance will not report its ports until that is fixed; the plugin retries once it is (or enable the addon under Godot's Project Settings > Plugins) and stays quiet for 5 minutes otherwise."
   ],
   "toast.ready.title": "lsp-echo is ready",
@@ -218,7 +223,7 @@
   "note.engine.saving": "Saving...",
   "note.engine.save.title": "Save the port setting (empty restores the default)",
   "note.engine.save.needEdit": "Change the port before saving",
-  "note.engine.port.project.title": "The port used to connect to this project's own Godot editor. Saving an empty value falls back to the \"All projects\" port, and then to the default 6005.",
+  "note.engine.port.project.title": "The port used to connect to this project's own Godot editor. Saving an empty value falls back to the \"All projects\" port, and then to the default 6005. When the editor is on another port, the bridge moves it here: moving it onto this port writes it into the project's project.godot as a project-level override, so the editor starts on it next time. If this port is held by another program, the bridge moves the server to a substitute for this session only and writes nothing.",
   "note.engine.port.fallback.title": "Projects without a port of their own connect to their Godot editors on this port. The default is 6005. If you changed it in Godot under Editor Settings > Network > Language Server > Remote Port, enter it here and save.",
   "note.bridge.installed": "Godot engine bridge installed into {path}{enabled}{restart}",
   "note.bridge.enabled": ", enabled in project.godot",

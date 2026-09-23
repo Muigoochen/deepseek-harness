@@ -241,6 +241,39 @@ export function addonSourceOf(eng) {
   return eng && eng.addon ? path.join(path.dirname(eng.bridge), eng.addon, ADDON_ID) : undefined
 }
 
+/** Files a shipped addon consists of; a copy is current only when all of them match.
+ * Extend this list whenever the shipped directory gains a file: the installer copies
+ * recursively, so nothing else would notice a file it does not compare. */
+const ADDON_FILES = ['plugin.cfg', 'plugin.gd']
+
+/** Whether a shipped addon file differs from its installed counterpart (or is missing). */
+function addonFileDiffers(src, dst) {
+  try {
+    return !fs.readFileSync(src).equals(fs.readFileSync(dst))
+  } catch {
+    // Missing or unreadable on either side counts as a difference: the caller installs.
+    return true
+  }
+}
+
+/**
+ * Whether a project's installed addon copy matches the engine's shipped one.
+ *
+ * An installed copy is refreshed only when something installs it, so a project that has
+ * one keeps running whatever was shipped the day it was copied. The addon executes inside
+ * a Godot instance, which loads editor plugins at startup, so a stale copy also keeps its
+ * old behavior until that instance restarts.
+ * @param {string} project project root
+ * @param {{ id?: string, bridge?: string, addon?: string }} eng engine record that ships an addon
+ * @returns {boolean} true when every shipped file exists in the project and is identical
+ */
+export function isAddonCurrent(project, eng) {
+  const src = addonSourceOf(eng)
+  if (!src) return false
+  const dst = path.join(project, 'addons', ADDON_ID)
+  return ADDON_FILES.every((name) => !addonFileDiffers(path.join(src, name), path.join(dst, name)))
+}
+
 /** How many ports above the base an addon instance may occupy (mirrors PORT_SCAN_COUNT). */
 const PORT_SCAN_COUNT = 16
 

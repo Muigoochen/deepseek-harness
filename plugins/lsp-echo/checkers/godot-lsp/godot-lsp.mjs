@@ -425,10 +425,16 @@ async function askBridgeState(port, timeoutMs = 1500) {
  * Ask the addon to move the editor's language server to `targetPort`.
  * @param {number} port control port
  * @param {number} targetPort port to move to
+ * @param {{ persist?: boolean, timeoutMs?: number }} [options] `persist` lets the addon
+ *   write the port into project.godot (only for the port this profile is configured with;
+ *   a substitute for an occupied target must not outlive this session)
  * @returns {Promise<{ ok: boolean, port?: number, error?: string }>} the port it moved to
  */
-async function askBridgeRelocate(port, targetPort, timeoutMs = 20_000) {
-  const line = await askBridgeLine(port, `lsp-relocate:${targetPort}\n`, timeoutMs);
+async function askBridgeRelocate(port, targetPort, options = {}) {
+  const persist = options.persist !== false;
+  const timeoutMs = options.timeoutMs ?? 20_000;
+  const command = `${persist ? 'lsp-relocate:' : 'lsp-relocate-temp:'}${targetPort}\n`;
+  const line = await askBridgeLine(port, command, timeoutMs);
   if (line === undefined) return { ok: false, error: 'no reply' };
   if (line.startsWith('ok:')) {
     const moved = Number(line.slice('ok:'.length));
@@ -481,6 +487,10 @@ async function waitForPort(port, timeoutMs) {
  * other way round: the addon reports where its server actually listens, and when
  * that differs the addon is asked to move it (it applies a project-level override
  * the engine re-reads on the spot, without writing the user's editor settings).
+ * Moving the server TO THE CONFIGURED PORT also makes that port part of the project
+ * (the addon persists the override into project.godot), so the next editor start is
+ * already there. A substitute for an occupied target is never persisted: it belongs
+ * to this session only.
  *
  * A configured port that something else holds cannot be honoured — Godot's own
  * debug adapter defaults to the very port users tend to pick, and the engine never
@@ -512,12 +522,13 @@ async function alignEditorTarget(project, flags) {
     chosen = await freePort(reservedPorts(flags));
     log(`configured editor port ${target} is held by ${owner}; moving the language server to ${chosen}`);
   }
-  const moved = await askBridgeRelocate(instance.controlPort, chosen);
+  const moved = await askBridgeRelocate(instance.controlPort, chosen, { persist: chosen === target });
   if (!moved.ok) {
     log(`editor language server relocation failed (${moved.error}); leaving the editor as it is`);
     return undefined;
   }
   log(`editor language server: ${actual || 'unknown'} -> ${moved.port} (configured ${target})`);
+  if (moved.port === target) log(`editor port ${target} written into this project's project.godot as a project override`);
   if (!(await waitForPort(moved.port, 20_000))) {
     log(`moved language server did not open port ${moved.port}`);
     return undefined;

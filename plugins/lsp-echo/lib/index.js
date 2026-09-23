@@ -20,7 +20,7 @@ import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { engines, markers, matchExtension } from './checkers.js'
 import { ensureHost, stopHost, status, checkFiles, runtimeRoot, stopClientd, diagnosticsPath, pruneSnapshot, rescanEngine, setReservedPorts } from './manager.js'
-import { ADDON_ID, addonResPath, discoverBridgePortAsync, installAddonInto, isEditorPluginEnabled, probeEngineBridge, probePortOpen, readBridgeInstances, rescanPortOf } from './addon.js'
+import { ADDON_ID, addonResPath, discoverBridgePortAsync, installAddonInto, isAddonCurrent, isEditorPluginEnabled, probeEngineBridge, probePortOpen, readBridgeInstances, rescanPortOf } from './addon.js'
 import { dependentsOf } from './dependents.js'
 import { ProjectWatcher, normalizeSkipEntry, sameSkipEntry, scanFiles } from './watcher.js'
 import { registerTool } from './tool.js'
@@ -503,28 +503,36 @@ export function apply(ctx, config) {
     const eng = (rec.lsp || []).map((x) => engine(x.engine)).find((e) => e && e.rescan && e.addon)
     if (!eng) return false
     const installed = fs.existsSync(path.join(rec.path, 'addons', ADDON_ID, 'plugin.gd'))
-    if (installed && isEditorPluginEnabled(rec.path, ADDON_RES_PATH)) {
-      // The half-state is gone — fixed here earlier or outside the plugin: stop
-      // counting it so a later failure is not held back by an old cooldown.
+    const enabled = installed && isEditorPluginEnabled(rec.path, ADDON_RES_PATH)
+    // A copied addon is otherwise never refreshed, so a project that has one keeps the
+    // version it was given: compare it against the shipped files and re-install on any
+    // difference. The addon runs inside a Godot instance, which loads editor plugins at
+    // startup, so an old copy also means old behavior until that instance restarts.
+    if (enabled && isAddonCurrent(rec.path, eng)) {
+      // Nothing to fix — the half-state is gone (fixed here earlier or outside the
+      // plugin): stop counting it so a later failure is not held back by an old cooldown.
       addonRepairFailures.delete(key)
       return false
     }
     const failedAt = addonRepairFailures.get(key)
     if (failedAt !== undefined && Date.now() - failedAt < ADDON_REPAIR_COOLDOWN_MS) return false
+    const what = !installed ? 'install' : (enabled ? 'update' : 'enable repair')
     try {
       const r = installAddonInto(rec.path, eng)
       if (!r.ok || r.enabled !== true) {
         addonRepairFailures.set(key, Date.now())
-        trace('addon', `${rec.path}: engine bridge ${installed ? 'enable repair' : 'install'} failed (enabled=${r.enabled}): ${r.error || 'unknown'}`)
+        trace('addon', `${rec.path}: engine bridge ${what} failed (enabled=${r.enabled}): ${r.error || 'unknown'}`)
         showToast('error', tLine('toast.addon.failed.title'), tLine('toast.addon.failed.body', { path: rec.path, reason: r.error || '' }), 'lsp-echo-addon', 9000)
         return false
       }
       addonRepairFailures.delete(key)
-      trace('addon', `${rec.path}: engine bridge ${installed ? 'enablement repaired' : 'installed'} (enabled=true)`)
-      if (installed) {
-        showToast('warning', tLine('toast.addon.enabled.title'), tLine('toast.addon.enabled.body', { path: rec.path }), 'lsp-echo-addon', 9000)
-      } else {
+      trace('addon', `${rec.path}: engine bridge ${what === 'install' ? 'installed' : what === 'update' ? 'updated' : 'enablement repaired'} (enabled=true)`)
+      if (what === 'install') {
         showToast('success', tLine('toast.addon.title'), tLine('toast.addon.body', { path: rec.path }), 'lsp-echo-addon', 9000)
+      } else if (what === 'update') {
+        showToast('warning', tLine('toast.addon.updated.title'), tLine('toast.addon.updated.body', { path: rec.path }), 'lsp-echo-addon', 9000)
+      } else {
+        showToast('warning', tLine('toast.addon.enabled.title'), tLine('toast.addon.enabled.body', { path: rec.path }), 'lsp-echo-addon', 9000)
       }
       // Only a freshly copied addon requires the engine restart: a headless engine that
       // started before the addon existed cannot load it, and the trigger that installed

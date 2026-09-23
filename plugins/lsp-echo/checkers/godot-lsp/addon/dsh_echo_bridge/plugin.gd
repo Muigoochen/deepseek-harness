@@ -29,6 +29,13 @@ extends EditorPlugin
 ##     reload rewrites the editor buffer from disk and would silently discard
 ##     those changes, which is exactly what the editor itself refuses to do
 ##     without asking (see ScriptEditor::_test_script_times_on_disk).
+##   lsp-relocate:<port> -> ok:<port>
+##     Move the editor language server to that port and write it into the project's
+##     settings file (an `editor_overrides/` entry): the caller configured that port
+##     for this project, so the next editor start binds it without another relocation.
+##   lsp-relocate-temp:<port> -> ok:<port>
+##     Same move, but the port is a substitute for this session only (the configured
+##     port is held by something else) and is never written to the project file.
 ##
 ## The listening port starts at DSH_ECHO_BRIDGE_PORT (default 6089) and walks
 ## upward until it binds, so two open projects — or an editor plus its headless
@@ -46,6 +53,10 @@ const UNSAVED_PREFIX: String = "unsaved:"
 const PROJECT_PREFIX: String = "project:"
 const STATE_PREFIX: String = "state:"
 const LSP_RELOCATE_PREFIX: String = "lsp-relocate:"
+## Relocation that must NOT be written into the project's settings file: the caller only
+## needs the server somewhere usable for this session (its configured port came out
+## occupied and it picked a substitute).
+const LSP_RELOCATE_TEMP_PREFIX: String = "lsp-relocate-temp:"
 ## Prefix under which a project stores per-project editor setting overrides. The
 ## language server reads its port through EditorSettings, which prefers this value.
 const OVERRIDE_PREFIX: String = "editor_overrides/"
@@ -100,7 +111,8 @@ var _published_dap_port: int = -1
 var _published_listening: int = -1
 var _next_state_check_at: int = 0
 var _next_state_probe_at: int = 0
-## Whether this session installed a project-level port override it must remove.
+## Whether this session wrote an in-memory project-level port override it must remove on
+## exit. A port DSH asked for is persisted into project.godot instead, and kept.
 var _installed_override: bool = false
 ## The automatic relocation runs once per session, so a port that stays unusable
 ## cannot make the language server restart in a loop.
@@ -141,9 +153,9 @@ func _exit_tree() -> void:
 	if _control_server != null:
 		_control_server.stop()
 		_control_server = null
-	# Drop a port override this session installed: it exists only to keep this run
-	# usable, and leaving it behind would rewrite the project's settings file with a
-	# machine-chosen port.
+	# Drop the in-memory override a self-heal installed: that port was chosen on this
+	# machine for this run, so persisting it would rewrite the project's settings file.
+	# An override DSH asked for is already saved into project.godot and stays.
 	if _installed_override:
 		_restore_lsp_override()
 	# The published file is deliberately left behind. It carries one slot per kind
@@ -195,10 +207,15 @@ func _handle_request(request_line: String) -> void:
 		var answer: String = "yes\n" if _is_unsaved(script_path) else "no\n"
 		_peer_connection.put_data(answer.to_utf8_buffer())
 		return
+	if request_line.begins_with(LSP_RELOCATE_TEMP_PREFIX):
+		var temp_requested: String = request_line.substr(LSP_RELOCATE_TEMP_PREFIX.length())
+		var temp_port: int = int(temp_requested) if temp_requested.is_valid_int() else 0
+		_peer_connection.put_data((_relocate_lsp(temp_port, false) + "\n").to_utf8_buffer())
+		return
 	if request_line.begins_with(LSP_RELOCATE_PREFIX):
 		var requested: String = request_line.substr(LSP_RELOCATE_PREFIX.length())
 		var requested_port: int = int(requested) if requested.is_valid_int() else 0
-		_peer_connection.put_data((_relocate_lsp(requested_port) + "\n").to_utf8_buffer())
+		_peer_connection.put_data((_relocate_lsp(requested_port, true) + "\n").to_utf8_buffer())
 		return
 	match request_line:
 		"ping":
@@ -469,9 +486,9 @@ func _project_root() -> String:
 	return ProjectSettings.globalize_path("res://")
 
 
-## 把编辑器语言服务器挪到一个空闲端口。
+## 把编辑器语言服务器挪到一个端口。
 ##
-## 走的是引擎自己的三条公开链路,不改全局编辑器设置、也不落盘:
+## 走的是引擎自己的三条公开链路:
 ##   1) 写项目级覆盖 editor_overrides/network/language_server/remote_port ——
 ##      EditorSettings.get_setting() 优先读它;
 ##   2) mark_setting_changed() 标记该组已变更 —— 否则语言服务器收到通知后会先
@@ -479,9 +496,14 @@ func _project_root() -> String:
 ##   3) 请编辑器重新广播设置变更 —— 唯一的广播点(notify_changes)只被设置对话框
 ##      的防抖回调调用,而该对话框是编辑器场景树里的标准节点、其方法绑定给脚本。
 ## 任何一步不成立都退回原状并报错,由调用方决定降级方案。
+##
+## `persist_requested` 且 `requested_port > 0` 表示这个端口来自 DSH 配置(DSH 为准):覆盖会
+## **落盘进 `project.godot`**,编辑器下次启动直接绑它,不必等下一次检查再搬一次;否则(本会话
+## 自愈、或 DSH 只能用替代端口)只写内存、退出时摘掉 —— 那种端口是这台机器当时挑的,不该落盘。
 ## @param requested_port: 指定端口;<=0 时自行从预设端口向上找
+## @param persist_requested: 是否把目标端口写进项目设置文件
 ## @return: String "ok:<端口>" 或 "err:<原因>"
-func _relocate_lsp(requested_port: int) -> String:
+func _relocate_lsp(requested_port: int, persist_requested: bool = false) -> String:
 	var settings: Object = EditorInterface.get_editor_settings()
 	if settings == null:
 		return "err no editor settings"
@@ -490,6 +512,7 @@ func _relocate_lsp(requested_port: int) -> String:
 		return "err no free port"
 	if _port_in_use(target):
 		return "err port %d in use" % target
+	var persist: bool = persist_requested and requested_port > 0
 	ProjectSettings.set_setting(OVERRIDE_PREFIX + LSP_PORT_SETTING, target)
 	settings.mark_setting_changed(LSP_PORT_SETTING)
 	if not _notify_editor_settings_changed():
@@ -497,7 +520,17 @@ func _relocate_lsp(requested_port: int) -> String:
 		# override behind: a later unrelated settings save would have persisted it.
 		ProjectSettings.set_setting(OVERRIDE_PREFIX + LSP_PORT_SETTING, null)
 		return "err cannot notify editor settings"
-	_installed_override = true
+	if persist:
+		# Rewriting project.godot is the point here: the port then belongs to the
+		# project, so the next editor start binds it without another relocation.
+		# ProjectSettings.save() rewrites the whole settings table from memory, so the
+		# addon's own enable entry has to be in that table first (see _ensure_self_enabled).
+		# A failed save leaves this session working and the next one to relocate again.
+		_ensure_self_enabled()
+		var saved: Error = ProjectSettings.save()
+		if saved != OK:
+			push_warning("[dsh-echo-bridge] cannot persist the project LSP port: %s" % error_string(saved))
+	_installed_override = not persist
 	_published_listening = -1
 	_next_state_probe_at = Time.get_ticks_msec() + STATE_REFRESH_MSEC
 	_published_lsp_port = target
@@ -524,6 +557,34 @@ func _restore_lsp_override() -> void:
 		return
 	_published_lsp_port = _lsp_port()
 	_publish_state()
+
+
+## 本 addon 的 plugin.cfg 在 `res://` 下的路径(project.godot 启用项里写的就是它)。
+## @return: String 路径;拿不到脚本路径时为空串
+func _self_res_path() -> String:
+	var script: Script = get_script()
+	if script == null:
+		return ""
+	return script.resource_path.get_basename() + ".cfg"
+
+
+## 把自己补进内存里的 `editor_plugins/enabled`,供随后的一次落盘使用。
+##
+## 启用项可能是本插件在编辑器**启动之后**才写进 project.godot 的 —— 那时编辑器内存里的
+## 列表还没有我们。`ProjectSettings.save()` 是把内存里整张设置表重写回文件,不先补齐,
+## 这次落盘就会把自己刚写的启用项抹掉,下次编辑器启动不再加载桥。
+## @return: void
+func _ensure_self_enabled() -> void:
+	var key: String = "editor_plugins/enabled"
+	var self_path: String = _self_res_path()
+	if self_path.is_empty():
+		return
+	var current: Variant = ProjectSettings.get_setting(key)
+	var list: PackedStringArray = current if typeof(current) == TYPE_PACKED_STRING_ARRAY else PackedStringArray()
+	if list.has(self_path):
+		return
+	list.append(self_path)
+	ProjectSettings.set_setting(key, list)
 
 
 ## 请编辑器重新广播一次设置变更,这是语言服务器重读端口的前提。
