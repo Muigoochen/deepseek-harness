@@ -323,19 +323,216 @@ function configuredBridgePort(flags) {
  * winner in `<project>/.godot/dsh_echo_bridge.json`.
  */
 function discoveredBridgePort(project) {
+  const slots = readBridgeSlots(project);
+  const record = slots.editor ?? slots.engine;
+  return record === undefined ? undefined : record.port;
+}
+
+/** How many control ports above the base an addon instance may occupy (mirrors the addon). */
+const BRIDGE_SCAN_COUNT = 16;
+
+/** Normalized absolute path, for "does this instance serve the project I asked about?". */
+function sameProjectPath(a, b) {
+  const norm = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
+  return norm(a) === norm(b);
+}
+
+/** One instance record from the published file, or undefined when it is not a live one. */
+function normalizeSlot(raw) {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const port = Number(raw.port);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return undefined;
+  const pid = Number(raw.pid);
+  if (Number.isInteger(pid) && pid > 0) {
+    // A record left behind by an exited engine points at a port nothing answers on.
+    try { process.kill(pid, 0); } catch { return undefined; }
+  }
+  const lspPort = Number(raw.lspPort);
+  const dapPort = Number(raw.dapPort);
+  return {
+    port,
+    pid: Number.isInteger(pid) && pid > 0 ? pid : undefined,
+    project: typeof raw.project === 'string' ? raw.project : undefined,
+    lspPort: Number.isInteger(lspPort) && lspPort > 0 && lspPort <= 65535 ? lspPort : undefined,
+    dapPort: Number.isInteger(dapPort) && dapPort > 0 && dapPort <= 65535 ? dapPort : undefined,
+    lspFromLaunch: raw.lspFromLaunch === true,
+  };
+}
+
+/**
+ * Addon instances serving a project, by kind.
+ *
+ * The record keeps one slot per kind because the user's editor and this plugin's
+ * own headless engine serve one project at the same time; instances are identified
+ * by PROJECT PATH, never by port. A record written before the slots existed holds
+ * one flat instance, filed under the kind its `lspFromLaunch` flag names.
+ */
+function readBridgeSlots(project) {
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(path.join(project, '.godot', 'dsh_echo_bridge.json'), 'utf8')); }
+  catch { return {}; }
+  if (!parsed || typeof parsed !== 'object') return {};
+  const version = Number(parsed.version);
+  if (Number.isInteger(version) && version >= 3) {
+    const out = {};
+    const editor = normalizeSlot(parsed.editor);
+    if (editor) out.editor = editor;
+    const engine = normalizeSlot(parsed.engine);
+    if (engine) out.engine = engine;
+    return out;
+  }
+  const flat = normalizeSlot(parsed);
+  if (!flat) return {};
+  return flat.lspFromLaunch ? { engine: flat } : { editor: flat };
+}
+
+/** One line answer from the addon's control socket, or undefined when none came. */
+function askBridgeLine(port, request, timeoutMs) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: '127.0.0.1', port });
+    let out = '';
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { sock.destroy(); } catch { /* already closed */ }
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(undefined), timeoutMs);
+    sock.once('connect', () => { try { sock.write(request); } catch { done(undefined); } });
+    sock.on('data', (d) => {
+      out += d;
+      const newline = out.indexOf('\n');
+      if (newline >= 0) done(out.slice(0, newline).trim());
+    });
+    sock.once('error', () => done(undefined));
+    sock.once('close', () => done(out.trim() || undefined));
+  });
+}
+
+/** The instance's own facts, or undefined when it cannot report them (old addon). */
+async function askBridgeState(port, timeoutMs = 1500) {
+  const line = await askBridgeLine(port, 'state\n', timeoutMs);
+  if (line === undefined || !line.startsWith('state:')) return undefined;
   try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(project, '.godot', 'dsh_echo_bridge.json'), 'utf8'));
-    const port = Number(parsed.port);
-    if (!Number.isInteger(port) || port <= 0 || port > 65535) return undefined;
-    // A file left behind by an engine that already exited points at a port
-    // nothing answers on.
-    const pid = Number(parsed.pid);
-    if (Number.isInteger(pid) && pid > 0) {
-      try { process.kill(pid, 0); } catch { return undefined; }
-    }
-    return port;
-  } catch { /* no running addon published a port */ }
+    const parsed = JSON.parse(line.slice('state:'.length));
+    return parsed && typeof parsed === 'object' ? parsed : undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * Ask the addon to move the editor's language server to `targetPort`.
+ * @param {number} port control port
+ * @param {number} targetPort port to move to
+ * @returns {Promise<{ ok: boolean, port?: number, error?: string }>} the port it moved to
+ */
+async function askBridgeRelocate(port, targetPort, timeoutMs = 20_000) {
+  const line = await askBridgeLine(port, `lsp-relocate:${targetPort}\n`, timeoutMs);
+  if (line === undefined) return { ok: false, error: 'no reply' };
+  if (line.startsWith('ok:')) {
+    const moved = Number(line.slice('ok:'.length));
+    if (Number.isInteger(moved) && moved > 0 && moved <= 65535) return { ok: true, port: moved };
+  }
+  return { ok: false, error: line.startsWith('err:') ? line.slice('err:'.length) : line };
+}
+
+/**
+ * The addon instance serving this project, asked over the control socket.
+ *
+ * Candidates come from the record's per-kind slots first (asking the instance is
+ * what proves it serves this project and gives current facts), and the control
+ * range is probed after that, for a record overwritten before the slots existed.
+ * @returns {Promise<{ controlPort: number, kind: 'editor'|'engine', state: object }|undefined>}
+ */
+async function findProjectInstance(project, flags) {
+  const slots = readBridgeSlots(project);
+  const candidates = [];
+  for (const record of [slots.editor, slots.engine]) if (record) candidates.push(record.port);
+  const base = configuredBridgePort(flags) ?? DEFAULT_BRIDGE_PORT;
+  for (let offset = 0; offset < BRIDGE_SCAN_COUNT; offset++) {
+    const port = base + offset;
+    if (!candidates.includes(port)) candidates.push(port);
+  }
+  for (const port of candidates) {
+    const state = await askBridgeState(port, 700);
+    if (state === undefined) continue;
+    const owner = typeof state.project === 'string' ? state.project : undefined;
+    if (owner !== undefined && !sameProjectPath(owner, project)) continue;
+    return { controlPort: port, kind: state.lspFromLaunch === true ? 'engine' : 'editor', state };
+  }
   return undefined;
+}
+
+/** Wait until something listens on a port, so the caller attaches to a ready server. */
+async function waitForPort(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await portOpen(port)) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(400);
+  }
+}
+
+/**
+ * Make the running editor's language server listen where this profile wants it.
+ *
+ * The plugin owns the port setting, so the EDITOR adapts to it rather than the
+ * other way round: the addon reports where its server actually listens, and when
+ * that differs the addon is asked to move it (it applies a project-level override
+ * the engine re-reads on the spot, without writing the user's editor settings).
+ *
+ * A configured port that something else holds cannot be honoured — Godot's own
+ * debug adapter defaults to the very port users tend to pick, and the engine never
+ * yields. The server is then moved to a free substitute and the substitution is
+ * recorded for the host, which owns the setting and can adopt it.
+ * @param {string} project project root
+ * @param {object} flags parsed CLI flags
+ * @returns {Promise<number|undefined>} the port to attach to, undefined when no editor instance answers
+ */
+async function alignEditorTarget(project, flags) {
+  const target = editorProbePorts(flags)[0];
+  const instance = await findProjectInstance(project, flags);
+  if (instance === undefined || instance.kind !== 'editor') return undefined;
+  const actual = Number(instance.state.lspPort);
+  if (Number.isInteger(actual) && actual === target && await portOpen(target)) return target;
+  let chosen = target;
+  if (await portOpen(target)) {
+    // Something holds the configured port. Godot's debug adapter is the usual
+    // owner (its default equals the port users pick), so say which it is.
+    const dapPort = Number(instance.state.dapPort);
+    const owner = dapPort === target ? 'this editor\'s debug adapter' : 'another program';
+    chosen = await freePort(reservedPorts(flags));
+    log(`configured editor port ${target} is held by ${owner}; moving the language server to ${chosen}`);
+  }
+  const moved = await askBridgeRelocate(instance.controlPort, chosen);
+  if (!moved.ok) {
+    log(`editor language server relocation failed (${moved.error}); leaving the editor as it is`);
+    return undefined;
+  }
+  log(`editor language server: ${actual || 'unknown'} -> ${moved.port} (configured ${target})`);
+  if (!(await waitForPort(moved.port, 20_000))) {
+    log(`moved language server did not open port ${moved.port}`);
+    return undefined;
+  }
+  if (moved.port !== target) {
+    // Record the substitution where the host reads it: it owns the setting, so only
+    // it can adopt the new port and tell the user. Written even when no host state
+    // exists yet (a cold start) — the attach path that follows carries it forward.
+    try {
+      writeHostState(project, {
+        // `project` is what makes the record readable back: readHostState() ignores a
+        // record whose project does not match, and a warning-only record without it
+        // would be dropped by the attach write that follows.
+        project: path.resolve(project),
+        warn: { ports: [target], port: moved.port, at: Date.now(), reason: 'editor-port-relocated' },
+      });
+      log(`editor port substitution recorded: configured ${target} -> ${moved.port}`);
+    } catch (error) {
+      log(`recording the editor port substitution failed: ${(error && error.message) || error}`);
+    }
+  }
+  return moved.port;
 }
 
 // ---------- runtime state ----------
@@ -561,7 +758,7 @@ async function ensureHost(project, godotBin, flags) {
   const st0 = readHostState(project);
   if (await hostAlive(st0) && st0.mode === MODE_HEADLESS) {
     if (attachEditorEnabled() && attachPolicy() === 'prefer-editor' && !badActive(st0)) {
-      const editorPort = await probeEditorPort(project, flags);
+      const editorPort = await alignEditorTarget(project, flags);
       if (editorPort !== undefined) {
         const moveLock = await acquireHostLock(project);
         if (moveLock === 'host-ready') {
@@ -622,7 +819,7 @@ async function ensureHost(project, godotBin, flags) {
     // Cold start, no live host: prefer the user's editor when reachable and
     // not blacklisted. Skip entirely when the bridge config sets
     // attachEditor:false (headless-only).
-    const editorPort = attachEditorEnabled() && !badActive(locked) ? await probeEditorPort(project, flags) : undefined;
+    const editorPort = attachEditorEnabled() && !badActive(locked) ? await alignEditorTarget(project, flags) : undefined;
     if (editorPort !== undefined) {
       writeHostState(project, {
         mode: MODE_EDITOR, pid: 0, port: editorPort,
