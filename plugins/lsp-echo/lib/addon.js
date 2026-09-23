@@ -28,6 +28,59 @@ export function rescanPortOf(eng) {
 }
 
 /**
+ * Version of the published addon record this build understands. A record without
+ * a `version` was written by an addon installed before the field existed, so its
+ * missing fields mean "that addon cannot report this", not "the value is absent".
+ */
+export const BRIDGE_STATE_VERSION = 2
+
+/** A port number, or undefined when the value is not one. */
+function asPort(value) {
+  const port = Number(value)
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : undefined
+}
+
+/**
+ * The addon's published record for a project.
+ *
+ * Besides the control port this instance listens on, a current addon reports the
+ * ports its editor's language server (LSP) and debug adapter (DAP) read from the
+ * editor settings, plus whether anything listens on the LSP port. Only the
+ * instance itself can know those: the settings may be overridden per project
+ * (`editor_overrides/<name>`), so a caller reading them from outside would guess.
+ * @param {string} project project root
+ * @returns {{ port: number, pid?: number, version: number, project?: string, lspPort?: number, dapPort?: number, lspListening?: boolean }|undefined}
+ *   undefined when no addon published a record, or the publisher already exited
+ */
+export function readBridgeState(project) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(project, '.godot', 'dsh_echo_bridge.json'), 'utf8'))
+    const port = asPort(parsed.port)
+    if (port === undefined) return undefined
+    const pid = Number(parsed.pid)
+    const livePid = Number.isInteger(pid) && pid > 0 ? pid : undefined
+    // A file left behind by an engine that already exited would point at a port
+    // nothing answers on (and hide the running instance that did publish one).
+    if (livePid !== undefined) {
+      try { process.kill(livePid, 0) } catch { return undefined }
+    }
+    const version = Number(parsed.version)
+    return {
+      port,
+      pid: livePid,
+      version: Number.isInteger(version) && version > 0 ? version : 1,
+      project: typeof parsed.project === 'string' ? parsed.project : undefined,
+      lspPort: asPort(parsed.lspPort),
+      dapPort: asPort(parsed.dapPort),
+      // Absent on a record from before the probe existed, and on a current record
+      // whose first probe has not run yet: both mean "unknown", not "not listening".
+      lspListening: typeof parsed.lspListening === 'boolean' ? parsed.lspListening : undefined,
+    }
+  } catch { /* no addon record for this project */ }
+  return undefined
+}
+
+/**
  * Port published by a running engine's addon. Each instance walks upward from
  * its base port until it binds and writes the winner to
  * `<project>/.godot/dsh_echo_bridge.json`, so two open projects (or an editor
@@ -37,19 +90,8 @@ export function rescanPortOf(eng) {
  * @returns {number|undefined} the published port, or undefined when no addon is running
  */
 export function discoverBridgePort(project) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(project, '.godot', 'dsh_echo_bridge.json'), 'utf8'))
-    const port = Number(parsed.port)
-    if (!Number.isInteger(port) || port <= 0 || port > 65535) return undefined
-    // A file left behind by an engine that already exited would point at a port
-    // nothing answers on (and hide the running instance that did publish one).
-    const pid = Number(parsed.pid)
-    if (Number.isInteger(pid) && pid > 0) {
-      try { process.kill(pid, 0) } catch { return undefined }
-    }
-    return port
-  } catch { /* no running addon published a port */ }
-  return undefined
+  const state = readBridgeState(project)
+  return state === undefined ? undefined : state.port
 }
 
 /** Shipped addon directory of an engine (undefined when it ships none). */
