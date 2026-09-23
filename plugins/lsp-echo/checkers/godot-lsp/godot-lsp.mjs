@@ -683,9 +683,12 @@ function writeHostState(project, state) {
     // `ownPorts`/`ownPid` describe the engine we last spawned. They must survive a
     // mode switch (attaching to an editor stops that engine but the record still
     // explains who held a port), because the attach-failure path uses them to tell
-    // "our own engine took this port" from "a foreign program did".
-    if (state.ownPorts === undefined && previous.ownPorts) carried.ownPorts = previous.ownPorts;
-    if (state.ownPid === undefined && previous.ownPid) carried.ownPid = previous.ownPid;
+    // "our own engine took this port" from "a foreign program did". They must NOT
+    // survive a clear (`writeHostState(project, {})`), which would otherwise leave a
+    // half-record naming an engine that no longer exists.
+    const describesHost = state.mode !== undefined || state.port !== undefined;
+    if (describesHost && state.ownPorts === undefined && previous.ownPorts) carried.ownPorts = previous.ownPorts;
+    if (describesHost && state.ownPid === undefined && previous.ownPid) carried.ownPid = previous.ownPid;
   }
   fs.writeFileSync(tmp, JSON.stringify({ ...state, ...carried }, null, 2), 'utf8');
   try { fs.renameSync(tmp, p); } catch { try { fs.unlinkSync(tmp); } catch { /* best effort */ } }
