@@ -81,6 +81,48 @@ export function readBridgeState(project) {
 }
 
 /**
+ * Ask one addon instance for its port facts over its control socket.
+ *
+ * Preferred over reading the published file when a control port is known: that file
+ * holds a single slot, so a second engine opening the same project overwrites the
+ * first instance's record even while it is still listening. Asking the instance
+ * answers for that instance, and the reply also refreshes its listening probe.
+ * @param {number} port control port
+ * @param {number} [timeoutMs] reply timeout
+ * @returns {Promise<{ port?: number, pid?: number, version?: number, project?: string, lspPort?: number, dapPort?: number, lspListening?: boolean, lspFromLaunch?: boolean }|undefined>}
+ *   the record as the instance reports it, undefined when nothing answered
+ */
+export function askBridgeState(port, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host: '127.0.0.1', port })
+    let out = ''
+    let settled = false
+    const done = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { sock.destroy() } catch { /* already closed */ }
+      resolve(value)
+    }
+    const timer = setTimeout(() => done(undefined), timeoutMs)
+    sock.once('connect', () => { try { sock.write('state\n') } catch { done(undefined) } })
+    sock.on('data', (d) => {
+      out += d
+      const line = out.split(/\r?\n/).map((raw) => raw.trim()).find((raw) => raw.startsWith('state:'))
+      if (!line) return
+      try {
+        const parsed = JSON.parse(line.slice('state:'.length))
+        // An addon older than the `state` command answers `err unknown command`
+        // instead, which lands here as a parse failure and reports "no facts".
+        done(parsed && typeof parsed === 'object' ? parsed : undefined)
+      } catch { done(undefined) }
+    })
+    sock.once('error', () => done(undefined))
+    sock.once('close', () => done(undefined))
+  })
+}
+
+/**
  * Port published by a running engine's addon. Each instance walks upward from
  * its base port until it binds and writes the winner to
  * `<project>/.godot/dsh_echo_bridge.json`, so two open projects (or an editor
