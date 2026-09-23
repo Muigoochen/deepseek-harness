@@ -154,6 +154,9 @@ function resolveConfig(config = {}) {
   if (config.toolEnabled !== undefined && typeof config.toolEnabled !== 'boolean') {
     throw new TypeError('conversation-summary: toolEnabled must be a boolean')
   }
+  if (config.logDecisions !== undefined && typeof config.logDecisions !== 'boolean') {
+    throw new TypeError('conversation-summary: logDecisions must be a boolean')
+  }
   const budgetScope = config.budgetScope ?? 'conversation'
   if (budgetScope !== 'conversation' && budgetScope !== 'envelope') {
     throw new TypeError(`conversation-summary: budgetScope must be "conversation" or "envelope", got ${JSON.stringify(budgetScope)}`)
@@ -190,6 +193,7 @@ function resolveConfig(config = {}) {
     planExit: config.planExit ?? false,
     freeform: config.freeform ?? false,
     toolEnabled: config.toolEnabled ?? true,
+    logDecisions: config.logDecisions ?? false,
     budgetScope,
     promptEnabled: config.promptEnabled ?? true,
     promptOrder,
@@ -589,6 +593,7 @@ function draftResolved(draft, base) {
     if (typeof draft.planExit === 'boolean') next.planExit = draft.planExit
     if (typeof draft.freeform === 'boolean') next.freeform = draft.freeform
     if (typeof draft.toolEnabled === 'boolean') next.toolEnabled = draft.toolEnabled
+    if (typeof draft.logDecisions === 'boolean') next.logDecisions = draft.logDecisions
     if (typeof draft.promptEnabled === 'boolean') next.promptEnabled = draft.promptEnabled
     if (Number.isSafeInteger(draft.promptOrder)) next.promptOrder = draft.promptOrder
     if (typeof draft.policyText === 'string') next.policyText = draft.policyText
@@ -638,6 +643,7 @@ const PERSIST_MAP = [
   ['planExit', 'planExit'],
   ['freeform', 'freeform'],
   ['toolEnabled', 'toolEnabled'],
+  ['logDecisions', 'logDecisions'],
   ['promptEnabled', 'promptEnabled'],
   ['promptOrder', 'promptOrder'],
   ['policyText', 'policyText'],
@@ -735,12 +741,25 @@ export function apply(ctx, rawConfig) {
 
   // One console notice per (session, reason) so an over-budget session that
   // cannot compact is visible in the host log instead of failing silently.
+  // `logDecisions` gates both notice families: the durable answer is the
+  // `/conversation-summary/diagnostics` snapshot, so the console stays quiet by
+  // default and only real failures warn unconditionally.
   const autoSkipNotices = new Map()
   const noteAutoSkip = (sessionId, reason) => {
+    if (!resolved.logDecisions) return
     if (autoSkipNotices.get(sessionId) === reason) return
     if (autoSkipNotices.size > 200) autoSkipNotices.clear()
     autoSkipNotices.set(sessionId, reason)
     console.warn(`conversation-summary: auto compaction skipped for ${sessionId}: ${reason}`)
+  }
+  // Failures warn once per (session, cause) even with logging off: silence is
+  // how an API drift disabled every compaction for days.
+  const failureNotices = new Map()
+  const noteFailure = (key, message) => {
+    if (failureNotices.get(key) === message) return
+    if (failureNotices.size > 200) failureNotices.clear()
+    failureNotices.set(key, message)
+    console.warn(message)
   }
   // Last measured decision per session, queryable at
   // GET /conversation-summary/diagnostics: `conversation=` there is this
@@ -770,6 +789,7 @@ export function apply(ctx, rawConfig) {
       planExited,
     }
     recordDecision(sessionKey, entry)
+    if (!resolved.logDecisions) return
     if (evaluation.totalTokens < Math.floor(evaluation.budget / 2) && !evaluation.aboveBudget) return
     const bucket = Math.round(evaluation.totalTokens / 5000)
     if (decisionNotices.get(sessionKey) === bucket) return
@@ -822,7 +842,7 @@ export function apply(ctx, rawConfig) {
       } catch (error) {
         const cause = error instanceof Error ? error.message : String(error)
         recordDecision(sessionKey, { mode: resolved.mode, action: `failed:${cause}`, turn, step })
-        console.warn(`conversation-summary: step auto-compaction failed (turn ${turn}, step ${step}): ${cause}`)
+        noteFailure(sessionKey, `conversation-summary: step auto-compaction failed (turn ${turn}, step ${step}): ${cause}`)
       }
     }
     const decision = await next()
@@ -854,7 +874,9 @@ export function apply(ctx, rawConfig) {
       }
     } catch (error) {
       const cause = error instanceof Error ? error.message : String(error)
-      console.warn(`conversation-summary: scenario reminder skipped (turn ${turn}): ${cause}`)
+      const sessionKey = agent.session?.id ?? String(agent.id)
+      recordDecision(sessionKey, { mode: resolved.mode, action: `failed:${cause}`, turn, step })
+      noteFailure(`hint:${sessionKey}`, `conversation-summary: scenario reminder skipped (turn ${turn}): ${cause}`)
       return decision
     }
   })

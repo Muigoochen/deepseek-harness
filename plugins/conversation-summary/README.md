@@ -46,6 +46,7 @@
 | `planExit` | `false` | plan 模式结束(批准/驳回/关闭)时也触发 |
 | `freeform` | `false` | 自由讨论收尾时也触发（agent 认定时刻） |
 | `toolEnabled` | `true` | 注册 `compact_conversation` 工具 |
+| `logDecisions` | `false` | 诊断日志开关：开启后宿主日志打印每次判定（含未到预算、跳过原因与压缩结果）；关闭时只保留两类必要输出——"压缩成功 N tokens"一行，以及真实失败按 `会话+原因` 去重后的一次性警告。`GET /conversation-summary/diagnostics` 不受此开关影响 |
 | `promptEnabled` | `true` | 注入常驻策略提示词 |
 | `promptOrder` | `9000` | 策略提示词在 prompt 中的排序值 |
 | `policyText` | 由开关自动拼装 | 整段自定义策略文案（`{budget} {retain} {mode} {planExit} {freeform}`）；留空用自动拼装版 |
@@ -84,8 +85,7 @@ powershell -ExecutionPolicy Bypass -File install\install.ps1
 
 ## 自诊断（GET `/conversation-summary/diagnostics`）
 
-宿主半为每个会话保留最近一次判定快照，并在预算过半后每变化 5k tokens 往宿主日志打一条
-`conversation-summary: decision …`。遇到"该压没压"，先查这个接口，不必翻终端：
+宿主半为每个会话保留最近一次判定快照，**该接口始终可用、无需任何开关**。遇到"该压没压"，先查这里，不必翻终端：
 
 ```powershell
 (Invoke-WebRequest http://127.0.0.1:3080/conversation-summary/diagnostics -UseBasicParsing).Content
@@ -105,6 +105,10 @@ envelope / budget / aboveBudget / compactable / span / surfaceNodes / weightedNo
 
 注意 `conversation` 是本插件的预算口径（对话本体），与 GUI 上的数字（完整请求信封）**不相等**；两者一起看
 才能区分"口径确实没超"与"该压却没压成"。
+
+控制台日志由 `logDecisions` 控制（默认 `false` = 不打印判定过程）：打开后，预算过半的会话每变化 5k tokens
+打一条 `conversation-summary: decision …`，另有跳过原因与压缩结果；无论开关如何，真实失败都会按
+`会话 + 原因` 去重后警告一次——排查完记得关回去。
 
 ## 版本兼容（Session API 漂移）
 

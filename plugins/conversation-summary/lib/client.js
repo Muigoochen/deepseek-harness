@@ -107,6 +107,7 @@ window.__ModuleLoader__.load({
       lines.push('        toolEnabled: ' + d.toolEnabled)
       lines.push('        promptEnabled: ' + d.promptEnabled)
       lines.push('        promptOrder: ' + d.promptOrder)
+      lines.push('        logDecisions: ' + d.logDecisions)
       var copyKeys = ['askOverBudget', 'askPlanExit', 'askFreeform', 'autoFreeform']
       for (var i = 0; i < copyKeys.length; i += 1) {
         var key = copyKeys[i]
@@ -171,6 +172,7 @@ window.__ModuleLoader__.load({
         toolEnabled: effective.toolEnabled,
         promptEnabled: effective.promptEnabled,
         promptOrder: effective.promptOrder,
+        logDecisions: effective.logDecisions,
         policyText: effective.policyText || '',
         askOverBudget: effective.askOverBudget || '',
         askPlanExit: effective.askPlanExit || '',
@@ -360,6 +362,14 @@ window.__ModuleLoader__.load({
             control: Switch({
               checked: d.toolEnabled,
               onChange: function (e) { patch({ toolEnabled: e.target.checked }) },
+            }),
+          }),
+          Row({
+            title: 'logDecisions（诊断日志）',
+            desc: '默认关：宿主日志不打印判定过程（要排查时打开，能看到每次判定与跳过原因；GET /conversation-summary/diagnostics 始终可用，不受此开关影响）。',
+            control: Switch({
+              checked: d.logDecisions,
+              onChange: function (e) { patch({ logDecisions: e.target.checked }) },
             }),
           }),
         ]),
