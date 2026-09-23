@@ -28,11 +28,12 @@ export function rescanPortOf(eng) {
 }
 
 /**
- * Version of the published addon record this build understands. A record without
- * a `version` was written by an addon installed before the field existed, so its
- * missing fields mean "that addon cannot report this", not "the value is absent".
+ * Version of the record format this build understands. 3 is the first format with
+ * one slot per kind of instance; without a `version` the record was written by an
+ * addon installed before the field existed, so its missing fields mean "that addon
+ * cannot report this", not "the value is absent".
  */
-export const BRIDGE_STATE_VERSION = 2
+export const BRIDGE_STATE_VERSION = 3
 
 /** A port number, or undefined when the value is not one. */
 function asPort(value) {
@@ -40,53 +41,85 @@ function asPort(value) {
   return Number.isInteger(port) && port > 0 && port <= 65535 ? port : undefined
 }
 
+/** Normalize one instance record, from the file or from a `state` reply. */
+function normalizeInstance(raw) {
+  if (!raw || typeof raw !== 'object') return undefined
+  const port = asPort(raw.port)
+  if (port === undefined) return undefined
+  const pid = Number(raw.pid)
+  const livePid = Number.isInteger(pid) && pid > 0 ? pid : undefined
+  // A record left behind by an engine that already exited would point at a port
+  // nothing answers on (and hide the running instance that did publish one).
+  if (livePid !== undefined) {
+    try { process.kill(livePid, 0) } catch { return undefined }
+  }
+  const version = Number(raw.version)
+  return {
+    port,
+    pid: livePid,
+    version: Number.isInteger(version) && version > 0 ? version : 1,
+    project: typeof raw.project === 'string' ? raw.project : undefined,
+    lspPort: asPort(raw.lspPort),
+    dapPort: asPort(raw.dapPort),
+    // Absent before the probe existed, and before a current record's first probe:
+    // both mean "unknown", not "not listening".
+    lspListening: typeof raw.lspListening === 'boolean' ? raw.lspListening : undefined,
+    lspFromLaunch: raw.lspFromLaunch === true,
+  }
+}
+
 /**
- * The addon's published record for a project.
+ * The addon instances serving a project, keyed by kind (`editor` / `engine`).
  *
- * Besides the control port this instance listens on, a current addon reports the
- * ports its editor's language server (LSP) and debug adapter (DAP) read from the
- * editor settings, plus whether anything listens on the LSP port. Only the
- * instance itself can know those: the settings may be overridden per project
- * (`editor_overrides/<name>`), so a caller reading them from outside would guess.
+ * The record has one slot per kind because both serve one project at once — the
+ * user's editor and the headless engine this plugin starts — and instances are
+ * identified by PROJECT PATH rather than by port: ports get occupied and the two
+ * sides' settings can disagree, while the directory an instance serves is
+ * unambiguous.
+ *
+ * A record written before the slots existed (v1/v2) holds one flat instance; it is
+ * filed under the kind its `lspFromLaunch` flag names, and a v1 record — which has
+ * no flag — is filed as `editor`, the instance the older code used.
  * @param {string} project project root
- * @returns {{ port: number, pid?: number, version: number, project?: string, lspPort?: number, dapPort?: number, lspListening?: boolean }|undefined}
- *   undefined when no addon published a record, or the publisher already exited
+ * @returns {{ editor?: object, engine?: object }} live instances only
+ */
+export function readBridgeInstances(project) {
+  let parsed
+  try { parsed = JSON.parse(fs.readFileSync(path.join(project, '.godot', 'dsh_echo_bridge.json'), 'utf8')) }
+  catch { return {} }
+  if (!parsed || typeof parsed !== 'object') return {}
+  const version = Number(parsed.version)
+  if (Number.isInteger(version) && version >= BRIDGE_STATE_VERSION) {
+    const out = {}
+    const editor = normalizeInstance(parsed.editor)
+    if (editor) out.editor = editor
+    const engine = normalizeInstance(parsed.engine)
+    if (engine) out.engine = engine
+    return out
+  }
+  const flat = normalizeInstance(parsed)
+  if (!flat) return {}
+  return flat.lspFromLaunch ? { engine: flat } : { editor: flat }
+}
+
+/**
+ * The instance a caller most likely wants: the user's editor when there is one,
+ * otherwise this plugin's own engine.
+ * @param {string} project project root
+ * @returns {object|undefined} the record, or undefined when neither is live
  */
 export function readBridgeState(project) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(project, '.godot', 'dsh_echo_bridge.json'), 'utf8'))
-    const port = asPort(parsed.port)
-    if (port === undefined) return undefined
-    const pid = Number(parsed.pid)
-    const livePid = Number.isInteger(pid) && pid > 0 ? pid : undefined
-    // A file left behind by an engine that already exited would point at a port
-    // nothing answers on (and hide the running instance that did publish one).
-    if (livePid !== undefined) {
-      try { process.kill(livePid, 0) } catch { return undefined }
-    }
-    const version = Number(parsed.version)
-    return {
-      port,
-      pid: livePid,
-      version: Number.isInteger(version) && version > 0 ? version : 1,
-      project: typeof parsed.project === 'string' ? parsed.project : undefined,
-      lspPort: asPort(parsed.lspPort),
-      dapPort: asPort(parsed.dapPort),
-      // Absent on a record from before the probe existed, and on a current record
-      // whose first probe has not run yet: both mean "unknown", not "not listening".
-      lspListening: typeof parsed.lspListening === 'boolean' ? parsed.lspListening : undefined,
-    }
-  } catch { /* no addon record for this project */ }
-  return undefined
+  const { editor, engine } = readBridgeInstances(project)
+  return editor ?? engine
 }
 
 /**
  * Ask one addon instance for its port facts over its control socket.
  *
- * Preferred over reading the published file when a control port is known: that file
- * holds a single slot, so a second engine opening the same project overwrites the
- * first instance's record even while it is still listening. Asking the instance
- * answers for that instance, and the reply also refreshes its listening probe.
+ * Preferred over reading the published file when a control port is known: a slot in
+ * that file is only as fresh as its instance's last publish, and it lags the first
+ * listening probe. Asking the instance answers for that instance, and the reply also
+ * refreshes the probe.
  * @param {number} port control port
  * @param {number} [timeoutMs] reply timeout
  * @returns {Promise<{ port?: number, pid?: number, version?: number, project?: string, lspPort?: number, dapPort?: number, lspListening?: boolean, lspFromLaunch?: boolean }|undefined>}
@@ -120,6 +153,68 @@ export function askBridgeState(port, timeoutMs = 1500) {
     sock.once('error', () => done(undefined))
     sock.once('close', () => done(undefined))
   })
+}
+
+/**
+ * The addon instance serving one project, with the facts it reports.
+ *
+ * Identity is the PROJECT PATH, not a port: ports get occupied and the two sides'
+ * settings can disagree, while the directory a session serves is unambiguous. The
+ * record's per-kind slots name the candidates; each candidate is then asked over its
+ * own control socket, because a slot is only as fresh as that instance's last
+ * publish.
+ * @param {string} project project root
+ * @param {{ rescanPort?: number }} [eng] engine record supplying the control-port scan base
+ * @param {{ prefer?: 'editor'|'engine' }} [options] which kind to answer with when both serve the project
+ * @returns {Promise<{ controlPort: number, kind: 'editor'|'engine'|'unknown', project?: string, version: number, lspPort?: number, dapPort?: number, lspListening?: boolean, lspFromLaunch: boolean, reported: boolean }|undefined>}
+ *   undefined when no instance serves this project; `reported: false` marks an addon
+ *   too old to answer `state`, whose ports are therefore unknown
+ */
+export async function resolveProjectInstance(project, eng, options = {}) {
+  const prefer = options.prefer === 'engine' ? 'engine' : 'editor'
+  const instances = readBridgeInstances(project)
+  const order = prefer === 'engine' ? ['engine', 'editor'] : ['editor', 'engine']
+  for (const kind of order) {
+    const slot = instances[kind]
+    if (!slot) continue
+    const resolved = await describeInstance(project, slot.port, kind, slot)
+    if (resolved) return resolved
+  }
+  // Nothing live in the record: an instance may have overwritten it before the slots
+  // existed, or the file may be missing. Probing the range asks each candidate who
+  // it serves, which is the same identity check.
+  const probed = await discoverBridgePortAsync(project, eng)
+  if (probed === undefined) return undefined
+  return describeInstance(project, probed, undefined, undefined)
+}
+
+/**
+ * Ask one control port for an instance's facts and normalize them.
+ * @param {string} project project root the caller wants
+ * @param {number} controlPort control port to ask
+ * @param {'editor'|'engine'|undefined} kind kind from the record slot, when known
+ * @param {object|undefined} slot the record slot, a fallback for an addon too old to answer
+ * @returns {Promise<object|undefined>} undefined when it answered for another project
+ */
+async function describeInstance(project, controlPort, kind, slot) {
+  const facts = await askBridgeState(controlPort)
+  const owner = facts && typeof facts.project === 'string' ? facts.project : undefined
+  if (facts && owner !== undefined && !samePath(owner, project)) return undefined
+  const lspFromLaunch = facts ? facts.lspFromLaunch === true : !!(slot && slot.lspFromLaunch)
+  const version = Number(facts && facts.version !== undefined ? facts.version : (slot && slot.version))
+  return {
+    controlPort,
+    kind: kind ?? (facts ? (lspFromLaunch ? 'engine' : 'editor') : 'unknown'),
+    project: owner ?? (slot && slot.project),
+    version: Number.isInteger(version) && version > 0 ? version : 1,
+    lspPort: asPort(facts && facts.lspPort) ?? (slot && slot.lspPort),
+    dapPort: asPort(facts && facts.dapPort) ?? (slot && slot.dapPort),
+    lspListening: facts && typeof facts.lspListening === 'boolean'
+      ? facts.lspListening
+      : (slot && slot.lspListening),
+    lspFromLaunch,
+    reported: facts !== undefined,
+  }
 }
 
 /**

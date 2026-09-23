@@ -55,7 +55,13 @@ const GODOT_RESERVED_PORTS: Array = [6005, 6006, 6007]
 const LSP_RELOCATE_SCAN: int = 16
 ## Bumped whenever the published record gains a field, so the DSH side can tell a
 ## stale addon copy (installed before the field existed) from a current one.
-const STATE_VERSION: int = 2
+const STATE_VERSION: int = 3
+## The record file holds one slot per kind of instance. Both kinds serve the same
+## project at once — the user's editor and the headless engine this plugin starts —
+## and a single slot let whichever published last erase the other's record, which
+## made the editor invisible to a caller looking up its instance.
+const SLOT_EDITOR: String = "editor"
+const SLOT_ENGINE: String = "engine"
 ## Editor settings naming the two servers this addon reports on. Both are read
 ## through EditorSettings.get_setting(), which prefers a per-project
 ## `editor_overrides/<name>` value — that is where a relocated port lives.
@@ -202,7 +208,7 @@ func _handle_request(request_line: String) -> void:
 			# Explicit request: probe now so the reply is current, without touching
 			# the published file.
 			_probe_state()
-			_peer_connection.put_data((STATE_PREFIX + _state_json() + "\n").to_utf8_buffer())
+			_peer_connection.put_data((STATE_PREFIX + JSON.stringify(_instance_record()) + "\n").to_utf8_buffer())
 		"publish":
 			_probe_state()
 			_publish_state()
@@ -257,8 +263,8 @@ func _listen_on_first_free_port(base_port: int) -> void:
 ## 除了控制端口,还报告编辑器语言服务器(LSP)与调试适配器(DAP)的端口:两者都会
 ## 从编辑器设置读取,而设置又可能被项目级 `editor_overrides/<name>` 覆盖,所以只有
 ## 实例自己读到的值才是准的(调用方从外面猜不出来)。
-## @return: String 单行 JSON(控制协议按行分帧,不能带换行)
-func _state_json() -> String:
+## @return: Dictionary 本实例的端口事实(键为 String,与 JSON 往返一致)
+func _instance_record() -> Dictionary:
 	var launched_lsp: int = _launch_port(LSP_PORT_ENV, LSP_PORT_FLAG)
 	var lsp_port: int = _lsp_port()
 	var dap_port: int = _dap_port()
@@ -278,7 +284,43 @@ func _state_json() -> String:
 	# 的记录会自相矛盾。
 	if _published_listening >= 0:
 		record[&"lspListening"] = _published_listening == 1
-	return JSON.stringify(record)
+	return record
+
+
+## 本实例属于哪种槽位(见 SLOT_EDITOR/SLOT_ENGINE)。
+## @return: String 槽位名
+func _own_slot() -> String:
+	return SLOT_ENGINE if _launch_port(LSP_PORT_ENV, LSP_PORT_FLAG) > 0 else SLOT_EDITOR
+
+
+## 读取文件里另一个槽位的内容。
+##
+## 不在这里判断那个实例是否还活着:实测 Godot 的 OS.is_process_running() 会把同机上
+## 另一个活着的引擎报成已退出, 一旦据此丢弃, 对方的记录就白白没了。存活判断交给读取
+## 方 —— 它用自己那侧可靠的方式验证。
+## @param slot: 槽位名
+## @return: Variant 该槽位的记录;不存在或形状不对时为 null
+func _read_slot(slot: String) -> Variant:
+	var text: String = ""
+	var state_file: FileAccess = FileAccess.open(_state_file_path, FileAccess.READ)
+	if state_file != null:
+		text = state_file.get_as_text()
+		state_file.close()
+	if text.is_empty():
+		return null
+	var parsed: Variant = JSON.parse_string(text)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return null
+	var data: Dictionary = parsed
+	# Plain String keys throughout: JSON.parse_string() yields String keys, and a
+	# StringName key is a DIFFERENT key to Dictionary — a `&"version"` write read
+	# back as `"version"` misses, which silently loses the other instance's slot.
+	if not data.has("version") or int(data.get("version", 1)) < STATE_VERSION:
+		data = { (SLOT_ENGINE if bool(data.get("lspFromLaunch", false)) else SLOT_EDITOR): data }
+	var entry: Variant = data.get(slot)
+	if typeof(entry) != TYPE_DICTIONARY:
+		return null
+	return entry
 
 
 ## 生效的 LSP 端口:启动时显式指定优先,其次是编辑器设置。
@@ -338,15 +380,27 @@ func _probe_state() -> void:
 
 
 ## 把端口事实写进 .godot/dsh_echo_bridge.json,DSH 侧默认从这里读。
+##
+## 只写自己那一格,并把另一格原样带过去:编辑器与本插件自起的引擎会同时服务同一个
+## 项目,单槽文件会让后写的那方抹掉先写的那方(调用方随后就分不清两个会话,编辑器
+## 甚至直接消失)。已退出的实例留下的那格由读取方忽略,不在这里清理(见 _read_slot)。
 ## @return: void
 func _publish_state() -> void:
 	_published_lsp_port = _lsp_port()
 	_published_dap_port = _dap_port()
+	var record: Dictionary = { "version": STATE_VERSION }
+	for slot in [SLOT_EDITOR, SLOT_ENGINE]:
+		if slot == _own_slot():
+			continue
+		var previous: Variant = _read_slot(slot)
+		if previous != null:
+			record[slot] = previous
+	record[_own_slot()] = _instance_record()
 	var state_file: FileAccess = FileAccess.open(_state_file_path, FileAccess.WRITE)
 	if state_file == null:
 		push_warning("[dsh-echo-bridge] cannot publish state to %s" % _state_file_path)
 		return
-	state_file.store_string(_state_json())
+	state_file.store_string(JSON.stringify(record))
 	state_file.close()
 
 
