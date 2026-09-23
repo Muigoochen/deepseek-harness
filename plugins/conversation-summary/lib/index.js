@@ -242,6 +242,17 @@ function compactionEngineOf(ctx, agent) {
 }
 
 /**
+ * The session's event log across product versions: current builds expose
+ * `snapshotEvents()`, while older ones kept a plain `events` array. Reading the
+ * wrong one throws `not iterable` on every pre-step, which silently disables
+ * every scenario, so resolve it once per read.
+ */
+function sessionEvents(session) {
+  if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+  return session.events ?? []
+}
+
+/**
  * Conversation-content weights for the current surface: node tokens count only
  * for genuine conversation messages (user / assistant / tool results) and for
  * compaction checkpoints ("各总结 + 未总结的内容"). System prompt, tools, and
@@ -255,10 +266,17 @@ function conversationWeights(session, measurement, budgetScope) {
     return measurement.nodes.map((node) => ({ seq: node.seq, tokens: node.tokens }))
   }
   const messageBySeq = new Map()
-  for (const event of session.events) {
-    if (event.type === 'user/message') messageBySeq.set(event.seq, event.data)
-    else if (event.type === 'assistant/message') messageBySeq.set(event.seq, event.data.message)
-    else if (event.type === 'tool/result') messageBySeq.set(event.seq, event.data.message)
+  for (const event of sessionEvents(session)) {
+    // Current builds project an event into its message through
+    // `deriveEventMessage`; the legacy branches keep older builds working.
+    const message = typeof session.deriveEventMessage === 'function'
+      ? session.deriveEventMessage(event)
+      : event.type === 'user/message'
+        ? event.data
+        : event.type === 'assistant/message' || event.type === 'tool/result'
+          ? event.data.message
+          : null
+    if (message !== null && message !== undefined) messageBySeq.set(event.seq, message)
   }
   return measurement.nodes.map((node) => {
     const message = messageBySeq.get(node.seq)
@@ -273,11 +291,22 @@ function conversationWeights(session, measurement, budgetScope) {
 }
 
 /**
+ * The event at one surface seq across product versions: current builds expose
+ * `eventAt(seq)`, older ones kept a dense `events` array.
+ */
+function eventAtSeq(session, seq) {
+  if (typeof session.eventAt === 'function') return session.eventAt(seq)
+  return sessionEvents(session).find((event) => event.seq === seq)
+}
+
+/**
  * Select the head-anchored compactable surface span whose retained tail keeps
  * at least `retainTokens` (measured on the weighted conversation content),
  * mirroring the built-in engine's range selection (including tool-call/result
- * pairing). Returns null when nothing is compactable — never an unbalanced
- * range.
+ * pairing). A `system/message` at surface node 0 is never inside the range —
+ * current builds surface the system prompt as node 0, and replacing it is
+ * rejected by the engine — so the range starts at the first non-system node.
+ * Returns null when nothing is compactable — never an unbalanced range.
  */
 function compactableSpan(session, weights, retainTokens) {
   if (!Array.isArray(weights) || weights.length === 0) return null
@@ -286,6 +315,9 @@ function compactableSpan(session, weights, retainTokens) {
   for (let i = 0; i < surface.length; i += 1) {
     if (surface[i] !== weights[i].seq) return null
   }
+  const head = eventAtSeq(session, surface[0])
+  const firstIdx = head !== undefined && head.type === 'system/message' ? 1 : 0
+  if (weights.length <= firstIdx) return null
   let accumulated = 0
   let keepFromIdx = weights.length
   for (let i = weights.length - 1; i >= 0; i -= 1) {
@@ -293,20 +325,20 @@ function compactableSpan(session, weights, retainTokens) {
     keepFromIdx = i
     if (accumulated >= retainTokens) break
   }
-  if (keepFromIdx === 0) return null
-  while (keepFromIdx > 0) {
+  if (keepFromIdx <= firstIdx) return null
+  while (keepFromIdx > firstIdx) {
     if (toolPairingBalancedBefore(session, surface[keepFromIdx])) break
     keepFromIdx -= 1
   }
-  if (keepFromIdx === 0) return null
+  if (keepFromIdx <= firstIdx) return null
   const shadowedTokens = weights
-    .slice(0, keepFromIdx)
+    .slice(firstIdx, keepFromIdx)
     .reduce((sum, node) => sum + node.tokens, 0)
   return {
-    start: surface[0],
+    start: surface[firstIdx],
     end: surface[keepFromIdx - 1],
     shadowedTokens,
-    shadowedNodes: keepFromIdx,
+    shadowedNodes: keepFromIdx - firstIdx,
   }
 }
 
@@ -318,12 +350,13 @@ function compactableSpan(session, weights, retainTokens) {
  * "plan-mode exit", not a reliable "方案获批" signal.
  */
 function planExitedSinceLastCompaction(session) {
+  const events = sessionEvents(session)
   let lastEndSeq = -1
-  for (const event of session.events) {
+  for (const event of events) {
     if (event.type === 'compaction/end') lastEndSeq = event.seq
   }
   let sawActive = false
-  for (const event of session.events) {
+  for (const event of events) {
     if (event.seq <= lastEndSeq) continue
     if (event.type === 'plan/mode') {
       if (event.data.active) sawActive = true
@@ -700,6 +733,56 @@ export function apply(ctx, rawConfig) {
 
   ctx.effect(() => ctx.sessionProjections.register(createProjectionRegistration()))
 
+  // One console notice per (session, reason) so an over-budget session that
+  // cannot compact is visible in the host log instead of failing silently.
+  const autoSkipNotices = new Map()
+  const noteAutoSkip = (sessionId, reason) => {
+    if (autoSkipNotices.get(sessionId) === reason) return
+    if (autoSkipNotices.size > 200) autoSkipNotices.clear()
+    autoSkipNotices.set(sessionId, reason)
+    console.warn(`conversation-summary: auto compaction skipped for ${sessionId}: ${reason}`)
+  }
+  // Last measured decision per session, queryable at
+  // GET /conversation-summary/diagnostics: `conversation=` there is this
+  // plugin's budget metric (conversation body), while the GUI number is the
+  // full request envelope, so the two answers together say whether a session
+  // was skipped for metric, engine, range, or call reasons.
+  const decisionLog = new Map()
+  const recordDecision = (sessionKey, entry) => {
+    decisionLog.set(sessionKey, { time: new Date().toISOString(), ...entry })
+    if (decisionLog.size > 50) decisionLog.delete(decisionLog.keys().next().value)
+  }
+  const decisionNotices = new Map()
+  const noteDecision = (sessionKey, evaluation, agent, planExited, engine, action) => {
+    const entry = {
+      mode: resolved.mode,
+      action,
+      engine: engine !== undefined,
+      conversation: evaluation.totalTokens,
+      envelope: evaluation.envelopeTokens,
+      budget: resolved.budget,
+      aboveBudget: evaluation.aboveBudget,
+      compactable: evaluation.compactable,
+      span: evaluation.span === null ? null : [evaluation.span.start, evaluation.span.end],
+      surfaceNodes: agent.session?.surface?.nodes?.length ?? -1,
+      weightedNodes: evaluation.surfaceNodes,
+      retain: resolved.retain,
+      planExited,
+    }
+    recordDecision(sessionKey, entry)
+    if (evaluation.totalTokens < Math.floor(evaluation.budget / 2) && !evaluation.aboveBudget) return
+    const bucket = Math.round(evaluation.totalTokens / 5000)
+    if (decisionNotices.get(sessionKey) === bucket) return
+    if (decisionNotices.size > 300) decisionNotices.clear()
+    decisionNotices.set(sessionKey, bucket)
+    console.log(`conversation-summary: decision ${sessionKey} mode=${resolved.mode} engine=${engine !== undefined} `
+      + `conversation=${evaluation.totalTokens} envelope=${evaluation.envelopeTokens} budget=${resolved.budget} `
+      + `aboveBudget=${evaluation.aboveBudget} compactable=${evaluation.compactable} `
+      + `span=${evaluation.span === null ? 'none' : `${evaluation.span.start}-${evaluation.span.end}`} `
+      + `surfaceNodes=${entry.surfaceNodes} weightedNodes=${entry.weightedNodes} `
+      + `retain=${resolved.retain} planExited=${planExited} action=${action}`)
+  }
+
   ctx.on('agent/pre-step', async (
     { agent, turn, step, signal },
     next,
@@ -709,16 +792,36 @@ export function apply(ctx, rawConfig) {
     // Auto mode: the plugin compacts at the next step boundary whenever a
     // plugin-detectable scenario is due — over budget (①) or plan mode exited
     // (②, only when the plan-exit scenario is enabled). Free-form finalization
-    // (③) is agent-sensed and handled by the tool/policy, not here.
+    // (③) is agent-sensed and handled by the tool/policy, not here. A due
+    // scenario that cannot compact logs why: the previous silent skip made an
+    // over-budget session look like the plugin was not running at all.
     const planExited = resolved.planExit && planExitedSinceLastCompaction(agent.session)
-    if (engine !== undefined && resolved.mode === 'auto') {
+    if (resolved.mode === 'auto') {
+      const sessionKey = agent.session?.id ?? String(agent.id)
       try {
         const evaluation = evaluate(ctx, agent, engine, resolved, planExited)
-        if (evaluation.compactable && (evaluation.aboveBudget || planExited)) {
-          await engine.compactRegion(evaluation.span.start, evaluation.span.end, agent, signal)
+        const due = evaluation.aboveBudget || planExited
+        let action = due ? 'due' : 'below-budget'
+        if (due && engine === undefined) {
+          action = 'skip:engine-unavailable'
+          noteAutoSkip(sessionKey,
+            `engine unavailable (preset mounts no ctx.compaction); ${evaluation.totalTokens} tokens >= budget ${resolved.budget}`)
+        } else if (due && !evaluation.compactable) {
+          action = 'skip:no-compactable-range'
+          noteAutoSkip(sessionKey,
+            `over budget (${evaluation.totalTokens} >= ${resolved.budget}) but no compactable range `
+            + `(surface ${agent.session?.surface?.nodes?.length ?? '?'} / weighted ${evaluation.surfaceNodes} nodes, retain ${resolved.retain})`)
+        } else if (due && engine !== undefined) {
+          const result = await engine.compactRegion(evaluation.span.start, evaluation.span.end, agent, signal)
+          autoSkipNotices.delete(sessionKey)
+          action = `compacted:${result.shadowedTokenCount}`
+          console.log(`conversation-summary: auto-compacted ${result.shadowedTokenCount} tokens `
+            + `(${result.shadowedSeqs.length} nodes) for ${sessionKey}; surface was ${evaluation.totalTokens} >= budget ${resolved.budget}`)
         }
+        noteDecision(sessionKey, evaluation, agent, planExited, engine, action)
       } catch (error) {
         const cause = error instanceof Error ? error.message : String(error)
+        recordDecision(sessionKey, { mode: resolved.mode, action: `failed:${cause}`, turn, step })
         console.warn(`conversation-summary: step auto-compaction failed (turn ${turn}, step ${step}): ${cause}`)
       }
     }
@@ -731,6 +834,8 @@ export function apply(ctx, rawConfig) {
     try {
       const planExitNow = resolved.planExit && planExitedSinceLastCompaction(agent.session)
       const evaluation = evaluate(ctx, agent, engine, resolved, planExitNow)
+      noteDecision(agent.session?.id ?? String(agent.id), evaluation, agent, planExitNow, engine,
+        `hint:${evaluation.compactable && (evaluation.aboveBudget || planExitNow) ? 'due' : 'idle'}`)
       if (!evaluation.compactable || !(evaluation.aboveBudget || planExitNow)) return decision
       const state = ctx.sessionProjections.stateOf(agent.session, 'conversationSummary')
       if (state && state.reminded) return decision
@@ -873,6 +978,20 @@ export function apply(ctx, rawConfig) {
         respondJson(res, 400, { ok: false, error: cause })
       }
     }
+    const diagnosticsHandler = (req, res) => {
+      if ((req.method || 'GET').toUpperCase() !== 'GET') {
+        respondJson(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      respondJson(res, 200, {
+        ok: true,
+        mode: resolved.mode,
+        budget: resolved.budget,
+        retain: resolved.retain,
+        budgetScope: resolved.budgetScope,
+        decisions: [...decisionLog.entries()].map(([session, entry]) => ({ session, ...entry })),
+      })
+    }
     const disposeConfig = ctx.webServer.register({
       kind: 'exact',
       path: '/conversation-summary/config',
@@ -883,9 +1002,15 @@ export function apply(ctx, rawConfig) {
       path: '/conversation-summary/policy',
       handler: policyHandler,
     })
+    const disposeDiagnostics = ctx.webServer.register({
+      kind: 'exact',
+      path: '/conversation-summary/diagnostics',
+      handler: diagnosticsHandler,
+    })
     return () => {
       disposeConfig()
       disposePolicy()
+      disposeDiagnostics()
     }
   })
 }
