@@ -22,7 +22,7 @@ import { engines, markers, matchExtension } from './checkers.js'
 import { ensureHost, stopHost, status, checkFiles, runtimeRoot, stopClientd, diagnosticsPath, pruneSnapshot, rescanEngine } from './manager.js'
 import { ADDON_ID, discoverBridgePortAsync, installAddonInto, probeEngineBridge, rescanPortOf } from './addon.js'
 import { dependentsOf } from './dependents.js'
-import { ProjectWatcher, scanFiles } from './watcher.js'
+import { ProjectWatcher, normalizeSkipEntry, sameSkipEntry, scanFiles } from './watcher.js'
 import { registerTool } from './tool.js'
 import { scanProjectRoots } from './registry.js'
 import { allDictionaries, getActiveLocale, localeIds, setActiveLocale, tLine } from './i18n.js'
@@ -50,6 +50,12 @@ const PROJECT_ENTRY = z.object({
     engine: z.string(),
   })), // v2 multiple-LSP field (array implies default [])
   autoInject: z.boolean(), // explicit exemption; absent = follow global
+  // Project-level extra skip list, comma separated (settings GUI: 项目卡片).
+  // Entries are directory names matched at any depth, or project-relative paths
+  // such as `addons/dsh_echo_bridge`. A string, not an array, so "unset" stays
+  // distinguishable from "explicitly empty" (`z.array` would default to []).
+  // Absent = fall back to Config.watchSkip.
+  skipDirs: z.string(),
 })
 const REGISTRY_SCHEMA = z.object({
   discovered: z.array(z.object({
@@ -95,7 +101,47 @@ const REGISTRY_SCHEMA = z.object({
   })).default([]),
 })
 
-const DEFAULT_SKIP = ['node_modules', '.git', '.godot', 'addons']
+// Directories no project may watch, whatever the configuration says: build
+// machinery and VCS data, never authored source. `scanFiles` and every other
+// traversal here already drop dot-directories on their own, so the two dotted
+// entries are redundant for today's walkers — they stay because this list is also
+// what the settings card shows as "always skipped", and it is the backstop for any
+// traversal added later that matches on names alone.
+const FORCED_SKIP = ['node_modules', '.git', '.godot']
+// Directories skipped by default but open to per-project configuration, because
+// a project may keep authored source there: a Godot addon IS the deliverable for
+// some projects. The plugin's own bridge directory is the one addon that stays
+// skipped — it is copied in by this plugin and its churn is not authored work.
+const DEFAULT_OPTIONAL_SKIP = [`addons/${ADDON_ID}`]
+const DEFAULT_SKIP = [...FORCED_SKIP, ...DEFAULT_OPTIONAL_SKIP]
+
+/**
+ * Parse a comma-separated skip list from the settings GUI.
+ * @param {string|undefined} raw user input, e.g. `addons, build/tmp`
+ * @returns {string[]} non-empty entries, trimmed, in input order
+ */
+function parseSkipList(raw) {
+  if (typeof raw !== 'string') return []
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+/**
+ * Skip list in force for one project: forced entries plus the project's own
+ * list, falling back to the global Config.watchSkip when the project sets none.
+ * @param {{ skipDirs?: string }} projectEntry normalized project entry
+ * @param {string[]} globalSkip Config.watchSkip
+ * @returns {string[]} directory entries for scanFiles/ProjectWatcher
+ */
+function effectiveSkipDirs(projectEntry, globalSkip) {
+  const own = projectEntry && typeof projectEntry.skipDirs === 'string' ? projectEntry.skipDirs : undefined
+  const optional = own === undefined
+    ? (Array.isArray(globalSkip) && globalSkip.length ? globalSkip : DEFAULT_OPTIONAL_SKIP)
+    : parseSkipList(own)
+  return [...FORCED_SKIP, ...optional.filter((d) => !FORCED_SKIP.some((f) => sameSkipEntry(f, d)))]
+}
 
 export const Config = z.object({
   projects: z.array(PROJECT_ENTRY).default([]),
@@ -116,7 +162,7 @@ export const Config = z.object({
  * Engine order: explicit lsp entries win; a lone v1 engine is appended when
  * no lsp entries are present (deduped).
  * @param {object} entry raw entry from store/config
- * @returns {{ path: string, lsp: Array<{engine: string}>, autoInject?: boolean } | undefined}
+ * @returns {{ path: string, lsp: Array<{engine: string}>, autoInject?: boolean, skipDirs?: string } | undefined}
  */
 function normalizeProjectEntry(entry) {
   if (!entry || typeof entry !== 'object' || typeof entry.path !== 'string' || !entry.path) return undefined
@@ -131,6 +177,7 @@ function normalizeProjectEntry(entry) {
   if (!lsp.length && typeof entry.engine === 'string' && entry.engine) lsp.push({ engine: entry.engine })
   const out = { path: entry.path, lsp }
   if (typeof entry.autoInject === 'boolean') out.autoInject = entry.autoInject
+  if (typeof entry.skipDirs === 'string') out.skipDirs = entry.skipDirs
   return out
 }
 
@@ -246,8 +293,11 @@ export function apply(ctx, config) {
   // adds more engines, guarding against node_modules/.git/vendor pollution.
   const suggestLsp = (root) => {
     const absRoot = path.resolve(root)
+    // Engine evidence comes from project sources, so build/VCS noise is skipped;
+    // `addons` is NOT skipped here either — a plugin-style project keeps its
+    // GDScript there.
     const skipDirs = (config.watchSkip || []).slice()
-    for (const s of ['node_modules', '.git', '.venv', 'dist', 'build', 'vendor', 'addons', '.dsh-build']) {
+    for (const s of ['node_modules', '.git', '.venv', 'dist', 'build', 'vendor', '.dsh-build']) {
       if (!skipDirs.includes(s)) skipDirs.push(s)
     }
     const suggested = []
@@ -633,8 +683,9 @@ export function apply(ctx, config) {
     }
     let current = new Map()
     // Godot registers global class names for the whole res:// tree, addons/
-    // included, so the index must not inherit the watcher's skip list.
-    const indexSkip = (config.watchSkip || DEFAULT_SKIP).filter((dir) => dir !== 'addons')
+    // included, so the index must not inherit the watcher's addons skip — but
+    // every other configured skip still bounds the walk.
+    const indexSkip = wideScanSkip(project)
     try { current = scanFiles(project, indexSkip, ['.gd']) } catch { /* unreadable: keep the last index */ }
     for (const [name, file] of [...entry.names]) if (!current.has(file)) entry.names.delete(name)
     for (const [file, mtime] of current) {
@@ -701,18 +752,20 @@ export function apply(ctx, config) {
   /** Ping status of the in-project bridge addon (shared by the GUI action). */
 
   // ---- effective project map (discovered/config seed, manual overrides) ----
-  // known value: { path, source, lsp: [{engine}], autoInject } (autoInject =
-  // exemption; explicit false anywhere config/manual disables injection).
+  // known value: { path, source, lsp: [{engine}], autoInject, skipDirs } — with
+  // autoInject an exemption (explicit false anywhere config/manual disables
+  // injection) and skipDirs the project's own comma-separated skip list
+  // (undefined = follow Config.watchSkip).
   const known = new Map() // lowercased root -> record
-  const addKnown = (root, lsp, autoInject, source) => {
+  const addKnown = (root, lsp, autoInject, source, skipDirs) => {
     if (!root || !fs.existsSync(root)) return
     const abs = path.resolve(root)
     const key = abs.toLowerCase()
     if (!known.has(key)) {
-      known.set(key, { path: abs, source, lsp: lsp || [], autoInject: autoInject !== false })
+      known.set(key, { path: abs, source, lsp: lsp || [], autoInject: autoInject !== false, skipDirs })
     }
   }
-  const setKnown = (root, lsp, autoInject, source) => {
+  const setKnown = (root, lsp, autoInject, source, skipDirs) => {
     if (!root) return
     const abs = path.resolve(root)
     const key = abs.toLowerCase()
@@ -726,6 +779,7 @@ export function apply(ctx, config) {
       source: source || (prev && prev.source) || 'manual',
       lsp: effectiveLsp,
       autoInject: autoInject === undefined ? (prev ? prev.autoInject : true) : autoInject !== false,
+      skipDirs: skipDirs === undefined ? (prev ? prev.skipDirs : undefined) : skipDirs,
     })
   }
   const seedKnown = () => {
@@ -741,7 +795,7 @@ export function apply(ctx, config) {
         const d = detectEngine(e.path)
         if (d) lsp = [{ engine: d }]
       }
-      addKnown(e.path, lsp, e.autoInject, 'config')
+      addKnown(e.path, lsp, e.autoInject, 'config', e.skipDirs)
     }
     for (const ws of store.discovered) {
       if (!ws) continue
@@ -749,9 +803,29 @@ export function apply(ctx, config) {
     }
     for (const m of store.manual) {
       if (!m || !m.path) continue
-      setKnown(m.path, entryEngineIds(m).map((engine) => ({ engine })), m.autoInject, 'manual')
+      setKnown(m.path, entryEngineIds(m).map((engine) => ({ engine })), m.autoInject, 'manual', m.skipDirs)
     }
   }
+  /** Project's own skip list in force, resolved through the effective record. */
+  const skipDirsOf = (absRoot) => {
+    const rec = known.get(path.resolve(absRoot).toLowerCase())
+    return effectiveSkipDirs(rec, config.watchSkip)
+  }
+  /**
+   * Skip list for the two scans whose scope must exceed the watcher's: the
+   * `class_name` index and the dependent-file candidates. Godot registers global
+   * class names for the whole `res://` tree and an addon script may reference a
+   * project class, so anything naming an `addons` directory is released here even
+   * when the watcher skips it. Every other configured entry still applies, so a
+   * user's `vendor`/`build` keeps bounding the walk. Releasing the whole `addons`
+   * subtree (not just the directory itself) is the deliberate cost of that
+   * correctness: on a project with a huge vendored addon these two walks cover it
+   * once per changed script.
+   */
+  const wideScanSkip = (absRoot) => skipDirsOf(absRoot).filter((d) => {
+    const n = normalizeSkipEntry(d).toLowerCase()
+    return n !== 'addons' && !n.startsWith('addons/')
+  })
   seedKnown()
   if (known.size) {
     showToast('info', tLine('toast.ready.title'), tLine('toast.ready.body', { count: known.size, engines: enginesList().join(', ') }), 'lsp-echo-ready', 4000)
@@ -787,10 +861,15 @@ export function apply(ctx, config) {
     const key = rec.path.toLowerCase()
     let w = watchers.get(key)
     const wantExts = projectExtensions(rec)
-    if (w && w.extensionsKey === wantExts.join(',')) return w
+    const wantSkips = skipDirsOf(rec.path)
+    // The skip list is a construction argument and can change behind this
+    // process (another session, or a hand edit of the settings file), so it
+    // belongs in the cache key alongside the extensions.
+    const wantKey = `${wantExts.join(',')}|${wantSkips.join(',')}`
+    if (w && w.cacheKey === wantKey) return w
     if (w) w.tick() // flush edits since the last tick into dirty before rebuild
-    const fresh = new ProjectWatcher(rec.path, config.watchSkip || DEFAULT_SKIP, wantExts)
-    fresh.extensionsKey = wantExts.join(',')
+    const fresh = new ProjectWatcher(rec.path, wantSkips, wantExts)
+    fresh.cacheKey = wantKey
     if (w) fresh.adopt(w) // rebuild without losing pending dirty files
     watchers.set(key, fresh)
     return fresh
@@ -870,7 +949,7 @@ export function apply(ctx, config) {
     const keepExts = boundExtensions(rec)
     await Promise.all(bound.map(async (eng) => {
       let files = []
-      try { files = [...scanFiles(rec.path, config.watchSkip || DEFAULT_SKIP, eng.extensions).keys()] } catch { /* keep [] */ }
+      try { files = [...scanFiles(rec.path, skipDirsOf(rec.path), eng.extensions).keys()] } catch { /* keep [] */ }
       if (!files.length) { rows.push({ eng: eng.id, empty: true }); return }
       try {
         const payload = await checkWithHeal(eng, rec.path, files, timeoutMs, 'baseline', eng.extensions, keepExts)
@@ -977,7 +1056,7 @@ export function apply(ctx, config) {
       // Unknown project: legacy single-engine path (resolved bridge only).
       const ownExts = engineByBridge(bridge) ? engineByBridge(bridge).extensions : undefined
       let all = []
-      try { all = [...scanFiles(project, config.watchSkip || DEFAULT_SKIP).keys()] } catch { /* ignore */ }
+      try { all = [...scanFiles(project, skipDirsOf(project)).keys()] } catch { /* ignore */ }
       if (!all.length) return '[lsp-echo] 项目里没有可检查的文件'
       const payload = await checkFiles(bridge, project, all, 200_000, 'baseline', ownExts, undefined, portForBridge(bridge, project))
       const scanned = payload && payload.summary ? payload.summary.files_checked : all.length
@@ -1007,7 +1086,7 @@ export function apply(ctx, config) {
     // effect asks for the header only our own bundle sends. Read-only actions
     // (projects/engines/diagnostics/status/addCandidates/bridgeStatus/locales)
     // stay open.
-    const MUTATING_ACTIONS = new Set(['installAddon', 'smart', 'setProject', 'addLsp', 'delLsp', 'resetProject', 'delProject', 'baseline', 'host', 'stop'])
+    const MUTATING_ACTIONS = new Set(['installAddon', 'smart', 'setProject', 'addLsp', 'delLsp', 'setSkipDirs', 'resetProject', 'delProject', 'baseline', 'host', 'stop'])
     const apiHandler = async (req, res) => {
       try {
         if ((req.method || 'GET').toUpperCase() !== 'GET') return json(res, 405, { ok: false, error: 'method not allowed' })
@@ -1031,6 +1110,11 @@ export function apply(ctx, config) {
               lsp: (r.lsp || []).map((x) => x.engine),
               path: r.path,
               autoInject: r.autoInject,
+              // The project's own optional skip list (undefined = following the
+              // global Config.watchSkip) and what it resolves to right now.
+              skipDirs: typeof r.skipDirs === 'string' ? r.skipDirs : undefined,
+              effectiveSkip: effectiveSkipDirs(r, config.watchSkip),
+              forcedSkip: FORCED_SKIP,
             })),
           })
         }
@@ -1217,11 +1301,18 @@ export function apply(ctx, config) {
           const rec = known.get(abs.toLowerCase())
           return rec ? rec.autoInject : true
         }
+        // The project's own skip list, so an engine edit does not erase it: the
+        // manual entry is the only place a project-level list lives, and every
+        // caller of setManualLsp rewrites that whole entry.
+        const knownSkipOf = (abs) => {
+          const rec = known.get(abs.toLowerCase())
+          return rec && typeof rec.skipDirs === 'string' ? rec.skipDirs : undefined
+        }
         // Replace or add the manual entry for `abs` with exactly `engineIds`.
         const setManualLsp = async (abs, engineIds, autoInject) => {
           const manual = store.manual.slice()
           const i = manualIndex(abs)
-          const entry = normalizeProjectEntry({ path: abs, lsp: engineIds.map((e) => ({ engine: e })), autoInject })
+          const entry = normalizeProjectEntry({ path: abs, lsp: engineIds.map((e) => ({ engine: e })), autoInject, skipDirs: knownSkipOf(abs) })
           if (i >= 0) manual[i] = entry
           else manual.push(entry)
           await persistManual(manual)
@@ -1288,6 +1379,62 @@ export function apply(ctx, config) {
           const next = [...current, eng]
           await setManualLsp(req.abs, next, knownAutoInjectOf(req.abs))
           return json(res, 200, { ok: true, added: true, project: req.abs, lsp: next })
+        }
+        // Per-project skip list (settings GUI: 项目卡片的「跳过目录」输入框).
+        // `skipDirs` is a comma-separated raw string; an empty value is an
+        // explicit "skip nothing optional", not "unset" — resetProject restores
+        // the global fallback. Forced entries are never stored, so they cannot
+        // be removed by editing this field.
+        if (action === 'setSkipDirs') {
+          const p = url.searchParams.get('project')
+          const req = requireProject(p)
+          if (req.error) return json(res, 400, { ok: false, error: tLine('err.skip.needProject') })
+          // An absent parameter is a caller bug, not "empty": only an explicit
+          // empty value means "watch everything optional".
+          if (!url.searchParams.has('skipDirs')) {
+            return json(res, 400, { ok: false, error: tLine('err.skip.needValue') })
+          }
+          const raw = url.searchParams.get('skipDirs') || ''
+          // A project that is not in the effective set has no engines to bind:
+          // accepting it would create a phantom card from a typo'd path.
+          if (!known.has(req.abs.toLowerCase())) {
+            return json(res, 400, { ok: false, error: tLine('err.skip.unknownProject', { path: req.abs }) })
+          }
+          // Forced entries are dropped through the same normalization and case
+          // rule the matcher uses, so `node_modules/` or `Node_Modules` cannot be
+          // stored and echoed back. Duplicates collapse too.
+          const kept = []
+          for (const d of parseSkipList(raw)) {
+            if (FORCED_SKIP.some((f) => sameSkipEntry(f, d))) continue
+            if (kept.some((k) => sameSkipEntry(k, d))) continue
+            // An entry that normalizes to nothing (`/`, `//`, `./`) would be
+            // stored as '' and match nothing; drop it here so the input box never
+            // shows an empty or `", "` list.
+            const norm = normalizeSkipEntry(d)
+            if (!norm) continue
+            kept.push(norm)
+          }
+          const value = kept.join(', ')
+          const manual = store.manual.slice()
+          const i = manualIndex(req.abs)
+          const entry = normalizeProjectEntry({
+            path: req.abs,
+            lsp: knownLspOf(req.abs).map((e) => ({ engine: e })),
+            autoInject: knownAutoInjectOf(req.abs),
+            skipDirs: value,
+          })
+          if (i >= 0) manual[i] = entry
+          else manual.push(entry)
+          await persistManual(manual)
+          // No explicit watcher eviction: the resolved skip list is part of the
+          // watcher cache key, so the next ensureWatcher rebuilds it — and that
+          // path adopts the pending dirty/created/deleted sets instead of
+          // dropping them.
+          return json(res, 200, {
+            ok: true, project: req.abs, skipDirs: value,
+            effective: effectiveSkipDirs(entry, config.watchSkip),
+            forced: FORCED_SKIP,
+          })
         }
         // Incremental removal of one LSP from a project. Removing the last
         // engine yields an explicit empty list (do not inject); removing from
@@ -1382,7 +1529,7 @@ export function apply(ctx, config) {
           // Unknown project: legacy single-engine path.
           const ownExts = engineByBridge(bridge) ? engineByBridge(bridge).extensions : undefined
           let all = []
-          try { all = [...scanFiles(proj, config.watchSkip || DEFAULT_SKIP).keys()] } catch { /* ignore */ }
+          try { all = [...scanFiles(proj, skipDirsOf(proj)).keys()] } catch { /* ignore */ }
           const payload = await checkFiles(bridge, proj, all, 200_000, 'baseline', ownExts, undefined, enginePortOf(found.engineId, proj))
           return json(res, 200, {
             ok: true,
@@ -1485,10 +1632,11 @@ export function apply(ctx, config) {
     let touched = dirty
     try {
       const changedGd = dirty.filter((f) => f.toLowerCase().endsWith('.gd'))
-      // Watching skips addons/, but an addon script can reference a project
-      // class, so dependencies are resolved over the same file set the
-      // class_name index uses, addons included.
-      const depSkip = (config.watchSkip || DEFAULT_SKIP).filter((d) => d !== 'addons')
+      // A changed script can break the files that reference it, and the engine
+      // reports only on the file it is given: the dependent candidates come from
+      // the same file set the class_name index uses, so `addons` is released
+      // while every other configured skip still applies.
+      const depSkip = wideScanSkip(rec.path)
       const candidates = changedGd.length ? scanFiles(rec.path, depSkip, ['.gd']).keys() : []
       const dependents = changedGd.length ? dependentsOf(rec.path, changedGd, candidates) : []
       if (dependents.length) {
@@ -1503,7 +1651,9 @@ export function apply(ctx, config) {
     // project for that round instead of guessing which files to open.
     if ((structural.deleted || []).some((f) => f.toLowerCase().endsWith('.gd'))) {
       try {
-        const all = [...scanFiles(rec.path, config.watchSkip || DEFAULT_SKIP, ['.gd']).keys()]
+        // Same scope as the dependent candidates above: a deleted class_name can
+        // be referenced from an addon script, so `addons` is released here too.
+        const all = [...scanFiles(rec.path, wideScanSkip(rec.path), ['.gd']).keys()]
         touched = [...new Set([...touched, ...all])]
         trace('pre-step', agentId, `deleted script → project-wide recheck (${all.length} file(s))`)
       } catch (error) {
@@ -1687,7 +1837,7 @@ export function apply(ctx, config) {
     showToast('info', tLine('toast.baseline.running.title'), tLine('toast.baseline.running.body', { path: rec.path }), `lsp-echo-baseline:${key}`, 0)
     const scanAll = (eng) => {
       let out = []
-      try { out = [...scanFiles(rec.path, config.watchSkip || DEFAULT_SKIP, eng.extensions).keys()] } catch (e) { trace('baseline', 'scan failed', (e && e.message) || e) }
+      try { out = [...scanFiles(rec.path, skipDirsOf(rec.path), eng.extensions).keys()] } catch (e) { trace('baseline', 'scan failed', (e && e.message) || e) }
       return out
     }
     const noFilesDone = () => {

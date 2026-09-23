@@ -555,6 +555,7 @@ window.__ModuleLoader__.load({
         bridgeInfo: {},      // path -> 检测引擎桥结果(就地显示在项目卡里,不必去页顶找提示)
         enginePorts: {},     // engineId -> 编辑器 LSP 端口(仅含显式覆盖)
         engPortDraft: {},    // 引擎卡端口输入草稿 engineId -> string|''
+        skipDraft: {},       // 项目卡「跳过目录」输入草稿 path -> string
         busy: '',            // busy token(单飞行)
         note: null,
         newEngine: null,     // 添加项目引擎下拉
@@ -745,6 +746,41 @@ window.__ModuleLoader__.load({
           ? engineId + '::' + String(projectPath).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
           : engineId
       }
+      // 项目卡「跳过目录」:逗号分隔(Host 只按逗号切;分号/换行都算同一项的一部分)。
+      // 铁定跳过的目录(node_modules/.git/.godot 以及一切点目录)不进这个输入框
+      // —— 它们由 Host 强制附加,写进来也会被剔除。
+      function saveProjectSkip(path) {
+        if (s.busy) return
+        var drafts0 = s.skipDraft || {}
+        if (!Object.prototype.hasOwnProperty.call(drafts0, path)) return
+        var v = String(drafts0[path] || '')
+        set({ busy: 'skip:' + path })
+        apiGet('setSkipDirs', null, { project: path, skipDirs: v }).then(function (d) {
+          if (d && d.ok) {
+            var drafts = Object.assign({}, drafts0)
+            delete drafts[path] // 保存完回到「未编辑」态:回显已存值
+            // 保存会写一条 manual 覆盖,项目的 source 徽章随之变化,所以整列表重取。
+            // 重取失败时至少用本次响应把这一项patch 成新值,否则输入框和「生效:」
+            // 会退回保存前的旧值,而提示却说已保存。
+            apiGet('projects').then(function (r) {
+              var list
+              if (r && r.ok && r.projects) list = r.projects
+              else {
+                list = s.projects.map(function (x) {
+                  return x.path === d.project
+                    ? Object.assign({}, x, { skipDirs: d.skipDirs, effectiveSkip: d.effective })
+                    : x
+                })
+              }
+              set({
+                busy: '', skipDraft: drafts, projects: list,
+                note: noteOf('note.skip.saved', { skip: d.skipDirs || noteOf('note.skip.none') }),
+              })
+            })
+          } else set({ busy: '', note: (d && d.error) || noteOf('note.skip.fail') })
+        })
+      }
+
       function saveEnginePort(engineId, projectPath) {
         if (s.busy) return
         var key = portRowKey(engineId, projectPath)
@@ -1007,6 +1043,39 @@ window.__ModuleLoader__.load({
               title: T('settings.card.reset.title'),
               onClick: function () { doReset(p.path) },
             }, s.busy === 'reset:' + p.path ? T('settings.busy') : T('settings.card.reset')),
+          ]),
+          React.createElement('div', { key: 'skip', className: 'lspi-card-foot' }, [
+            React.createElement('span', { key: 'l', className: 'lspi-set-hint', style: { flex: 'none' } }, T('settings.card.skip.label')),
+            React.createElement('input', {
+              key: 'skipin', className: 'lspi-set-input', type: 'text',
+              style: { flex: '1 1 200px', minWidth: 140 },
+              placeholder: T('settings.card.skip.placeholder'),
+              value: (function () {
+                var d = s.skipDraft || {}
+                if (Object.prototype.hasOwnProperty.call(d, p.path)) return d[p.path]
+                return typeof p.skipDirs === 'string' ? p.skipDirs : ''
+              })(),
+              disabled: !!s.busy,
+              title: T('settings.card.skip.title', {
+                forced: ((p.forcedSkip || [])).join(', '),
+                effective: ((p.effectiveSkip || [])).join(', ') || T('note.skip.none'),
+              }),
+              onChange: function (ev) {
+                var nd = Object.assign({}, s.skipDraft)
+                nd[p.path] = ev.target.value
+                set({ skipDraft: nd })
+              },
+            }),
+            React.createElement('button', {
+              key: 'saveskip', type: 'button', className: 'lspi-set-btn',
+              disabled: !!s.busy || !Object.prototype.hasOwnProperty.call(s.skipDraft || {}, p.path),
+              title: T('settings.card.skip.save.title'),
+              onClick: function () { saveProjectSkip(p.path) },
+            }, s.busy === 'skip:' + p.path ? T('settings.busy') : T('settings.card.skip.save')),
+            // 输入框只显示「这个项目自己设的值」,空框既可能是继承全局、也可能
+            // 是显式清空,所以把当前实际生效的列表单独标出来。
+            React.createElement('span', { key: 'skipnow', className: 'lspi-set-hint', style: { flex: 'none' } },
+              T('settings.card.skip.effective', { list: ((p.effectiveSkip || [])).join(', ') || T('note.skip.none') })),
           ]),
           // 检测结果就地贴在这一行下面:按钮在哪,反馈就在哪
           (canBridge && s.bridgeInfo[p.path])

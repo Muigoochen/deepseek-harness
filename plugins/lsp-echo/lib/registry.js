@@ -27,7 +27,7 @@ export const EMPTY_STORE = { discovered: {}, manual: {} }
  * @param {number} [opts.maxDepth] descent depth cap below the root (default 4)
  * @returns {string[]} absolute project roots found (empty when no marker workspace)
  */
-export function scanProjectRoots(root, { markers = ['project.godot'], skipDirs = ['.git', '.godot', 'node_modules', 'addons', '.venv', 'dist', 'build', 'plugins', 'vendor', '.pnpm-store', '.dsh-build'], maxDepth = 4 } = {}) {
+export function scanProjectRoots(root, { markers = ['project.godot'], skipDirs = ['.git', '.godot', 'node_modules', 'dsh_echo_bridge', '.venv', 'dist', 'build', 'plugins', 'vendor', '.pnpm-store', '.dsh-build'], maxDepth = 4 } = {}) {
   const found = []
   const hasMarker = (dir) => markers.some((m) => m && fs.existsSync(path.join(dir, m)))
   const walk = (dir, depth) => {
