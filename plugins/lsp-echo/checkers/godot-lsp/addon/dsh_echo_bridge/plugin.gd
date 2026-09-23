@@ -44,6 +44,15 @@ const MAXIMUM_REQUEST_LENGTH: int = 256
 const UNSAVED_PREFIX: String = "unsaved:"
 const PROJECT_PREFIX: String = "project:"
 const STATE_PREFIX: String = "state:"
+const LSP_RELOCATE_PREFIX: String = "lsp-relocate:"
+## Prefix under which a project stores per-project editor setting overrides. The
+## language server reads its port through EditorSettings, which prefers this value.
+const OVERRIDE_PREFIX: String = "editor_overrides/"
+## Ports Godot itself may hold: the language server and debug adapter defaults and
+## the remote-debug port. A relocation skips them rather than taking one over.
+const GODOT_RESERVED_PORTS: Array = [6005, 6006, 6007]
+## How far a relocation walks upward from the configured port.
+const LSP_RELOCATE_SCAN: int = 16
 ## Bumped whenever the published record gains a field, so the DSH side can tell a
 ## stale addon copy (installed before the field existed) from a current one.
 const STATE_VERSION: int = 2
@@ -74,6 +83,11 @@ var _published_dap_port: int = -1
 var _published_listening: int = -1
 var _next_state_check_at: int = 0
 var _next_state_probe_at: int = 0
+## Whether this session installed a project-level port override it must remove.
+var _installed_override: bool = false
+## The automatic relocation runs once per session, so a port that stays unusable
+## cannot make the language server restart in a loop.
+var _lsp_relocate_checked: bool = false
 
 #endregion
 
@@ -110,6 +124,11 @@ func _exit_tree() -> void:
 	if _control_server != null:
 		_control_server.stop()
 		_control_server = null
+	# Drop a port override this session installed: it exists only to keep this run
+	# usable, and leaving it behind would rewrite the project's settings file with a
+	# machine-chosen port.
+	if _installed_override:
+		_restore_lsp_override()
 	# The published file is deliberately left behind. It holds one instance's
 	# record, and another engine opening this project overwrites it: removing it
 	# here would take that other instance's only record with it, which is how a
@@ -159,6 +178,11 @@ func _handle_request(request_line: String) -> void:
 		var answer: String = "yes\n" if _is_unsaved(script_path) else "no\n"
 		_peer_connection.put_data(answer.to_utf8_buffer())
 		return
+	if request_line.begins_with(LSP_RELOCATE_PREFIX):
+		var requested: String = request_line.substr(LSP_RELOCATE_PREFIX.length())
+		var requested_port: int = int(requested) if requested.is_valid_int() else 0
+		_peer_connection.put_data((_relocate_lsp(requested_port) + "\n").to_utf8_buffer())
+		return
 	match request_line:
 		"ping":
 			_peer_connection.put_data("pong\n".to_utf8_buffer())
@@ -172,6 +196,11 @@ func _handle_request(request_line: String) -> void:
 		"publish":
 			_probe_state()
 			_publish_state()
+			_peer_connection.put_data("ok\n".to_utf8_buffer())
+		"lsp-relocate":
+			_peer_connection.put_data((_relocate_lsp(0) + "\n").to_utf8_buffer())
+		"lsp-restore":
+			_restore_lsp_override()
 			_peer_connection.put_data("ok\n".to_utf8_buffer())
 		"rescan":
 			# The editor's own focus scan: registers newly created class_name scripts.
@@ -265,6 +294,13 @@ func _maybe_refresh_state() -> void:
 	if now >= _next_state_probe_at:
 		_next_state_probe_at = now + STATE_PROBE_MSEC
 		_probe_state()
+		# Nobody listens on the configured port: Godot's language server failed to
+		# bind it (the engine logs that and gives up instead of trying another port),
+		# so move it to a free one. Skipped when the port came from `--lsp-port`: that
+		# outranks the setting, which would make the override pointless.
+		if _published_listening == 0 and not _lsp_relocate_checked and not _lsp_port_overridden_by_cli():
+			_lsp_relocate_checked = true
+			print_debug("[dsh-echo-bridge] lsp relocate -> %s" % _relocate_lsp(0))
 		_publish_state()
 		return
 	if now < _next_state_check_at:
@@ -310,6 +346,105 @@ func _port_in_use(port: int) -> bool:
 ## @return: String
 func _project_root() -> String:
 	return ProjectSettings.globalize_path("res://")
+
+
+## 把编辑器语言服务器挪到一个空闲端口。
+##
+## 走的是引擎自己的三条公开链路,不改全局编辑器设置、也不落盘:
+##   1) 写项目级覆盖 editor_overrides/network/language_server/remote_port ——
+##      EditorSettings.get_setting() 优先读它;
+##   2) mark_setting_changed() 标记该组已变更 —— 否则语言服务器收到通知后会先
+##      检查"这组变了吗",没变就直接返回,根本不会重启;
+##   3) 请编辑器重新广播设置变更 —— 唯一的广播点(notify_changes)只被设置对话框
+##      的防抖回调调用,而该对话框是编辑器场景树里的标准节点、其方法绑定给脚本。
+## 任何一步不成立都退回原状并报错,由调用方决定降级方案。
+## @param requested_port: 指定端口;<=0 时自行从预设端口向上找
+## @return: String "ok:<端口>" 或 "err:<原因>"
+func _relocate_lsp(requested_port: int) -> String:
+	var settings: Object = EditorInterface.get_editor_settings()
+	if settings == null:
+		return "err no editor settings"
+	var target: int = requested_port if requested_port > 0 else _find_free_lsp_port()
+	if target <= 0:
+		return "err no free port"
+	if _port_in_use(target):
+		return "err port %d in use" % target
+	ProjectSettings.set_setting(OVERRIDE_PREFIX + LSP_PORT_SETTING, target)
+	settings.mark_setting_changed(LSP_PORT_SETTING)
+	if not _notify_editor_settings_changed():
+		# Without the notification the server keeps its old port, so leave no
+		# override behind: a later unrelated settings save would have persisted it.
+		ProjectSettings.set_setting(OVERRIDE_PREFIX + LSP_PORT_SETTING, null)
+		return "err cannot notify editor settings"
+	_installed_override = true
+	_published_listening = -1
+	_next_state_probe_at = Time.get_ticks_msec() + STATE_REFRESH_MSEC
+	_published_lsp_port = target
+	# Publish at once: the caller reads the record right after this reply, and the
+	# periodic refresh would leave it stale for a whole interval.
+	_publish_state()
+	return "ok:%d" % target
+
+
+## 摘掉本会话安装的端口覆盖,让语言服务器回到编辑器设置里的端口。
+## @return: void
+func _restore_lsp_override() -> void:
+	var settings: Object = EditorInterface.get_editor_settings()
+	ProjectSettings.set_setting(OVERRIDE_PREFIX + LSP_PORT_SETTING, null)
+	# Marking is what lets the language server's notification handler past its
+	# "did this group change?" guard; without it the server is left stopped instead
+	# of rebinding the configured port.
+	if settings != null:
+		settings.mark_setting_changed(LSP_PORT_SETTING)
+	_installed_override = false
+	_published_listening = -1
+	_next_state_probe_at = Time.get_ticks_msec() + STATE_REFRESH_MSEC
+	if not _notify_editor_settings_changed():
+		return
+	_published_lsp_port = _editor_port(LSP_PORT_SETTING)
+	_publish_state()
+
+
+## 请编辑器重新广播一次设置变更,这是语言服务器重读端口的前提。
+## @return: bool 是否成功触发
+func _notify_editor_settings_changed() -> bool:
+	var tree: SceneTree = get_tree()
+	if tree == null:
+		return false
+	for node in tree.root.find_children("*", "EditorSettingsDialog", true, false):
+		if node.has_method("_settings_changed"):
+			node.call("_settings_changed")
+			return true
+	return false
+
+
+## 从配置端口向上找第一个可用端口,跳过 Godot 自己可能占用的端口、本插件的控制端口
+## 区间,以及调试适配器端口。
+## @return: int 可用端口;找不到时为 0
+func _find_free_lsp_port() -> int:
+	var base: int = _editor_port(LSP_PORT_SETTING)
+	# An unset or out-of-range setting gives no meaningful port to walk from; the
+	# caller falls back to its own engine instead of us picking an arbitrary one.
+	if base <= 0:
+		return 0
+	var dap_port: int = _editor_port(DAP_PORT_SETTING)
+	for offset in range(1, LSP_RELOCATE_SCAN + 1):
+		var candidate: int = base + offset
+		if candidate > 65535:
+			return 0
+		if GODOT_RESERVED_PORTS.has(candidate) or candidate == dap_port:
+			continue
+		if candidate >= _control_port and candidate < _control_port + PORT_SCAN_COUNT:
+			continue
+		if not _port_in_use(candidate):
+			return candidate
+	return 0
+
+
+## 端口是否由 `--lsp-port` 显式指定(它优先于设置,覆盖就没意义了)。
+## @return: bool
+func _lsp_port_overridden_by_cli() -> bool:
+	return OS.get_cmdline_args().has("--lsp-port")
 
 
 ## 释放当前对端连接并清空接收缓冲。
