@@ -70,7 +70,7 @@ preset 压缩组（每 preset 一个 standing isolate realm，实例跨该 prese
 
 - GUI 引擎卡：当前引擎显示（调 director.getEngineInfo）、默认引擎下拉、本会话覆盖下拉；切完即时生效提示；instant 档案说明 + recall 工具指引 + patch 片段。
 - estimate/evaluate/预算/提醒逻辑全部不变（tokenMeter 口径与引擎无关）。
-- 楼层默认选区：**这是策略层新逻辑，不是引擎默认行为**——两引擎的 `selectCompactableRange` 默认都从表面开头（`surface[0]`，含旧 checkpoint）选起；frontier 起点（"最后一个 checkpoint 之后"）由 conversation-summary 的 `compactableSpan` 实现（现亦从 surface[0] 起，需改成 checkpoint 感知起点）。显式传 `(start,end)` 时引擎照做。
+- 楼层默认选区：**这是策略层新逻辑，不是引擎默认行为**——两引擎的 `selectCompactableRange` 默认都从表面开头（含旧 checkpoint）选起（新版把节点 0 的 system prompt 排除在范围外，仍是"从头"）；frontier 起点（"最后一个 checkpoint 之后"）由 conversation-summary 的 `compactableSpan` 实现（现亦从头起，需改成 checkpoint 感知起点）。显式传 `(start,end)` 时引擎照做。
 - 引擎盖印：压缩归档时记录 checkpoint → {引擎档案, provider/model, 起始楼层}（compaction/summary 优先，回退 director 身份）。
 
 ### 3.4 GUI（设置 → 会话压缩，新增/扩展）
@@ -103,7 +103,7 @@ preset 压缩组（每 preset 一个 standing isolate realm，实例跨该 prese
 | b | director 需实现的对外方法面 | 读 dsh-compaction 的 Service/Engine 契约（abstract = compactIfNeeded/compactNow/compactRegion）与 `/compact` 消费点；并核对 **/compact、策略层、溢出恢复三个入口都走 seat**（无旁路直连旧引擎） | 方法清单齐全；无旁路 |
 | c | auto 关闭路径 | 两引擎 Config 校验（不显式传则默认 true） | `auto:false` 均被接受且不注册 pre-step/request-error 监听 |
 | d | 会话覆盖存储选型 | settings 命名空间按 sessionId 键 + 宿主写通道/表状 schema | 可 GUI 读写、文件热发布、不破坏回放 |
-| e | frontier 起点受尊重 | instant 已可读（region.js selectCompactableRange 默认 surface[0]）；basic 读 region.ts（同）——两者默认**都含旧 checkpoint**，frontier 是策略层新起点 | 显式传 `start=frontier` 时两引擎照做、不改动其前节点（勿写"引擎默认一致"） |
+| e | frontier 起点受尊重 | instant 已可读（region.js selectCompactableRange 默认从头）；basic 读 region.ts（同，新版跳过节点 0 的 system prompt）——两者默认**都含旧 checkpoint**，frontier 是策略层新起点 | 显式传 `start=frontier` 时两引擎照做、不改动其前节点（勿写"引擎默认一致"） |
 | f | 热换语义 | director 每次实时查表 + 实测 GUI 切换后下一压缩生效 | 切换无需重启 |
 | g | 事件/持久化由子引擎直发 | 构造探针跑一次压缩 | compaction/start\|summary\|end\|prune 落日志、UI 检查点行正常 |
 | h | 现有会话重启后是否重挂 director | 改 preset 行后重启 dsh web，观察本文档所在会话等既有会话座位 | 明确"重挂 / 不重挂"，据此定接入说明 |

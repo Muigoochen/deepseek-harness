@@ -60,8 +60,9 @@ powershell -ExecutionPolicy Bypass -File install\install.ps1
 
 脚本用 DSH 官方方式安装本包：`dsh plugin --profile web add <本包路径>`，由它把包链入 profile 并登记为
 依赖与 bundle，随后自检宿主半能否导入、浏览器半是否合法。**不再复制文件**，安装后 profile 通过 `link:`
-指向本目录，改完源码直接生效。web profile 组合是 **live 热应用**：web 正在运行时保存即生效（宿主半），
-无需为宿主逻辑重启；要看到设置页等客户端界面，需**刷新页面**做确定性验证。
+指向本目录，改完源码直接生效。生效方式分两种：`cordis.patch.yml` 里的**配置**是 live 热应用，保存即生效；
+`lib/index.js` 里的**宿主半代码**要先重启一次 `dsh web`（重启时按 `link:` 加载新代码）；设置页等客户端界面
+改动需**刷新页面**做确定性验证。
 
 本包贡献的配置层在包根的 `cordis.patch.yml`（只有 id 与 name）；profile 自己那份
 `$DSH_HOME\profiles\web\cordis.patch.yml` 在同 id 上后应用、会覆盖它，所以预算与触发设置写在那里。
@@ -81,6 +82,45 @@ powershell -ExecutionPolicy Bypass -File install\install.ps1
 
 页面数据只读真源是宿主：GET `/conversation-summary/config`（当前生效配置）；改动仅停留在页面草稿，不会偷偷改运行态。
 
+## 自诊断（GET `/conversation-summary/diagnostics`）
+
+宿主半为每个会话保留最近一次判定快照，并在预算过半后每变化 5k tokens 往宿主日志打一条
+`conversation-summary: decision …`。遇到"该压没压"，先查这个接口，不必翻终端：
+
+```powershell
+(Invoke-WebRequest http://127.0.0.1:3080/conversation-summary/diagnostics -UseBasicParsing).Content
+```
+
+返回 `{mode, budget, retain, budgetScope, decisions:[…]}`；每条含 `time / action / engine / conversation /
+envelope / budget / aboveBudget / compactable / span / surfaceNodes / weightedNodes / retain / planExited`。
+`action` 直接给出结论：
+
+| `action` | 含义 |
+|---|---|
+| `compacted:N` | 本次压掉 N tokens（成功） |
+| `skip:engine-unavailable` | 该会话 preset 没挂压缩引擎（`ctx.compaction`） |
+| `skip:no-compactable-range` | 已超预算，但按保留尾部与工具配对选不出可压范围 |
+| `failed:<原因>` | 调用抛错，原因原文（例如新版 API 变更） |
+| `below-budget` / `hint:…` | 未到点或 hint 模式判定 |
+
+注意 `conversation` 是本插件的预算口径（对话本体），与 GUI 上的数字（完整请求信封）**不相等**；两者一起看
+才能区分"口径确实没超"与"该压却没压成"。
+
+## 版本兼容（Session API 漂移）
+
+产品处于 pre-stable，Session API 变过一次，本插件同时适配新旧：
+
+| 用途 | 旧版 | 新版（0.1.6-alpha.2 起） |
+|---|---|---|
+| 读事件日志 | `session.events`（数组） | `session.snapshotEvents()` / `session.eventAt(seq)` |
+| 按事件取消息 | `event.data.message` | `session.deriveEventMessage(event)` |
+| 压缩范围起点 | 直接取 `surface[0]` | **跳过节点 0 的 system prompt**：`firstIdx = 节点 0 是 system/message ? 1 : 0` |
+
+包内 `sessionEvents()` / `eventAtSeq()` 是兼容取值（新版优先），两种版本都能跑。取错事件日志会让每步抛
+`session.events is not iterable`；少跳过 system head 会被引擎拒绝并抛 `surface replace: node 0 holds the
+system prompt and may be rewritten only by a system/message over exactly that node`。两者都会让自动压缩
+**整体静默失效**（表现为对话一路涨、从不压缩），根因看上面的自诊断 `action`。
+
 ## 已知限制（v0）
 
 - checkpoint 模板为引擎内置英文 8 节结构，暂不可配置（中文/自定义模板=v1，子类化引擎）。
@@ -92,3 +132,4 @@ powershell -ExecutionPolicy Bypass -File install\install.ps1
 - `mode: auto` 与内置引擎的 80% 阈值自动压缩并存时，理论上可能在同一请求步先后各压一次（两个 checkpoint）；预算明显低于 80%×上下文窗时不发生。介意可二选一（关引擎 auto 或本插件用 `hint`）。
 - 运行依赖：需 profile 环境已具备 `zod`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-compaction`（install.ps1 只部署本包、不安装依赖）。
 - 提醒、estimate 均不含系统提示/注入的成本，实际省钱要叠加 `envelope` 一起看。
+- `agent/pre-step` 里抛的错会被 catch 掉（不打断你的对话），所以**失败不会弹到你面前**：表现出来就是"该压没压"。先查 `/conversation-summary/diagnostics` 的 `action=failed:<原因>`。
