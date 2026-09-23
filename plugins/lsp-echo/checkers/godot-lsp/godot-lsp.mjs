@@ -648,7 +648,17 @@ async function ensureHost(project, godotBin, flags) {
     const child = spawn(
       godotBin,
       ['--path', project, '--editor', '--headless', '--no-window', '--lsp-port', String(port), '--dap-port', String(dapPort)],
-      { detached: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }
+      {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        // Godot consumes --lsp-port/--dap-port before scripts run (a probe shows the
+        // addon only ever sees `--editor`/`--no-window`), so the bridge addon inside
+        // this engine cannot read them from OS.get_cmdline_args(). Exporting the same
+        // values lets the addon publish the port this engine actually serves, which
+        // is what lets the host tell its own engine from the user's editor.
+        env: { ...process.env, DSH_ECHO_LSP_PORT: String(port), DSH_ECHO_DAP_PORT: String(dapPort) },
+      }
     );
     child.stdout.on('data', (d) => logStream.write(d));
     child.stderr.on('data', (d) => logStream.write(d));

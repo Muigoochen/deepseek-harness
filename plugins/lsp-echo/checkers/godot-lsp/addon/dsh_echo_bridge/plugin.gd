@@ -61,6 +61,16 @@ const STATE_VERSION: int = 2
 ## `editor_overrides/<name>` value — that is where a relocated port lives.
 const LSP_PORT_SETTING: String = "network/language_server/remote_port"
 const DAP_PORT_SETTING: String = "network/debug_adapter/remote_port"
+## Command-line flags that override those settings inside the engine. Their value
+## wins over the setting, and scripts cannot read the engine's `port_override`
+## variable — but the launcher can export the same value, which scripts do see.
+const LSP_PORT_FLAG: String = "--lsp-port"
+const DAP_PORT_FLAG: String = "--dap-port"
+## Environment variables a launcher sets alongside those flags. Godot consumes most
+## engine flags before scripts run (an isolated run exposes only `--editor` and
+## `--no-window`), so the environment is the only reliable channel.
+const LSP_PORT_ENV: String = "DSH_ECHO_LSP_PORT"
+const DAP_PORT_ENV: String = "DSH_ECHO_DAP_PORT"
 ## How often the recorded port facts are compared against the editor settings.
 const STATE_REFRESH_MSEC: int = 5000
 ## How often the listening port is probed. The probe briefly binds the port, so it
@@ -249,14 +259,20 @@ func _listen_on_first_free_port(base_port: int) -> void:
 ## 实例自己读到的值才是准的(调用方从外面猜不出来)。
 ## @return: String 单行 JSON(控制协议按行分帧,不能带换行)
 func _state_json() -> String:
-	var lsp_port: int = _editor_port(LSP_PORT_SETTING)
+	var launched_lsp: int = _launch_port(LSP_PORT_ENV, LSP_PORT_FLAG)
+	var lsp_port: int = _lsp_port()
+	var dap_port: int = _dap_port()
 	var record: Dictionary = {
 		&"version": STATE_VERSION,
 		&"port": _control_port,
 		&"pid": OS.get_process_id(),
 		&"project": _project_root(),
 		&"lspPort": lsp_port,
-		&"dapPort": _editor_port(DAP_PORT_SETTING),
+		# True when this instance was started with an explicit port (the headless
+		# engines this plugin starts), false when it follows the editor settings (the
+		# user's editor). A caller needs that to tell the two apart.
+		&"lspFromLaunch": launched_lsp > 0,
+		&"dapPort": dap_port,
 	}
 	# 探测结果一旦拿到就一直带着:否则后续刷新会把已发布的事实抹掉,读取方看到
 	# 的记录会自相矛盾。
@@ -265,17 +281,67 @@ func _state_json() -> String:
 	return JSON.stringify(record)
 
 
+## 生效的 LSP 端口:启动时显式指定优先,其次是编辑器设置。
+##
+## `port_override` 是引擎里的静态变量、脚本读不到,但它优先于设置,所以不认启动端口
+## 就会把实际端口报成设置里的旧值 —— 本插件自起的 headless 引擎正是这种情形。
+## @return: int 端口号;都没有时为 0
+func _lsp_port() -> int:
+	var launched: int = _launch_port(LSP_PORT_ENV, LSP_PORT_FLAG)
+	return launched if launched > 0 else _editor_port(LSP_PORT_SETTING)
+
+
+## 生效的 DAP 端口(同上)。
+## @return: int 端口号;都没有时为 0
+func _dap_port() -> int:
+	var launched: int = _launch_port(DAP_PORT_ENV, DAP_PORT_FLAG)
+	return launched if launched > 0 else _editor_port(DAP_PORT_SETTING)
+
+
+## 启动时显式指定的端口(环境变量优先,其次命令行)。
+## @param env_name: 启动器设置的环境变量名
+## @param flag: 形如 "--lsp-port" 的开关名
+## @return: int 端口;未指定或不是合法端口时为 0
+func _launch_port(env_name: String, flag: String) -> int:
+	var from_env: String = OS.get_environment(env_name)
+	if from_env.is_valid_int():
+		var port: int = int(from_env)
+		if port > 0 and port <= 65535:
+			return port
+	return _cli_port(flag)
+
+
+## 命令行显式指定的端口。
+##
+## Godot 在脚本运行前就消费掉了自己的开关,实测 `OS.get_cmdline_args()` 只剩
+## `["--editor", "--no-window"]`,所以正常路径拿不到 —— 保留它是为了某些确实会把
+## 参数透出来的构建,真正的通道是 _launch_port 的环境变量。
+## @param flag: 形如 "--lsp-port" 的开关名
+## @return: int 该开关后面的端口;未出现或不是合法端口时为 0
+func _cli_port(flag: String) -> int:
+	var args: PackedStringArray = OS.get_cmdline_args()
+	for index in range(args.size() - 1):
+		if args[index] != flag:
+			continue
+		var raw: String = args[index + 1]
+		if raw.is_valid_int():
+			var port: int = int(raw)
+			if port > 0 and port <= 65535:
+				return port
+	return 0
+
+
 ## 探测 LSP 端口是否有人监听,并记住结果。
 ## @return: void
 func _probe_state() -> void:
-	_published_listening = 1 if _port_in_use(_editor_port(LSP_PORT_SETTING)) else 0
+	_published_listening = 1 if _port_in_use(_lsp_port()) else 0
 
 
 ## 把端口事实写进 .godot/dsh_echo_bridge.json,DSH 侧默认从这里读。
 ## @return: void
 func _publish_state() -> void:
-	_published_lsp_port = _editor_port(LSP_PORT_SETTING)
-	_published_dap_port = _editor_port(DAP_PORT_SETTING)
+	_published_lsp_port = _lsp_port()
+	_published_dap_port = _dap_port()
 	var state_file: FileAccess = FileAccess.open(_state_file_path, FileAccess.WRITE)
 	if state_file == null:
 		push_warning("[dsh-echo-bridge] cannot publish state to %s" % _state_file_path)
@@ -306,7 +372,7 @@ func _maybe_refresh_state() -> void:
 	if now < _next_state_check_at:
 		return
 	_next_state_check_at = now + STATE_REFRESH_MSEC
-	if _editor_port(LSP_PORT_SETTING) != _published_lsp_port or _editor_port(DAP_PORT_SETTING) != _published_dap_port:
+	if _lsp_port() != _published_lsp_port or _dap_port() != _published_dap_port:
 		_publish_state()
 
 
@@ -401,7 +467,7 @@ func _restore_lsp_override() -> void:
 	_next_state_probe_at = Time.get_ticks_msec() + STATE_REFRESH_MSEC
 	if not _notify_editor_settings_changed():
 		return
-	_published_lsp_port = _editor_port(LSP_PORT_SETTING)
+	_published_lsp_port = _lsp_port()
 	_publish_state()
 
 
@@ -422,12 +488,12 @@ func _notify_editor_settings_changed() -> bool:
 ## 区间,以及调试适配器端口。
 ## @return: int 可用端口;找不到时为 0
 func _find_free_lsp_port() -> int:
-	var base: int = _editor_port(LSP_PORT_SETTING)
+	var base: int = _lsp_port()
 	# An unset or out-of-range setting gives no meaningful port to walk from; the
 	# caller falls back to its own engine instead of us picking an arbitrary one.
 	if base <= 0:
 		return 0
-	var dap_port: int = _editor_port(DAP_PORT_SETTING)
+	var dap_port: int = _dap_port()
 	for offset in range(1, LSP_RELOCATE_SCAN + 1):
 		var candidate: int = base + offset
 		if candidate > 65535:
@@ -444,7 +510,7 @@ func _find_free_lsp_port() -> int:
 ## 端口是否由 `--lsp-port` 显式指定(它优先于设置,覆盖就没意义了)。
 ## @return: bool
 func _lsp_port_overridden_by_cli() -> bool:
-	return OS.get_cmdline_args().has("--lsp-port")
+	return _launch_port(LSP_PORT_ENV, LSP_PORT_FLAG) > 0
 
 
 ## 释放当前对端连接并清空接收缓冲。
