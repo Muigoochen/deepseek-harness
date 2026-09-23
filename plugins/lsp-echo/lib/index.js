@@ -1780,6 +1780,14 @@ export function apply(ctx, config) {
   const baseline = new Map() // projectLower -> state
   const baselineKey = (rec) => rec.path.toLowerCase()
   const B_START = '[lsp-echo] 正在做首次全量编译诊断，完成后我会汇报结果。'
+  // TODO(baseline-lag): a cold engine answers "no diagnostics" before it has finished
+  // its first project import, so this summary can report "0 个编译错误" while broken
+  // scripts sit on disk, and report them only in a later round. Observed on the first
+  // baseline after enabling: two hard syntax errors present, "扫描 29 个文件，0 个编译错误",
+  // with the four errors arriving afterwards. Until this waits for the engine's first
+  // scan to settle (or retries until the reported file set stops growing), the result is
+  // a first signal, not a gate — a caller must not treat "0 errors" here as a pass.
+  // See README「已知问题」.
   const baselineDoneText = (payload, scanned) => {
     const s = payload && payload.summary
     const errs = s ? s.errors : 0
