@@ -90,6 +90,7 @@ window.__ModuleLoader__.load({
       '.lspi-btn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.06));}',
       '.lspi-btn:disabled{opacity:.5;cursor:default;}',
       '.lspi-sum{flex:1;min-width:0;text-align:right;font-size:12px;opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+      '.lspi-hint{padding:7px 12px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.06));font-size:12px;line-height:1.5;background:var(--dsw-alias-bg-layer-3,rgba(128,128,128,.08));opacity:.85;}',
       '.lspi-body{flex:1;min-height:0;overflow:auto;padding:6px 0 10px;}',
       '.lspi-status{padding:18px 14px;text-align:center;opacity:.65;font-size:13px;}',
       '.lspi-file{margin:4px 8px 0;}',
@@ -404,6 +405,18 @@ window.__ModuleLoader__.load({
         summaryText = T('overlay.reading')
       }
 
+      // 为什么还在用自己的引擎:状态里带回了编辑器端口/桥启用的事实,这里只给结论
+      var hintText = ''
+      if (mode === 'headless' && st) {
+        var ed = st.editor || {}
+        var br = st.bridge || {}
+        var portText = String(ed.port || 6005)
+        if (br.installed && !br.enabled) hintText = T('overlay.note.headless.bridgeOff')
+        else if (ed.instance) hintText = T('overlay.note.headless.nextCheck')
+        else if (ed.listening) hintText = T('overlay.note.headless.bridgeStale', { port: portText })
+        else hintText = T('overlay.note.headless.portDead', { port: portText })
+      }
+
       // 组装按文件分组的行
       var fileRows = []
       if (diag && diag.files) {
@@ -532,7 +545,7 @@ window.__ModuleLoader__.load({
         style: stylePos,
         role: 'dialog',
         'aria-label': T('overlay.label'),
-      }, [head, tools, body])
+      }, [head, tools, hintText ? React.createElement('div', { key: 'hint', className: 'lspi-hint' }, hintText) : null, body])
     }
 
     // ============================================================

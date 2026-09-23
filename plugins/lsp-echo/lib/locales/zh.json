@@ -108,6 +108,16 @@
     "已装到 {path}。",
     "重启该项目的 Godot 编辑器后,未保存守卫与新脚本类名识别生效。"
   ],
+  "toast.addon.enabled.title": "引擎桥已启用(此前只是被复制进项目)",
+  "toast.addon.enabled.body": [
+    "已在 {path} 的 project.godot 里补上启用项 —— 之前 addon 文件在,但 Godot 从未加载它,所以编辑器里的实例无法上报端口。",
+    "重启该项目的 Godot 编辑器后生效。"
+  ],
+  "toast.addon.failed.title": "引擎桥启用失败",
+  "toast.addon.failed.body": [
+    "已把 addon 复制到 {path},但没能写进 project.godot 的启用项:{reason}",
+    "编辑器里的实例因此在修好之前不会上报端口;修好后(或在 Godot「项目设置 → 插件」里手动启用)插件会重试,5 分钟内不再重复尝试。"
+  ],
   "toast.ready.title": "lsp-echo 已就绪",
   "toast.ready.body": "已登记 {count} 个 Godot 项目(引擎:{engines})",
   "toast.discovered.title": "lsp-echo 自动发现",
@@ -152,6 +162,10 @@
   "overlay.mode.off": "已停止",
   "overlay.mode.running": "运行中",
   "overlay.summary": "{files} 文件 · {err} 错误 · {warn} 警告",
+  "overlay.note.headless.portDead": "独立引擎在跑:编辑器端口 {port} 上没有监听 —— 编辑器可能没开,或它的 LSP 端口与这里配置的不一致。",
+  "overlay.note.headless.bridgeOff": "独立引擎在跑:引擎桥已复制进项目但未在 project.godot 里启用,编辑器里的实例无法上报端口(插件会尝试补上启用;补写失败时会另有提示)。",
+  "overlay.note.headless.bridgeStale": "独立引擎在跑:端口 {port} 有响应,但没有实例上报端口 —— 桥没被编辑器加载,或版本过旧。重启 Godot 编辑器后重试。",
+  "overlay.note.headless.nextCheck": "独立引擎在跑,但编辑器在线:下次检查(发消息,或点「全量重扫」)会接入它并停掉独立引擎。",
   "overlay.fileCount.error": "{n} 错误",
   "overlay.fileCount.warning": "{n} 警告",
   "toast.rescan.title": "{engine} 引擎未刷新",

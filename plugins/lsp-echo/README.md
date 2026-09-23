@@ -193,6 +193,7 @@ node "$env:DSH_HOME\profiles\web\node_modules\@dsh-user\lsp-echo\checkers\godot-
   (`editor attach` = 附加你的编辑器 / `headless`)+ 工具条(**刷新 / 全量重扫 / 启动引擎 / 停止**)+
   摘要(`501 files · 0 err · 8 warn`)+ 按文件分组的 error/warning(点文件名展开详情,
   `.gdshader` 显示 `engine_note`);
+- 徽章显示「独立引擎」时,浮层顶部会说明原因(编辑器端口没监听 / 桥已复制但未启用 / 端口有响应但没实例上报 / 编辑器在线但还没检查),不让你猜;
 - ESC 或点浮层外关闭;非项目会话不显示图标(零打扰)。
 
 **设置页**(设置面板 → "LSP 诊断"):项目为主的卡片列表 ——
@@ -202,6 +203,10 @@ node "$env:DSH_HOME\profiles\web\node_modules\@dsh-user\lsp-echo\checkers\godot-
   多项目路由都不依赖它),但缺了它会退化三处:新建 `class_name` 脚本首轮误报未知类型、改动后的自愈重检不触发、
   且「改动后刷新」失去「该脚本有无未保存改动」的守卫(会覆盖你正在编辑的内容)。关掉后仍可用项目卡的
   「安装 Godot 引擎桥」按钮手动安装——**重复安装即覆盖更新/修复**;
+  开关开启时,自动安装**不只看文件是否存在**:项目里 addon 文件在、而 `project.godot` 里没有启用项
+  (Godot 从未加载它 → 编辑器里的实例无法上报端口 → 项目永远接不上你的编辑器、只能一直用独立引擎)也会被补上启用;
+  时机是**打开该项目的会话**与每次检查前,并浮窗提示重启 Godot 编辑器;补写失败会**明确报错**并按项目冷却 5 分钟再试
+  (避免每次检查都重抄 addon、重发提示、并把下一轮要用的引擎停掉);注入关掉的项目不会被改写;
 - 每张项目卡 = 项目目录名 + 已绑定引擎 chips(✕ 移除)+ 常驻**手动添加引擎**下拉/按钮 +
   **安装 Godot 引擎桥 / 检测 Godot 引擎桥**(见「引擎桥」)+ **智能配置**(扫描项目补缺失引擎,只补充不覆盖)+ 还原种子/移除手动配置;
 - **登记行**:从 **DSH 工作区项目下拉**选择登记(已登记的选项禁用,含无 GDScript 的
@@ -215,6 +220,7 @@ node "$env:DSH_HOME\profiles\web\node_modules\@dsh-user\lsp-echo\checkers\godot-
 (action:`projects|engines|config|enginePort|addCandidates|smart|setProject|addLsp|delLsp|resetProject|delProject|host|stop|status|baseline|diagnostics|installAddon|bridgeStatus|locales|setLocale`)。
 **有副作用的 action 必须带 `x-dsh-lsp-echo: 1` 头**(`installAddon`/`smart`/`setProject`/`addLsp`/`delLsp`/`resetProject`/`delProject`/`baseline`/`host`/`stop`,以及带参数的 `config`/`enginePort`/`setLocale`):
 浏览器不会给跨站请求附加自定义头,因此别的网页无法让 DSH 写你的项目、停你的引擎,也无法改掉浮窗提示所用的语言;只读 action(`projects`/`engines`/`diagnostics`/`status`/`addCandidates`/`bridgeStatus`/`locales`)不设门。
+`status` 另带 `editor`/`bridge` 事实(端口是否有监听、是否有实例上报端口、桥是否已装/已启用),供浮层解释「为什么还在用独立引擎」;其中端口取桥自己报的探测目标(设置 → 引擎配置 → 默认),因此和真正会去连的端口一致;引擎副本过旧、状态行里没有该字段时回退到设置值或默认 6005(只影响这一行提示)。
 详见 `docs/design.md` §8。
 
 ## 多语言(中 / 英)
@@ -316,6 +322,8 @@ addon 在本机 `127.0.0.1` 上监听一个控制端口,把一行 `rescan` 变�
 **2. addon 要更新到当前版本才会上报端口事实**
 
 旧副本答不了 `state`(回 `err unknown command`),插件会回退到"按配置端口尽力而为"的模式。更新:设置页 → 项目卡 →**安装 Godot 引擎桥**(它同时就是更新),然后重启该项目的 Godot 编辑器让它加载。
+
+另外,「addon 文件在、但 Godot 没加载它」这种半装状态现在会被自动补上启用项(见「引擎桥」一节),并浮窗提示重启编辑器;此前它是完全无声的 —— 表现为「你的编辑器和插件的独立引擎同时跑着,而徽章一直是独立引擎」。
 
 **3. 编辑器 LSP 端口与 Godot 自己的 DAP 默认端口(6006)冲突**
 

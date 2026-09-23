@@ -20,7 +20,7 @@ import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { engines, markers, matchExtension } from './checkers.js'
 import { ensureHost, stopHost, status, checkFiles, runtimeRoot, stopClientd, diagnosticsPath, pruneSnapshot, rescanEngine, setReservedPorts } from './manager.js'
-import { ADDON_ID, discoverBridgePortAsync, installAddonInto, probeEngineBridge, rescanPortOf } from './addon.js'
+import { ADDON_ID, addonResPath, discoverBridgePortAsync, installAddonInto, isEditorPluginEnabled, probeEngineBridge, probePortOpen, readBridgeInstances, rescanPortOf } from './addon.js'
 import { dependentsOf } from './dependents.js'
 import { ProjectWatcher, normalizeSkipEntry, sameSkipEntry, scanFiles } from './watcher.js'
 import { registerTool } from './tool.js'
@@ -114,6 +114,12 @@ const FORCED_SKIP = ['node_modules', '.git', '.godot']
 // skipped — it is copied in by this plugin and its churn is not authored work.
 const DEFAULT_OPTIONAL_SKIP = [`addons/${ADDON_ID}`]
 const DEFAULT_SKIP = [...FORCED_SKIP, ...DEFAULT_OPTIONAL_SKIP]
+
+/** `res://` path of the engine bridge addon's plugin.cfg inside a project. */
+const ADDON_RES_PATH = addonResPath()
+
+/** Editor LSP port a Godot editor serves on unless its own settings say otherwise. */
+const DEFAULT_EDITOR_PORT = 6005
 
 /**
  * Parse a comma-separated skip list from the settings GUI.
@@ -456,8 +462,12 @@ export function apply(ctx, config) {
   }
   /** Auto-install the engine bridge addon: settings toggle when set, else on. */
   const globalAutoAddon = () => (typeof store.autoInstallAddon === 'boolean' ? store.autoInstallAddon : true)
+  /** How long a failed bridge install/enable is left alone before it is retried. */
+  const ADDON_REPAIR_COOLDOWN_MS = 5 * 60_000
+  const addonRepairFailures = new Map() // projectLower -> last failure time
+  const addonRepairs = new Map() // projectLower -> in-flight repair
   /**
-   * Install the engine bridge addon into a project that lacks it.
+   * Install or enable the engine bridge addon of a project that needs it.
    *
    * Without the addon a running engine cannot be asked to rescan, so the first
    * check of a newly created `class_name` script reports an unknown type, and
@@ -465,24 +475,54 @@ export function apply(ctx, config) {
    * overwriting an editor buffer. Installing is idempotent — the directory is
    * copied over — so a manual install doubles as an update.
    *
-   * The check is one existsSync per round on a project bound to an engine that
-   * ships an addon, so calling it before every check stays cheap.
+   * A project whose addon files exist but whose project.godot never enabled them is
+   * repaired here too: that half-state leaves a running editor invisible to this
+   * plugin (it cannot report its LSP port), and an existence check alone finds
+   * nothing to do. A failure is retried only after ADDON_REPAIR_COOLDOWN_MS, so an
+   * unwritable or malformed project.godot cannot make every check re-copy, re-toast
+   * and restart the engine. Overlapping triggers (a conversation opening while a
+   * check runs) share one attempt per project: the copy writes a fixed temp path, so
+   * two interleaved attempts would race the rename and report a spurious failure.
    * @param {{ path: string, lsp?: Array<{ engine: string }> }} rec project record
-   * @returns {Promise<boolean>} true when the addon was installed this call
+   * @returns {Promise<boolean>} true when the addon was installed or enabled this call
    */
-  const ensureEngineBridge = async (rec) => {
+  const ensureEngineBridge = (rec) => {
+    const key = rec.path.toLowerCase()
+    const running = addonRepairs.get(key)
+    if (running !== undefined) return running
+    const attempt = repairEngineBridge(rec, key).finally(() => { addonRepairs.delete(key) })
+    addonRepairs.set(key, attempt)
+    return attempt
+  }
+  /** One repair attempt; {@link ensureEngineBridge} owns single-flight and caching. */
+  const repairEngineBridge = async (rec, key) => {
     if (!globalAutoAddon()) return false
     const eng = (rec.lsp || []).map((x) => engine(x.engine)).find((e) => e && e.rescan && e.addon)
     if (!eng) return false
-    if (fs.existsSync(path.join(rec.path, 'addons', ADDON_ID, 'plugin.gd'))) return false
+    const installed = fs.existsSync(path.join(rec.path, 'addons', ADDON_ID, 'plugin.gd'))
+    if (installed && isEditorPluginEnabled(rec.path, ADDON_RES_PATH)) {
+      // The half-state is gone — fixed here earlier or outside the plugin: stop
+      // counting it so a later failure is not held back by an old cooldown.
+      addonRepairFailures.delete(key)
+      return false
+    }
+    const failedAt = addonRepairFailures.get(key)
+    if (failedAt !== undefined && Date.now() - failedAt < ADDON_REPAIR_COOLDOWN_MS) return false
     try {
       const r = installAddonInto(rec.path, eng)
-      if (!r.ok) {
-        trace('addon', `${rec.path}: auto install failed: ${r.error || 'unknown'}`)
+      if (!r.ok || r.enabled !== true) {
+        addonRepairFailures.set(key, Date.now())
+        trace('addon', `${rec.path}: engine bridge ${installed ? 'enable repair' : 'install'} failed (enabled=${r.enabled}): ${r.error || 'unknown'}`)
+        showToast('error', tLine('toast.addon.failed.title'), tLine('toast.addon.failed.body', { path: rec.path, reason: r.error || '' }), 'lsp-echo-addon', 9000)
         return false
       }
-      trace('addon', `${rec.path}: engine bridge installed (enabled=${r.enabled})`)
-      showToast('success', tLine('toast.addon.title'), tLine('toast.addon.body', { path: rec.path }), 'lsp-echo-addon', 9000)
+      addonRepairFailures.delete(key)
+      trace('addon', `${rec.path}: engine bridge ${installed ? 'enablement repaired' : 'installed'} (enabled=true)`)
+      if (installed) {
+        showToast('warning', tLine('toast.addon.enabled.title'), tLine('toast.addon.enabled.body', { path: rec.path }), 'lsp-echo-addon', 9000)
+      } else {
+        showToast('success', tLine('toast.addon.title'), tLine('toast.addon.body', { path: rec.path }), 'lsp-echo-addon', 9000)
+      }
       // A headless engine already running predates the addon; stop it so the
       // next check starts one that loads the addon. The user's editor is never
       // touched — its addon loads when the editor restarts.
@@ -1541,7 +1581,12 @@ export function apply(ctx, config) {
         if (action === 'host') r = await ensureHost(bridge, proj, enginePortOf(found.engineId, proj))
         else if (action === 'stop') r = await stopHost(bridge, proj)
         else if (action === 'status') {
-          r = await status(bridge, proj)
+          const rec = known.get(path.resolve(proj).toLowerCase())
+          const editorPort = enginePortOf(found.engineId, proj)
+          // The editor port travels with the call: the bridge reports back the port it
+          // would attach on, which is the settings override, the machine config, or the
+          // default — not something this side can infer.
+          r = await status(bridge, proj, editorPort)
           // Structured mode for the GUI: parse the bridge's one-line report.
           // Anchored on the report itself — the same line carries the project
           // path, which may contain words like "headless" or "editor".
@@ -1550,7 +1595,31 @@ export function apply(ctx, config) {
           if (/^running \(headless\)/m.test(out)) mode = 'headless'
           else if (/^running \(editor-attach\)/m.test(out)) mode = 'editor'
           else if (/^running\b/m.test(out)) mode = 'running'
-          return json(res, 200, { ok: !r.fatal, project: proj, mode, stdout: out, stderr: r.stderr })
+          // Anchored on the running line, like the mode checks above: a project path
+          // that happens to contain "editorProbe=..." must not decide the port.
+          const runningLine = /^running\b[^\n]*$/m.exec(out)
+          const probeMatch = runningLine === null ? null : /\beditorProbe=(\d+)\b/.exec(runningLine[0])
+          const editorProbe = probeMatch === null ? undefined : Number(probeMatch[1])
+          // Facts that let the panel explain why a project is still on our own
+          // engine: is that editor port answered, has an instance published its
+          // ports, and is the bridge addon installed and enabled at all. Cheap and
+          // handshake-free — an editor LSP serves one session, so only a plain TCP
+          // connect may be used to probe it.
+          const probePort = editorProbe || editorPort || DEFAULT_EDITOR_PORT
+          const instances = rec ? readBridgeInstances(rec.path) : {}
+          const listening = await probePortOpen(probePort)
+          return json(res, 200, {
+            ok: !r.fatal,
+            project: proj,
+            mode,
+            stdout: out,
+            stderr: r.stderr,
+            editor: { port: probePort, listening, instance: !!instances.editor },
+            bridge: {
+              installed: !!(rec && fs.existsSync(path.join(rec.path, 'addons', ADDON_ID, 'plugin.gd'))),
+              enabled: !!(rec && isEditorPluginEnabled(rec.path, ADDON_RES_PATH)),
+            },
+          })
         } else if (action === 'baseline') {
           const rec = known.get(path.resolve(proj).toLowerCase())
           if (rec) {
@@ -1630,14 +1699,17 @@ export function apply(ctx, config) {
       if (eng) boundEngines.push(eng)
     }
     if (!boundEngines.length) { trace('pre-step', agentId, `skip: no engine bound to ${rec.path}`); return decision }
+    // Before any watcher work: a project missing the engine bridge addon cannot
+    // be asked to rescan, and its didSave path has no unsaved-changes guard. This
+    // runs before the baseline below, which may start an engine — repairing the
+    // addon stops the engine it replaces, and stopping one the baseline has just
+    // started would fail that sweep.
+    await ensureEngineBridge(rec)
     // Fallback: the agent/created trigger can miss (a session resumed under a
     // project whose discovery had not finished yet, or a plugin reload mid
     // session). Start the one-time full baseline on this project's first real
     // step instead.
     if (typeof baselineStarter === 'function') baselineStarter(agent)
-    // Before any watcher work: a project missing the engine bridge addon cannot
-    // be asked to rescan, and its didSave path has no unsaved-changes guard.
-    await ensureEngineBridge(rec)
     const watcher = ensureWatcher(rec)
     watcher.tick() // full-tree diff at the step boundary (mode B)
     const structural = watcher.drainStructural()
@@ -1993,7 +2065,17 @@ export function apply(ctx, config) {
     // the project synchronously before its first await — on a large project that
     // would delay the creation dispatch, i.e. the conversation opening itself.
     // Starting once per mount and per project makes the deferral free.
-    setTimeout(() => startBaseline(agent), 0)
+    setTimeout(() => {
+      // Repair the engine bridge before the sweep picks an engine: opening a
+      // conversation is the earliest moment to notice a project whose addon files
+      // were copied but never enabled, and a running editor stays invisible to this
+      // plugin until that is fixed. The gates match the check path, so a project with
+      // injection switched off is not touched.
+      const rec = hdr && hdr.cwd ? baselineRecFor(hdr.cwd) : undefined
+      const repairs = rec !== undefined && globalAutoInject() && rec.autoInject !== false
+      const prepared = repairs ? ensureEngineBridge(rec) : Promise.resolve(false)
+      prepared.catch(() => false).then(() => startBaseline(agent))
+    }, 0)
   })
   baselineStarter = startBaseline
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
@@ -2023,16 +2105,25 @@ export function apply(ctx, config) {
   })
 
   // ---- stop every engine this plugin started when the plugin is unloaded --
-  ctx.effect(() => {
+  // The loop belongs in the DISPOSER: a Cordis effect runs its callback at setup and
+  // treats the return value as cleanup, so the inline form stopped the engines of
+  // every known project while this plugin was being loaded — it killed a warm engine
+  // another instance had started on the same DSH home (and on every restart), while
+  // stopping nothing on unload.
+  ctx.effect(() => async () => {
+    const stops = []
     for (const rec of known.values()) {
       for (const x of rec.lsp || []) {
         const eng = engine(x.engine)
         if (eng) {
-          stopHost(eng.bridge, rec.path).catch(() => {})
+          stops.push(stopHost(eng.bridge, rec.path).catch(() => {}))
           stopClientd(eng.bridge, rec.path)
         }
       }
     }
+    // Awaited so the unload really waits for the stop: a fire-and-forget stop races
+    // process exit and would leave engines running.
+    await Promise.allSettled(stops)
   })
 
   // keep the effective set live when the manual/discovered layers change

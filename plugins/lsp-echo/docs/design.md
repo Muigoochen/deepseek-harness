@@ -123,7 +123,11 @@ lsp-echo 带**静态 client 半**(`lib/client.js`,toast/workspace-files 同款:
   引擎状态经 host API。
 - **控制(host JSON API,`webServer.register` exact `/lsp-echo/api`)**:
   - `?action=projects` → `{ok, projects:[{source,engine,path,autoInject}]}`
-  - `?action=status&project=<abs>` → `{ok, mode:'editor'|'headless'|'running'|'off', stdout}`
+  - `?action=status&project=<abs>` → `{ok, mode:'editor'|'headless'|'running'|'off', stdout, editor:{port,listening,instance}, bridge:{installed,enabled}}`
+    (`editor`/`bridge` 两组事实供浮层解释「为什么还在用独立引擎」;`port` 取**桥自己报的**探测目标 ——
+    `status` 也带 `--editor-port`,所以它等于「设置 → 桥 config → 默认」的实际取值,不是主机的猜测;
+    引擎副本过旧、状态行里没有该字段时回退到设置值/默认 6005(只影响这一行提示);
+    端口用**纯 TCP 连接**探测,不用 LSP 握手 —— 编辑器 LSP 单会话,额外握手会踢掉已连客户端)
   - `?action=host|stop|baseline&project=<abs>` → 启/停引擎、全量重扫(同 manager)
   - `?action=diagnostics&project=<abs>` → `{ok, updated_at, summary, files}`(读快照,
     纯读不启引擎;无快照时 `{empty:true}`,浏览器据此提示先做 baseline)
@@ -142,7 +146,8 @@ lsp-echo 带**静态 client 半**(`lib/client.js`,toast/workspace-files 同款:
 | `conversation.session.header.actions`(order -5) | ⧆ 图标 + 角标:仅当前会话 cwd 命中已注册项目时显示(零打扰);
   角标 = 错误数(红)或 ✓(绿),3s 轮询摘要;点击记录按钮锚点并开/关浮层 |
 | `shell.overlay`(order 60) | 诊断浮层:锚在图标左缘下方;项目路径 + 模式徽章 + 工具条
-  (刷新/全量重扫/启动/停止)+ 按文件分组 error/warning(gdshader 带 engine_note);
+  (刷新/全量重扫/启动/停止)+ **独立引擎时的原因行**(端口没监听 / 桥已复制但未启用 / 端口有响应但没有实例上报 /
+  编辑器在线但尚未检查)+ 按文件分组 error/warning(gdshader 带 engine_note);
   每 3s 自刷,ESC/点外部关闭 |
 
 - 会话绑定:**图标随会话出现**(cwd→项目判定,与 host pre-step 同规则);
@@ -227,10 +232,19 @@ lsp-echo 带**静态 client 半**(`lib/client.js`,toast/workspace-files 同款:
 表中 addon 安装器与端口校验两行来自一次性验证脚本(临时项目,跑完即删,脚本不随包分发);
 引擎端到端各步可用插件 README「验证」节的命令重跑。
 
+**半装状态**(addon 文件在、`project.godot` 里没有启用项,2026-09-23 实测补):此前是**完全无声**的坏态 ——
+文件存在让自动安装直接跳过,而 Godot 从不加载它,于是编辑器里的实例不上报端口,DSH 探不到编辑器、只能一直用自己的
+headless(现象:你的编辑器和插件的 headless **同时跑着**,徽章一直是「独立引擎」,刷新界面也不会变,因为收敛决策
+只在每次检查前做)。现在自动安装**按启用项判断**而非文件是否存在:发现半装状态就在 `project.godot` 补上启用项,
+时机为**打开该项目的会话(`agent/created`)**与每次检查前,并浮窗提示「重启 Godot 编辑器后生效」(重启后实例才会加载
+addon 并上报端口)。补写失败(只读/被占用、`[editor_plugins]` 列表缺右括号等)时**明确报错**,并按项目进入
+5 分钟冷却,避免每次检查都重抄一遍 addon、重发浮窗、并把下一轮要用的引擎停掉。会话打开这条触发与检查路径同样受
+「全局自动注入 + 项目 autoInject」门控 —— 注入关掉的项目不会被改写 `project.godot`。
+
 **边界**:未安装 addon 时不自愈——重扫失败进入 120s 冷却并浮窗提示一次("引擎未刷新"),
-诊断按引擎原样注入,绝不伪造成"通过"。安装 addon 会写用户项目的 `addons/` 与 `project.godot`,
-只能由用户在设置页显式点击触发;运行中的编辑器需重启(或在「项目设置 → 插件」里启用)才加载它,
-headless 引擎下次启动即生效。
+诊断按引擎原样注入,绝不伪造成"通过"。安装 addon 会写用户项目的 `addons/` 与 `project.godot`:
+自动安装受设置页「自动安装 Godot 引擎桥」开关(默认开)约束,也可由用户在设置页显式点击;
+运行中的编辑器需重启(或在「项目设置 → 插件」里启用)才加载它,headless 引擎下次启动即生效。
 
 ## 12. 已知边界
 
@@ -251,7 +265,9 @@ headless 引擎下次启动即生效。
   两者用的是同一条文件系统扫描,注册结果一致,所以诊断不受影响;但"哪一个实例执行了扫描"不确定,
   且该发布文件不携带实例身份(只有 port/pid),桥无法按身份挑选。
   默认 `attachPolicy=prefer-editor` 会在下次检查时收敛成一个(迁回编辑器、停掉自己的 headless);
-  只有 `cold-start` 才让两者长期并存。
+  只有 `cold-start` 才让两者长期并存。**注意**:编辑器那边没加载 addon(未启用/旧副本)时它**不会**公布端口,
+  DSH 也就看不见它 —— 此时只能探到「配置的编辑器端口」有没有监听;配置端口与实际不符(如 DSH 配 6007、
+  编辑器在 6006)时两边永远接不上,直到启用桥(插件会自动补,见 §11)或把端口改成一致。浮层会把这种状态说清楚。
 - **引擎自有运行时状态的位置**:`$DSH_HOME/lsp-echo-runtime/godot-lsp/`(`host-<项目>.json` /
   `host-<项目>.log` / 引擎自己写的那份 `lsp_diagnostics-<项目>.json`)。引擎目录内的 `.runtime/` 是
   迁移前的位置,只作**读取兜底**,新写入一律落到 DSH home(`writeHostState` 会顺手清掉旧副本),

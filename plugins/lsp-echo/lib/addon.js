@@ -21,6 +21,11 @@ import path from 'node:path'
 /** Addon directory name under <project>/addons (and its plugin.cfg name). */
 export const ADDON_ID = 'dsh_echo_bridge'
 
+/** `res://` path of the addon's plugin.cfg, the string project.godot must enable. */
+export function addonResPath() {
+  return `res://addons/${ADDON_ID}/plugin.cfg`
+}
+
 /** Control port an engine's addon listens on (falls back to the shipped default). */
 export function rescanPortOf(eng) {
   const p = eng && eng.rescanPort
@@ -310,6 +315,68 @@ export async function discoverBridgePortAsync(project, eng) {
 }
 
 /**
+ * Whether project.godot lists one editor plugin in its `[editor_plugins]` enabled list.
+ *
+ * Scoped to that section and to uncommented text: a commented-out entry, or the same
+ * quoted path elsewhere in the file, does not count as enabled. Treating either as
+ * enabled would leave the addon installed but never loaded — the state where a running
+ * editor cannot report its LSP port.
+ * @param {string} project project root
+ * @param {string} resPath `res://` path of the addon's plugin.cfg
+ * @returns {boolean} true only for an active entry in that list
+ */
+export function isEditorPluginEnabled(project, resPath) {
+  let text
+  try { text = fs.readFileSync(path.join(project, 'project.godot'), 'utf8') } catch { return false }
+  const section = editorPluginsSection(text)
+  if (section === undefined) return false
+  // The same scan the writer uses, on the same text: a commented-out key never matches
+  // (`;enabled=` does not start a line with `enabled`), and reader and writer can never
+  // disagree about where the list ends.
+  const span = enabledListSpan(section.body)
+  return !!span && span.inner.includes(`"${resPath}"`)
+}
+
+/** Offsets of the `[editor_plugins]` section body, or undefined when the section is absent. */
+function editorPluginsSection(text) {
+  // A section header may also be the last line of the file, without a newline.
+  const header = /^\[editor_plugins\][^\S\r\n]*(?:\r?\n|$)/m.exec(text)
+  if (header === null) return undefined
+  const bodyStart = header.index + header[0].length
+  const tail = text.slice(bodyStart)
+  const nextHeaderRel = tail.search(/^\[/m)
+  const bodyEnd = nextHeaderRel < 0 ? text.length : bodyStart + nextHeaderRel
+  return { bodyStart, bodyEnd, body: text.slice(bodyStart, bodyEnd) }
+}
+
+/**
+ * The `enabled=PackedStringArray(...)` value inside one section body.
+ *
+ * The closing parenthesis is found by scanning and ignoring parentheses inside quoted
+ * entries: a res:// path may legitimately contain them, and a naive `[^)]*` match would
+ * cut the list in half.
+ * @param {string} body section body
+ * @returns {{ start: number, end: number, inner: string }|undefined|false} the span;
+ *   undefined when the section declares no `enabled` key; false when that key has no
+ *   closing parenthesis (a malformed list, which must fail loudly rather than be replaced)
+ */
+function enabledListSpan(body) {
+  const key = /^[^\S\r\n]*enabled[^\S\r\n]*=[^\S\r\n]*PackedStringArray\(/m.exec(body)
+  if (key === null) return undefined
+  const innerStart = key.index + key[0].length
+  let cursor = innerStart
+  let insideQuote = false
+  while (cursor < body.length) {
+    const character = body[cursor]
+    if (character === '"') insideQuote = !insideQuote
+    else if (character === ')' && !insideQuote) break
+    cursor++
+  }
+  if (cursor >= body.length) return false // a list without its closing parenthesis
+  return { start: key.index, end: cursor, inner: body.slice(innerStart, cursor) }
+}
+
+/**
  * Register an editor plugin in project.godot, so Godot loads it on startup.
  * @param {string} project project root
  * @param {string} resPath `res://` path of the addon's plugin.cfg
@@ -320,48 +387,29 @@ export function ensureEditorPluginEnabled(project, resPath) {
   let text
   try { text = fs.readFileSync(cfg, 'utf8') } catch { return { ok: false, error: tLine('addon.err.noProject') } }
   const quoted = `"${resPath}"`
-  // A commented-out entry (`;enabled=PackedStringArray(...)`) must not count as
-  // already enabled, or the addon would never actually be registered.
-  const activeText = text.split(/\r?\n/).filter((line) => !/^\s*;/.test(line)).join('\n')
-  if (activeText.includes(quoted)) return { ok: true, changed: false }
-  // A section header may also be the last line of the file, without a newline.
-  const header = /^\[editor_plugins\][^\S\r\n]*(?:\r?\n|$)/m.exec(text)
+  // Already listed in the section: nothing to write. The check is the same one the
+  // callers use, so a path in the list is never appended twice.
+  if (isEditorPluginEnabled(project, resPath)) return { ok: true, changed: false }
+  const section = editorPluginsSection(text)
   let next
-  if (header) {
-    const bodyStart = header.index + header[0].length
-    const tail = text.slice(bodyStart)
-    const nextHeaderRel = tail.search(/^\[/m)
-    const bodyEnd = nextHeaderRel < 0 ? text.length : bodyStart + nextHeaderRel
-    const body = text.slice(bodyStart, bodyEnd)
-    const enabledStart = /^[^\S\r\n]*enabled[^\S\r\n]*=[^\S\r\n]*PackedStringArray\(/m.exec(body)
+  if (section) {
+    const span = enabledListSpan(section.body)
     let newBody
-    if (enabledStart) {
-      // Scan for the matching ")" while ignoring parentheses inside quoted
-      // entries: a res:// path may legitimately contain them, and a naive
-      // [^)]* match would cut the list in half and write an invalid value.
-      const innerStart = enabledStart.index + enabledStart[0].length
-      let cursor = innerStart
-      let is_in_quote = false
-      while (cursor < body.length) {
-        const character = body[cursor]
-        if (character === '"') is_in_quote = !is_in_quote
-        else if (character === ')' && !is_in_quote) break
-        cursor++
-      }
-      if (cursor >= body.length) return { ok: false, error: tLine('addon.err.badPluginSection') }
+    if (span === false) return { ok: false, error: tLine('addon.err.badPluginSection') }
+    if (span) {
       // Append to the existing list; the trailing comma of a hand-written list
       // is dropped so the result stays a valid PackedStringArray literal.
-      const inner = body.slice(innerStart, cursor).trim().replace(/,$/, '')
+      const inner = span.inner.trim().replace(/,$/, '')
       const list = inner ? `${inner}, ${quoted}` : quoted
-      newBody = body.slice(0, enabledStart.index) + `enabled=PackedStringArray(${list})` + body.slice(cursor + 1)
+      newBody = section.body.slice(0, span.start) + `enabled=PackedStringArray(${list})` + section.body.slice(span.end + 1)
     } else {
       // The header may have matched at end-of-file without a trailing newline:
       // insert the break, or the key would be glued to the section name and the
       // section would stop parsing.
-      const needsBreak = !/\r?\n$/.test(text.slice(0, bodyStart))
-      newBody = `${needsBreak ? '\n' : ''}enabled=PackedStringArray(${quoted})\n\n${body.replace(/^\r?\n/, '')}`
+      const needsBreak = !/\r?\n$/.test(text.slice(0, section.bodyStart))
+      newBody = `${needsBreak ? '\n' : ''}enabled=PackedStringArray(${quoted})\n\n${section.body.replace(/^\r?\n/, '')}`
     }
-    next = text.slice(0, bodyStart) + newBody + text.slice(bodyEnd)
+    next = text.slice(0, section.bodyStart) + newBody + text.slice(section.bodyEnd)
   } else {
     next = `${text.replace(/\s*$/, '')}\n\n[editor_plugins]\n\nenabled=PackedStringArray(${quoted})\n`
   }
@@ -395,10 +443,46 @@ export function installAddonInto(project, eng) {
   } catch (e) {
     return { ok: false, error: tLine('addon.err.copyFailed', { message: (e && e.message) || e }) }
   }
-  const en = ensureEditorPluginEnabled(project, `res://addons/${ADDON_ID}/plugin.cfg`)
+  const en = ensureEditorPluginEnabled(project, addonResPath())
   return en.ok
     ? { ok: true, addonPath: dst, enabled: true, enableChanged: !!en.changed }
     : { ok: true, addonPath: dst, enabled: false, enableChanged: false, error: en.error }
+}
+
+/**
+ * TCP reachability of one local port, without speaking the protocol.
+ *
+ * Godot's editor LSP serves a single session and an extra LSP handshake kicks the
+ * client already attached to it, so "is something listening?" is answered with a
+ * plain connect. The GUI status report uses this to explain why a project is still
+ * on the plugin's own engine.
+ * @param {number} port local port
+ * @param {number} [timeoutMs] connect timeout
+ * @returns {Promise<boolean>} true when something accepts the connection
+ */
+export function probePortOpen(port, timeoutMs = 600) {
+  return new Promise((resolve) => {
+    let sock
+    try {
+      sock = net.connect({ host: '127.0.0.1', port })
+    } catch {
+      // An out-of-range port throws synchronously; a caller probing a bad value
+      // wants "nothing there", not a rejected promise.
+      resolve(false)
+      return
+    }
+    let settled = false
+    const done = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { sock.destroy() } catch { /* already closed */ }
+      resolve(value)
+    }
+    const timer = setTimeout(() => done(false), timeoutMs)
+    sock.on('connect', () => done(true))
+    sock.on('error', () => done(false))
+  })
 }
 
 /**

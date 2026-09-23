@@ -358,8 +358,19 @@ export function stopHost(bridge, project) {
   return runBridge(bridge, ['stop', '--project', project], 30_000)
 }
 
-export function status(bridge, project) {
-  return runBridge(bridge, ['status', '--project', project], 30_000)
+/**
+ * Ask the bridge for one project's host state. The editor port override travels with
+ * the call because it decides which port this bridge would probe/attach on, and the
+ * GUI status report repeats that number to the user.
+ * @param {string} bridge absolute bridge script path
+ * @param {string} project project root
+ * @param {number} [editorPort] editor LSP port override (settings page)
+ * @returns {Promise<{ ok: boolean, fatal: boolean, stdout: string, stderr: string }>}
+ */
+export function status(bridge, project, editorPort) {
+  const args = ['status', '--project', project]
+  if (editorPort) args.push('--editor-port', String(editorPort))
+  return runBridge(bridge, args, 30_000)
 }
 
 /**

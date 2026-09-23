@@ -1635,7 +1635,10 @@ async function main() {
       const st = readHostState(project);
       if (st && (await hostAlive(st))) {
         const mode = st.mode === MODE_EDITOR ? 'editor-attach' : 'headless';
-        console.log(`running (${mode}): port=${st.port} project=${st.project} started=${st.startedAt}`);
+        // The editor probe target travels with the report: the host repeats it to the
+        // user, and it must be the port THIS invocation would attach on (settings
+        // override -> machine config -> default), not a default the host guessed.
+        console.log(`running (${mode}): port=${st.port} project=${st.project} started=${st.startedAt} editorProbe=${editorProbePorts(flags)[0]}`);
       } else {
         console.log(`stopped: no live host for ${project}`);
       }

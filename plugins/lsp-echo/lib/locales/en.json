@@ -108,6 +108,16 @@
     "Installed into {path}.",
     "Restart that project's Godot editor to activate the unsaved-changes guard and new-script class detection."
   ],
+  "toast.addon.enabled.title": "Engine bridge enabled (its files were copied but never loaded)",
+  "toast.addon.enabled.body": [
+    "Added the enable entry to project.godot in {path}: the addon files were there, but Godot never loaded them, so the editor instance could not report its ports.",
+    "Restart that project's Godot editor to activate it."
+  ],
+  "toast.addon.failed.title": "Could not enable the engine bridge",
+  "toast.addon.failed.body": [
+    "The addon was copied into {path}, but its enable entry could not be written to project.godot: {reason}",
+    "The editor instance will not report its ports until that is fixed; the plugin retries once it is (or enable the addon under Godot's Project Settings > Plugins) and stays quiet for 5 minutes otherwise."
+  ],
   "toast.ready.title": "lsp-echo is ready",
   "toast.ready.body": "Registered {count} Godot project(s) (engines: {engines})",
   "toast.discovered.title": "lsp-echo auto-discovery",
@@ -152,6 +162,10 @@
   "overlay.mode.off": "off",
   "overlay.mode.running": "running",
   "overlay.summary": "{files} files, {err} err, {warn} warn",
+  "overlay.note.headless.portDead": "Own engine is running: nothing listens on editor port {port}. The editor may be closed, or its LSP port differs from this setting.",
+  "overlay.note.headless.bridgeOff": "Own engine is running: the bridge addon is copied into the project but not enabled in project.godot, so the editor instance cannot report its ports (the plugin tries to add the entry, and reports separately when that fails).",
+  "overlay.note.headless.bridgeStale": "Own engine is running: port {port} answers, but no instance reports its ports - the bridge is not loaded by the editor, or it is too old. Restart the Godot editor and retry.",
+  "overlay.note.headless.nextCheck": "Own engine is running while the editor is online: the next check (send a message, or press Full rescan) attaches to it and stops the own engine.",
   "overlay.fileCount.error": "{n} error",
   "overlay.fileCount.warning": "{n} warning",
   "toast.rescan.title": "{engine} engine did not rescan",
