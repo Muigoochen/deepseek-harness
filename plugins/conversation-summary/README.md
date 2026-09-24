@@ -92,7 +92,8 @@ powershell -ExecutionPolicy Bypass -File install\install.ps1
 ```
 
 返回 `{mode, budget, retain, budgetScope, decisions:[…]}`；每条含 `time / action / engine / conversation /
-envelope / budget / aboveBudget / compactable / span / surfaceNodes / weightedNodes / retain / planExited`。
+envelope / budget / aboveBudget / compactable / span / savedTokens / tailTokens / surfaceNodes / weightedNodes /
+retain / planExited`（`savedTokens`=可压的早期部分，`tailTokens`=压缩后会保留的尾部）。
 `action` 直接给出结论：
 
 | `action` | 含义 |
@@ -100,6 +101,7 @@ envelope / budget / aboveBudget / compactable / span / surfaceNodes / weightedNo
 | `compacted:N` | 本次压掉 N tokens（成功） |
 | `skip:engine-unavailable` | 该会话 preset 没挂压缩引擎（`ctx.compaction`） |
 | `skip:no-compactable-range` | 已超预算，但按保留尾部与工具配对选不出可压范围 |
+| `skip:span-too-small` | 超预算，可压的早期部分太小（重量集中在保留尾部，通常是某个巨型节点）：写出的摘要不会比原文更小，引擎必拒，故不再尝试 |
 | `failed:<原因>` | 调用抛错，原因原文（例如新版 API 变更） |
 | `below-budget` / `hint:…` | 未到点或 hint 模式判定 |
 
@@ -137,3 +139,4 @@ system prompt and may be rewritten only by a system/message over exactly that no
 - 运行依赖：需 profile 环境已具备 `zod`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-compaction`（install.ps1 只部署本包、不安装依赖）。
 - 提醒、estimate 均不含系统提示/注入的成本，实际省钱要叠加 `envelope` 一起看。
 - `agent/pre-step` 里抛的错会被 catch 掉（不打断你的对话），所以**失败不会弹到你面前**：表现出来就是"该压没压"。先查 `/conversation-summary/diagnostics` 的 `action=failed:<原因>`。
+- **重量集中在尾部时压不动**：选区永远是"从第一个非系统节点压到保留尾部之前"，若绝大部分 tokens 落在最近的一个巨型节点（超长工具输出、长文粘贴、大文件内容），可压的早期部分可能只剩几千 tokens——引擎会以 `summary is not smaller than the shadowed content` 拒绝。插件现在跳过并标记 `skip:span-too-small`（不再每步失败），但要真正变瘦得处理那个巨型节点本身（工具输出裁剪/图片外置/开新会话继续）。

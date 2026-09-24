@@ -55,6 +55,16 @@ const DEFAULT_BUDGET_TOKENS = 200_000
 /** Default recent tail retained verbatim by a compaction, in tokens. */
 const DEFAULT_RETAIN_TOKENS = 30_000
 
+/**
+ * Smallest compactable span worth a summarizer call. The engine refuses a
+ * summary that is not smaller than the content it replaces ("summary is not
+ * smaller than the shadowed content"), and a short span cannot beat the
+ * summarizer's own output floor — a 3,128-token span produced a 3,130-token
+ * summary. Below this the plugin skips with a reason instead of retrying a
+ * doomed summarizer call on every step.
+ */
+const MIN_COMPACT_TOKENS = 4000
+
 /** Editable agent-facing copies (empty or omitted → default). Only scenarios in
  *  which the agent participates carry a copy. In mode=hint the ①② copies are
  *  injected verbatim when the plugin detects the scenario so the agent asks the
@@ -782,6 +792,8 @@ export function apply(ctx, rawConfig) {
       budget: resolved.budget,
       aboveBudget: evaluation.aboveBudget,
       compactable: evaluation.compactable,
+      savedTokens: evaluation.savedTokens,
+      tailTokens: evaluation.totalTokens - evaluation.savedTokens,
       span: evaluation.span === null ? null : [evaluation.span.start, evaluation.span.end],
       surfaceNodes: agent.session?.surface?.nodes?.length ?? -1,
       weightedNodes: evaluation.surfaceNodes,
@@ -798,6 +810,7 @@ export function apply(ctx, rawConfig) {
     console.log(`conversation-summary: decision ${sessionKey} mode=${resolved.mode} engine=${engine !== undefined} `
       + `conversation=${evaluation.totalTokens} envelope=${evaluation.envelopeTokens} budget=${resolved.budget} `
       + `aboveBudget=${evaluation.aboveBudget} compactable=${evaluation.compactable} `
+      + `saved=${evaluation.savedTokens} tail=${evaluation.totalTokens - evaluation.savedTokens} `
       + `span=${evaluation.span === null ? 'none' : `${evaluation.span.start}-${evaluation.span.end}`} `
       + `surfaceNodes=${entry.surfaceNodes} weightedNodes=${entry.weightedNodes} `
       + `retain=${resolved.retain} planExited=${planExited} action=${action}`)
@@ -818,8 +831,9 @@ export function apply(ctx, rawConfig) {
     const planExited = resolved.planExit && planExitedSinceLastCompaction(agent.session)
     if (resolved.mode === 'auto') {
       const sessionKey = agent.session?.id ?? String(agent.id)
+      let evaluation = null
       try {
-        const evaluation = evaluate(ctx, agent, engine, resolved, planExited)
+        evaluation = evaluate(ctx, agent, engine, resolved, planExited)
         const due = evaluation.aboveBudget || planExited
         let action = due ? 'due' : 'below-budget'
         if (due && engine === undefined) {
@@ -831,6 +845,11 @@ export function apply(ctx, rawConfig) {
           noteAutoSkip(sessionKey,
             `over budget (${evaluation.totalTokens} >= ${resolved.budget}) but no compactable range `
             + `(surface ${agent.session?.surface?.nodes?.length ?? '?'} / weighted ${evaluation.surfaceNodes} nodes, retain ${resolved.retain})`)
+        } else if (due && evaluation.savedTokens < MIN_COMPACT_TOKENS) {
+          action = 'skip:span-too-small'
+          noteAutoSkip(sessionKey,
+            `over budget (${evaluation.totalTokens} >= ${resolved.budget}) but only ${evaluation.savedTokens} tokens sit before the `
+            + `retained tail (${evaluation.totalTokens - evaluation.savedTokens} kept); no summary of that is smaller than itself`)
         } else if (due && engine !== undefined) {
           const result = await engine.compactRegion(evaluation.span.start, evaluation.span.end, agent, signal)
           autoSkipNotices.delete(sessionKey)
@@ -841,7 +860,13 @@ export function apply(ctx, rawConfig) {
         noteDecision(sessionKey, evaluation, agent, planExited, engine, action)
       } catch (error) {
         const cause = error instanceof Error ? error.message : String(error)
-        recordDecision(sessionKey, { mode: resolved.mode, action: `failed:${cause}`, turn, step })
+        // Keep the measured inputs on the failure too: without them a refused
+        // summary says nothing about where the tokens actually sit.
+        if (evaluation !== null) {
+          noteDecision(sessionKey, evaluation, agent, planExited, engine, `failed:${cause}`)
+        } else {
+          recordDecision(sessionKey, { mode: resolved.mode, action: `failed:${cause}`, turn, step })
+        }
         noteFailure(sessionKey, `conversation-summary: step auto-compaction failed (turn ${turn}, step ${step}): ${cause}`)
       }
     }
