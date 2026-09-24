@@ -478,7 +478,9 @@ export async function checkFiles(bridge, project, files, timeoutMs = 120_000, ro
     // retry would build with the bridge's interactive default instead.
     const budgetArgs = buildBudgetMs > 0 ? ['--build-timeout-ms', String(buildBudgetMs)] : []
     const waitArgs = noWait ? ['--no-wait'] : []
-    const r = await runBridge(bridge, ['check', ...sweepArgs, ...portArgs, ...budgetArgs, ...waitArgs, ...reserveArgs(), ...files, '--project', project, '--out', tmpOut], timeoutMs)
+    // The files come first: a valueless flag followed by a path would otherwise
+    // eat the file it precedes (the bridge's parser gives a flag the next token).
+    const r = await runBridge(bridge, ['check', ...files, ...sweepArgs, ...portArgs, ...budgetArgs, ...waitArgs, ...reserveArgs(), '--project', project, '--out', tmpOut], timeoutMs)
     if (r.fatal) {
       try { fs.unlinkSync(tmpOut) } catch { /* best effort */ }
       throw new Error(r.stderr.trim() || r.stdout.trim() || 'bridge check failed')

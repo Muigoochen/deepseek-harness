@@ -55,6 +55,11 @@ const MAX_BUILD_DIR_DEPTH = 6
 const MAIN_TIMEOUT_MS = 110_000
 const SWEEP_TIMEOUT_MS = 190_000
 
+// Flags that take no value. Without this list a valueless flag swallows the next
+// argument, so `check --no-wait src/a.cpp` would both lose that file and stop
+// being a boolean (`flags['no-wait']` would be the path, never `true`).
+const BOOLEAN_FLAGS = new Set(['sweep', 'both', 'no-wait', 'kill-on-timeout'])
+
 function parseArgs(argv) {
   const flags = {}
   const files = []
@@ -64,6 +69,7 @@ function parseArgs(argv) {
       const eq = a.indexOf('=')
       const key = eq > 0 ? a.slice(2, eq) : a.slice(2)
       if (eq > 0) flags[key] = a.slice(eq + 1)
+      else if (BOOLEAN_FLAGS.has(key)) flags[key] = true
       else flags[key] = i + 1 < argv.length && !argv[i + 1].startsWith('--') ? argv[++i] : true
     } else files.push(a)
   }
@@ -361,6 +367,16 @@ function runOnce(hit, target, timeoutMs, flags, toolchain, lock) {
       // hands the lock to it and answers now: the next check waits for that build
       // and finds the work already done.
       if (lock && lock.orphan && child.pid) lock.orphan(child.pid)
+      // The build outlives this verdict, and its pipes would keep this process
+      // alive after it: detach them so a one-shot check exits on budget instead of
+      // waiting for the build (the verdict is already decided; the log is not).
+      for (const stream of [child.stdout, child.stderr]) {
+        try {
+          stream.removeListener('data', onData)
+          if (typeof stream.unref === 'function') stream.unref()
+        } catch { /* already closed */ }
+      }
+      try { child.unref() } catch { /* gone */ }
       resolve({ code: undefined, out, timedOut: true, text, stillRunning: child.pid })
     }, timeoutMs)
     const onData = (d) => { out += d }
@@ -802,12 +818,21 @@ async function checkOnce(project, requestedAbs, sweep, flags) {
   // Only files this build actually covers may be stamped as checked: claiming
   // "0 errors" for a file that lives under a different GDExtension (or outside
   // the build directory) would be a clean result nothing verified.
-  const covered = requestedAbs.filter((abs) => isUnder(hit.dir, abs))
+  const covered = requestedAbs.filter((abs) => {
+    if (!isUnder(hit.dir, abs)) return false
+    // One check can be handed files of two GDExtensions (the host sends every
+    // changed C++ file to this engine). The build that runs is the one the first
+    // resolved file chose, so a file that resolves to a different extension
+    // directory was not compiled by it either.
+    let own
+    try { own = findBuildDir(project, flags, [abs]) } catch { own = undefined }
+    return !own || path.resolve(own.dir) === path.resolve(hit.dir)
+  })
   const payload = payloadFor(project, covered, byKey, hit)
   payload.build = { dir: hit.dir, entry: path.basename(hit.file), toolchain, commands: built.commands }
   const skipped = requestedAbs.length - covered.length
   if (skipped) {
-    payload.engine_note = `${skipped} requested file(s) are outside ${hit.dir} and were not compiled by this check`
+    payload.engine_note = `${skipped} requested file(s) were not compiled by this check (outside ${hit.dir}, or owned by another GDExtension's build)`
   }
   return { ok: true, payload }
 }
@@ -845,11 +870,13 @@ function cmdClientd(project, flags) {
   // directory fight over the same object files and DLLs.
   const queue = []
   let draining = false
+  let busy = false // a check is executing right now
   const drain = async () => {
     if (draining) return
     draining = true
     while (queue.length) {
       const { id, files, sweep, budgetMs, noWait, killOnTimeout } = queue.shift()
+      busy = true
       try {
         // A request may carry its own build budget and waiting policy: the plugin
         // asks for a short, non-blocking check before a step and a patient one
@@ -865,6 +892,8 @@ function cmdClientd(project, flags) {
         else reply(id, { ok: false, error: r.error })
       } catch (error) {
         reply(id, { ok: false, error: (error && error.message) || String(error) })
+      } finally {
+        busy = false
       }
     }
     draining = false
@@ -879,7 +908,15 @@ function cmdClientd(project, flags) {
       if (!line.trim()) continue
       let req
       try { req = JSON.parse(line) } catch { continue }
-      queue.push({ id: req && req.id, files: req.files, sweep: req.sweep, budgetMs: req && req.budgetMs, noWait: req && req.noWait, killOnTimeout: req && req.killOnTimeout })
+      const entry = { id: req && req.id, files: req.files, sweep: req.sweep, budgetMs: req && req.budgetMs, noWait: req && req.noWait, killOnTimeout: req && req.killOnTimeout }
+      // A request that refuses to wait must not queue behind the check already
+      // running: the host would time the whole channel out, retire this clientd
+      // and reject the running request as well.
+      if (entry.noWait === true && (busy || queue.length)) {
+        reply(entry.id, { ok: false, error: `another check is already building ${project}; this check does not wait for it (wait for the running check, or run one manually)` })
+        continue
+      }
+      queue.push(entry)
       void drain()
     }
   })

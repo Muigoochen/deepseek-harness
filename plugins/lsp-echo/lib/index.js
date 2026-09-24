@@ -1759,10 +1759,57 @@ export function apply(ctx, config) {
     try { fs.appendFileSync(traceLog, `${new Date().toISOString()} ${parts.join(' ')}\n`) } catch { /* never break the step */ }
   }
   const lastInjected = new Map()
-  // Failure notices (per project + engine + message): a check that could not run
-  // is reported once, then at most once per cooldown while it keeps failing.
+  // Failure notices (per project + engine + failure class): a check that could not
+  // run is reported once, then at most once per cooldown while it keeps failing.
   const failNotice = new Map()
   const FAIL_NOTICE_COOLDOWN_MS = 180_000
+  const MAX_NOTICE_ENTRIES = 200
+  // A failed check hands its files back to the watcher, but only a bounded number
+  // of times per edit: a build slower than the pre-step budget must not cost that
+  // budget on every step, and the injected note must never promise a retry that
+  // will not happen. The allowance belongs to one content of the file, so an edit
+  // (a moved mtime) starts it over.
+  const buildRetries = new Map() // lowercased abs path -> { count, mtimeMs, at }
+  const MAX_BUILD_RETRIES = 2
+  const MAX_RETRY_ENTRIES = 500
+  /** Keep a bounded map small by dropping its oldest entries. */
+  const capMap = (map, max) => {
+    if (map.size <= max) return
+    const stale = [...map.entries()]
+      .sort((a, b) => ((a[1] && a[1].at) || 0) - ((b[1] && b[1].at) || 0))
+      .slice(0, map.size - max)
+    for (const [key] of stale) map.delete(key)
+  }
+  /**
+   * Stable class of a failed check: its message embeds a budget and a build pid,
+   * so keying a cooldown on the raw text would mint a fresh key every attempt.
+   * @param {string} message engine failure message
+   * @returns {'timeout'|'busy'|'other'} class the cooldown keys on
+   */
+  const failureClass = (message) => (/did not finish within/.test(message) ? 'timeout'
+    : /already building|does not wait/.test(message) ? 'busy' : 'other')
+  /**
+   * Decide which files a failed check hands back to the watcher, counting one
+   * attempt per file content.
+   * @param {string[]} files absolute paths the failed check was given
+   * @returns {{keep: string[], attempts: number}} files to re-check, and the highest attempt count
+   */
+  const planRetry = (files) => {
+    const keep = []
+    let attempts = 0
+    for (const file of files) {
+      let mtimeMs
+      try { mtimeMs = fs.statSync(file).mtimeMs } catch { mtimeMs = undefined }
+      const key = file.toLowerCase()
+      const prev = buildRetries.get(key)
+      const count = prev && prev.mtimeMs === mtimeMs ? prev.count + 1 : 1
+      attempts = Math.max(attempts, count)
+      buildRetries.set(key, { count, mtimeMs, at: Date.now() })
+      if (count <= MAX_BUILD_RETRIES) keep.push(file)
+    }
+    capMap(buildRetries, MAX_RETRY_ENTRIES)
+    return { keep, attempts }
+  }
   let baselineStarter = null // assigned the guarded startBaseline below
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
@@ -1915,16 +1962,12 @@ export function apply(ctx, config) {
             const message = (error && error.message) || String(error)
             console.error(`[lsp-echo] check failed (${eng.id}): ${message}`)
             trace('pre-step', agentId, `check failed (${eng.id}): ${message}`)
-            // A check that did not run verified nothing: keep its files pending so
-            // the next step retries them (the build may still be finishing in the
-            // background) instead of dropping the round as if it were clean. Only
-            // a check that gave up on a busy or still-running build is retried —
-            // a project whose build entry is simply wrong would otherwise pay the
-            // same budget on every single step.
-            if (/did not finish within|already building|does not wait/.test(message)) {
-              for (const f of files) watcher.dirty.add(f)
-            }
-            return { engineId: eng.id, eng, payload: undefined, failure: message }
+            // A check that did not run verified nothing: hand its files back to
+            // the watcher (bounded per file content, see planRetry) so a later
+            // step retries them instead of dropping the round as if it were clean.
+            const retry = planRetry(files)
+            for (const f of retry.keep) watcher.dirty.add(f)
+            return { engineId: eng.id, eng, payload: undefined, failure: message, files, retry }
           }),
       )
     }
@@ -1937,23 +1980,29 @@ export function apply(ctx, config) {
     // counts the whole project: count only the files this round asked for, per
     // engine, so totals and echoes never double-count nor report older results.
     const roundRel = new Set(touched.map((f) => path.relative(rec.path, f).split(path.sep).join('/')))
-    for (const { engineId, eng, payload, failure } of results) {
+    for (const { engineId, eng, payload, failure, files, retry } of results) {
       // An engine that silently fell back to headless (dead editor LSP port)
       // still "succeeds"; surface its host-state warning once per occurrence.
       if (eng) maybeToastEngineWarn(eng, rec.path)
       if (failure) {
         // Never let a check that did not run read as a clean round. Repeat the
-        // same failure at most once per cooldown, so a project whose build cannot
-        // keep up does not inject the same sentence on every step.
-        const key = `${rec.path.toLowerCase()}::${engineId}::${failure}`
+        // same failure class at most once per cooldown, so a project whose build
+        // cannot keep up does not inject the same sentence on every step.
+        const key = `${rec.path.toLowerCase()}::${engineId}::${failureClass(failure)}`
         const last = failNotice.get(key)
-        if (!last || Date.now() - last > FAIL_NOTICE_COOLDOWN_MS) {
-          failNotice.set(key, Date.now())
-          parts.push(`[lsp-echo] ${engineId} 这一轮没跑完，你刚才改的文件没有被验证：${failure}\n（文件已留在待检查列表，下一步会自动重试；这不等于没有问题。）`)
+        if (!last || Date.now() - last.at > FAIL_NOTICE_COOLDOWN_MS) {
+          failNotice.set(key, { at: Date.now() })
+          capMap(failNotice, MAX_NOTICE_ENTRIES)
+          const tail = retry && retry.keep.length
+            ? `（文件已留在待检查列表，下一步会自动重试，同一内容最多重试 ${MAX_BUILD_RETRIES} 次；这不等于没有问题。）`
+            : `（已尝试 ${retry ? retry.attempts : 1} 次仍未跑完，不再自动重试；需要时先手动构建一次，或显式调 lsp_echo check；这不等于没有问题。）`
+          parts.push(`[lsp-echo] ${engineId} 这一轮没跑完，你刚才改的文件没有被验证：${failure}\n${tail}`)
         }
         continue
       }
       if (!payload) continue
+      // The check verified these files: the next edit starts a fresh allowance.
+      if (files) for (const f of files) buildRetries.delete(f.toLowerCase())
       const scope = engineScope(payload, eng ? eng.extensions : undefined, eng ? eng.syntheticKeys : undefined)
       const scoped = { files: scope.files, summary: scope.summary, engine_note: payload && payload.engine_note }
       for (const rel of Object.keys(scoped.files)) {
@@ -1975,7 +2024,7 @@ export function apply(ctx, config) {
       if (checked > 0) {
         const shown = checkedNames.slice(0, 3).join('、')
         const list = checkedNames.length > 3 ? `${shown} 等 ${checkedNames.length} 个` : shown
-        const okText = `[lsp-echo] 已自动完成本轮编译诊断：\n- 检查文件（${checked} 个）：${list}\n- 结果：编译通过，0 错误\n- 本结论来自引擎实时检查，无需为这些文件再次运行 LSP/编译检查。`
+        const okText = `[lsp-echo] 已自动完成本轮编译诊断：\n- 检查文件（${checked} 个）：${list}\n- 结果：本次检查 0 错误\n- 本结论来自引擎实时检查，无需为这些文件再次运行 LSP/编译检查。`
         const okMsg = createUserMessage({
           content: [{ type: 'text', text: okText }],
           source: { kind: 'plugin', plugin: name, form: 'snapshot', sections: [{ name, text: okText }] },

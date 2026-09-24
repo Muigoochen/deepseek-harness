@@ -97,6 +97,13 @@ const SLOW_OUT = String.raw`param([string]$Target = 'both')
 Start-Sleep -Seconds 20
 Write-Host "done"
 `
+// Raises a flag file the moment the build starts: a test can wait for the flag
+// instead of guessing how long clientd needs before the build is really running.
+const SLOW_FLAG_OUT = String.raw`param([string]$Target = 'both')
+New-Item -ItemType File -Force -Path (Join-Path $PSScriptRoot 'build-started.flag') | Out-Null
+Start-Sleep -Seconds 20
+Write-Host "done"
+`
 
 async function main() {
   console.log(`temp root: ${ROOT}`)
@@ -162,6 +169,18 @@ async function main() {
   const p4 = readJson(cleanOut)
   ok(r4.code === 0, 'exit code 0', `got ${r4.code}: ${r4.err.trim()}`)
   ok(p4 && p4.summary.errors === 0 && Object.keys(p4.files).length === 1, 'requested file present with zero errors', JSON.stringify(p4 && p4.summary))
+  // A valueless flag must not swallow the argument after it: the one-shot retry
+  // and the baseline sweep both put flags before the file list.
+  const out4b = path.join(ROOT, 'clean-nowait.json')
+  const r4b = await run(['check', '--no-wait', cleanFile, '--project', clean.project, '--out', out4b])
+  const p4b = readJson(out4b)
+  ok(r4b.code === 0 && p4b && Object.keys(p4b.files).length === 1,
+    '--no-wait before the file still checks that file', `${r4b.code} ${r4b.err.trim()}`)
+  const out4c = path.join(ROOT, 'clean-sweep-first.json')
+  const r4c = await run(['check', '--sweep', cleanFile, '--project', clean.project, '--out', out4c])
+  const p4c = readJson(out4c)
+  ok(r4c.code === 0 && p4c && /-Target both\b/.test(((p4c.build || {}).commands || []).join(' ')),
+    '--sweep before the file is still a boolean', `${r4c.code} ${JSON.stringify(p4c && p4c.build)} ${r4c.err.trim()}`)
 
   // ---- 5. failures are never clean --------------------------------------
   console.log('\n[5] a build that did not produce diagnostics is a failure')
@@ -177,6 +196,16 @@ async function main() {
   const r6 = await run(['check', path.join(slow.native, 'src', 'hello.cpp'), '--project', slow.project, '--build-timeout-ms', '1500', '--kill-on-timeout'])
   ok(r6.code === 2, 'exit code 2 on timeout', `got ${r6.code}`)
   ok(/did not finish within/.test(r6.err), 'stderr says it did not finish', r6.err.trim())
+  // The default is *not* to kill: the verdict arrives at the budget and the build
+  // keeps running, so the process must not outlive its own answer (a one-shot
+  // check that lingered would make the host pay its whole timeout for a verdict
+  // it already had).
+  const t6b = Date.now()
+  const r6b = await run(['check', path.join(slow.native, 'src', 'hello.cpp'), '--project', slow.project, '--build-timeout-ms', '1500'])
+  const ms6b = Date.now() - t6b
+  ok(r6b.code === 2 && /still running \(pid \d+\)/.test(r6b.err),
+    'without --kill-on-timeout the verdict names the build it left running', `${r6b.code} ${r6b.err.trim()}`)
+  ok(ms6b < 6_000, 'and the check exits on its budget instead of waiting for that build', `${ms6b}ms`)
 
   console.log('\n[7] a project with no build entry fails loud')
   fs.mkdirSync(path.join(ROOT, 'empty'), { recursive: true })
@@ -227,6 +256,63 @@ async function main() {
     child.stdin.write(`${JSON.stringify({ id: 1, files: [msvcFile], sweep: false })}\n`)
   })
 
+  // A request that refuses to wait must not sit in the queue behind the check
+  // already running: the host's short pre-step budget would time the whole
+  // channel out and retire this clientd, rejecting the running request too. The
+  // fixture raises a flag file when its build starts, so the second request is
+  // sent while the first is provably running instead of after a guessed sleep.
+  console.log('\n[9b] a no-wait request is refused instead of queueing')
+  const flagRun = project('flag-run', SLOW_FLAG_OUT, source)
+  const flagFile = path.join(flagRun.native, 'build-started.flag')
+  const flagInput = path.join(flagRun.native, 'src', 'hello.cpp')
+  await new Promise((resolve) => {
+    const child = spawn(process.execPath, [BRIDGE, 'clientd', '--project', flagRun.project], { cwd: ROOT, windowsHide: true })
+    let buf = ''
+    const replies = []
+    const started = Date.now()
+    let sentSecond = false
+    let done = false
+    // A silent timeout would skip these assertions and still print PASSED: a
+    // probe promise that gives up must report the give-up as a failure.
+    const finish = (giveUp) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      clearInterval(poll)
+      try { child.kill() } catch { /* gone */ }
+      if (giveUp) {
+        ok(false, giveUp, `replies: ${replies.map((x) => `${x.body.id}@${x.at}ms`).join(', ') || 'none'}`)
+      }
+      resolve()
+    }
+    const timer = setTimeout(() => finish('the no-wait refusal answered within 60s'), 60_000)
+    const poll = setInterval(() => {
+      if (sentSecond || !fs.existsSync(flagFile)) return
+      sentSecond = true
+      child.stdin.write(`${JSON.stringify({ id: 2, files: [flagInput], budgetMs: 6000, noWait: true })}\n`)
+    }, 50)
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (d) => {
+      buf += d
+      const lines = buf.split('\n')
+      buf = lines.pop() || ''
+      for (const line of lines) {
+        if (!line.trim().startsWith('{')) continue
+        try { replies.push({ at: Date.now() - started, body: JSON.parse(line) }) } catch { /* chatter */ }
+      }
+      const busy = replies.find((x) => x.body.id === 2)
+      if (!busy) return
+      ok(busy.body.ok === false && /does not wait|already building/.test(busy.body.error || ''),
+        'the no-wait request is refused, not queued', JSON.stringify(busy.body))
+      ok(busy.at < 5_000, 'the refusal is immediate, not after the host timeout', `${busy.at}ms`)
+      const first = replies.find((x) => x.body.id === 1)
+      if (!first) return
+      ok(busy.at < first.at, 'and it arrives before the running build finishes', `busy@${busy.at}ms first@${first.at}ms`)
+      finish()
+    })
+    child.stdin.write(`${JSON.stringify({ id: 1, files: [flagInput], budgetMs: 6000 })}\n`)
+  })
+
   // ---- 10. the real toolchain, end to end -------------------------------
   if (REAL_MSVC) {
     console.log('\n[10] real MSVC through the bridge')
@@ -243,12 +329,13 @@ exit $LASTEXITCODE
     ok(r10.code === 1, 'real compiler failure surfaces as exit 1', `got ${r10.code}: ${r10.err.trim()}`)
     const key = 'addons/probe_ext/platform/native/src/broken.cpp'
     const rec = p10 && p10.files ? p10.files[key] : undefined
-    ok(rec && rec.errors >= 1, 'real MSVC diagnostic parsed onto the file', JSON.stringify(p10 && p10.files))
-    if (rec) {
-      const codes = rec.diagnostics.map((d) => d.code).filter(Boolean)
-      ok(codes.includes('C2065'), `real error code kept (${codes.join(',')})`, JSON.stringify(rec.diagnostics))
-      ok(rec.diagnostics.every((d) => d.line > 0), 'real diagnostics carry line numbers', JSON.stringify(rec.diagnostics))
-    }
+    const codes = rec ? rec.diagnostics.map((d) => d.code).filter(Boolean) : []
+    // Unconditional: a toolchain that cannot produce the diagnostic must fail this
+    // section loudly instead of skipping its assertions (the tail guard catches a
+    // count mismatch, but an explicit failure names the cause).
+    ok(rec && rec.errors >= 1, 'real MSVC diagnostic parsed onto the file', JSON.stringify(p10 && p10.files) || r10.err.trim())
+    ok(codes.includes('C2065'), `real error code kept (${codes.join(',') || 'none'})`, JSON.stringify(rec && rec.diagnostics) || r10.err.trim())
+    ok(!!rec && rec.diagnostics.every((d) => d.line > 0), 'real diagnostics carry line numbers', JSON.stringify(rec && rec.diagnostics) || r10.err.trim())
   } else {
     console.log('\n[10] real MSVC skipped (pass --real-msvc)')
   }
@@ -347,6 +434,31 @@ exit 0
     'the dependency file is never reported clean',
     JSON.stringify(p12f && { files: Object.keys(p12f.files), note: p12f.engine_note }))
 
+  // A root-level extension plus a *nested* one: the first requested file decides
+  // which build runs, and a file that resolves to the nested extension must not be
+  // stamped clean merely because it sits inside the chosen directory.
+  const nested = path.join(ROOT, 'nested')
+  const nestedInner = path.join(nested, 'addons', 'inner', 'platform', 'native')
+  fs.mkdirSync(path.join(nested, 'src'), { recursive: true })
+  fs.mkdirSync(path.join(nestedInner, 'src'), { recursive: true })
+  fs.writeFileSync(path.join(nested, 'SConstruct'), '# fixture\n', 'utf8')
+  fs.writeFileSync(path.join(nested, 'root.gdextension'), '[configuration]\ncompatibility_minimum = "4.7"\n', 'utf8')
+  fs.writeFileSync(path.join(nested, 'build.ps1'), CLEAN_OUT, 'utf8')
+  fs.writeFileSync(path.join(nested, 'src', 'root.cpp'), 'int root() { return 0; }\n', 'utf8')
+  fs.writeFileSync(path.join(nestedInner, 'SConstruct'), '# fixture\n', 'utf8')
+  fs.writeFileSync(path.join(nestedInner, 'inner.gdextension'), '[configuration]\ncompatibility_minimum = "4.7"\n', 'utf8')
+  fs.writeFileSync(path.join(nestedInner, 'build.ps1'), CLEAN_OUT, 'utf8')
+  fs.writeFileSync(path.join(nestedInner, 'src', 'inner.cpp'), 'int inner() { return 0; }\n', 'utf8')
+  const out12g = path.join(ROOT, 'nested.json')
+  const r12g = await run(['check', path.join(nested, 'src', 'root.cpp'), path.join(nestedInner, 'src', 'inner.cpp'),
+    '--project', nested, '--out', out12g])
+  const p12g = readJson(out12g)
+  ok(r12g.code === 0 && p12g && path.resolve(p12g.build.dir) === path.resolve(nested),
+    'the first requested file decides the build directory', `${r12g.code} ${JSON.stringify(p12g && p12g.build)} ${r12g.err.trim()}`)
+  ok(p12g && !!p12g.files['src/root.cpp'] && !p12g.files['addons/inner/platform/native/src/inner.cpp'],
+    "the other GDExtension's file is not stamped as checked", JSON.stringify(p12g && Object.keys(p12g.files)))
+  ok(p12g && /were not compiled/.test(p12g.engine_note || ''), 'and the payload names the file it did not compile', p12g && p12g.engine_note)
+
   // ---- 13. one build per build directory ---------------------------------
   console.log('\n[13] concurrent builds in one directory')
   // Two checker processes can reach one build directory (the host retries a
@@ -438,23 +550,35 @@ exit 0
   ok(agedRun.code === 0, 'an aged record with a live pid is cleared, not waited on', `${agedRun.code} ${agedRun.err.trim()}`)
 
   // Locks these fixture builds left behind (they name builds that outran their
-  // budget and were not killed): every record pointing into a probe fixture is
-  // swept, including leftovers of an earlier probe run whose root is long gone.
+  // budget and were not killed): every record pointing into a throwaway fixture
+  // is swept, including leftovers of an earlier run whose root is long gone and
+  // the `.lock.stale-<pid>-<ts>` files a stale-lock takeover renames aside.
   try {
     const tempLower = path.resolve(os.tmpdir()).toLowerCase()
     for (const name of fs.readdirSync(lockDir)) {
-      if (!name.startsWith('cpp-build-') || !name.endsWith('.lock')) continue
+      if (!name.startsWith('cpp-build-') || !/\.lock(\.stale-|$)/.test(name)) continue
       const p = path.join(lockDir, name)
       let rec
       try { rec = JSON.parse(fs.readFileSync(p, 'utf8')) } catch { rec = undefined }
-      if (!rec || typeof rec.dir !== 'string') continue
-      const dir = path.resolve(rec.dir)
-      const inTemp = dir.toLowerCase().startsWith(tempLower) && path.basename(dir).startsWith('dsh-cpp-')
-      if (inTemp) {
+      const dir = rec && typeof rec.dir === 'string' ? path.resolve(rec.dir) : undefined
+      const underTemp = !!dir && dir.toLowerCase().startsWith(tempLower)
+      // The recorded dir is a *subdirectory* of the throwaway root
+      // (…/dsh-cpp-probe-XXXX/slow), so look for the root segment, not the basename.
+      const throwaway = underTemp && dir.slice(tempLower.length).toLowerCase().includes('dsh-')
+      // A temp path that no longer exists cannot be a live build directory.
+      if (throwaway || (underTemp && !fs.existsSync(dir))) {
         try { fs.unlinkSync(p) } catch { /* best effort */ }
       }
     }
   } catch { /* no runtime dir */ }
+
+  // A skipped assertion (a promise that timed out, a section that never ran) must
+  // not print PASSED: the number of assertions executed is part of the contract.
+  const EXPECTED_CHECKS = 81
+  if (checks !== EXPECTED_CHECKS) {
+    failures += 1
+    console.log(`  FAIL every check ran: ${checks}/${EXPECTED_CHECKS} executed`)
+  }
 
   console.log(`\n${failures ? 'FAILED' : 'PASSED'}: ${checks - failures}/${checks} checks`)
   if (!KEEP) {
