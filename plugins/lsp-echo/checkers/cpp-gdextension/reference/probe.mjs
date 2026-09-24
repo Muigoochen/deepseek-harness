@@ -360,6 +360,30 @@ exit 0
   ok(takeoverRun.code === 2 && /did not finish within/.test(takeoverRun.err),
     'a lock whose taker and build child are both gone is taken over', `${takeoverRun.code} ${takeoverRun.err.trim()}`)
   ok(!fs.existsSync(lockFile), 'the taken-over lock is released again')
+  ok(/already building .*\(lock: .*cpp-build-/.test(orphanRun.err), 'the refusal names the lock file to clear', orphanRun.err.trim())
+  // Waiting comes out of the same budget as the build: with a 25s budget and a 6s
+  // wait the build gets ~19s, so the whole check answers inside its budget.
+  const waitSlow = project('wait-slow', SLOW_OUT, source)
+  const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 6000)'], { stdio: 'ignore' })
+  const lockFor = (dir) => path.join(lockDir, `cpp-build-${crypto.createHash('sha1').update(path.resolve(dir).toLowerCase()).digest('hex').slice(0, 12)}.lock`)
+  const holderLock = lockFor(waitSlow.native)
+  fs.writeFileSync(holderLock, JSON.stringify({ pid: 999999999, childPid: holder.pid, at: Date.now(), dir: waitSlow.native }))
+  const waitStart = Date.now()
+  const waitRun = await run(['check', path.join(waitSlow.native, 'src', 'hello.cpp'), '--project', waitSlow.project,
+    '--out', path.join(ROOT, 'wait.json'), '--build-timeout-ms', '25000'])
+  const waitElapsed = Date.now() - waitStart
+  ok(waitRun.code === 2 && /did not finish within/.test(waitRun.err) && waitElapsed < 28_000,
+    'a check that waits builds inside the same budget, not a second one', `${waitRun.code} ${waitElapsed}ms ${waitRun.err.trim()}`)
+  ok(/after waiting .*s for another check/.test(waitRun.err), 'and says that it had to wait', waitRun.err.trim())
+  ok(!fs.existsSync(holderLock), 'the waited-out lock is released again')
+  // A record no build can still be behind is cleared, so a recycled pid cannot
+  // wedge the directory for good.
+  const waitClean = project('wait-clean', CLEAN_OUT, source)
+  const agedLock = lockFor(waitClean.native)
+  fs.writeFileSync(agedLock, JSON.stringify({ pid: process.pid, at: Date.now() - 25 * 60 * 60_000, dir: waitClean.native }))
+  const agedRun = await run(['check', path.join(waitClean.native, 'src', 'hello.cpp'), '--project', waitClean.project,
+    '--out', path.join(ROOT, 'aged.json'), '--build-timeout-ms', '20000'])
+  ok(agedRun.code === 0, 'an aged record with a live pid is cleared, not waited on', `${agedRun.code} ${agedRun.err.trim()}`)
 
   console.log(`\n${failures ? 'FAILED' : 'PASSED'}: ${checks - failures}/${checks} checks`)
   if (!KEEP) {

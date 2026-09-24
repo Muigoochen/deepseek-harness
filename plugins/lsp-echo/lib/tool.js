@@ -16,6 +16,9 @@ export function renderDiagnostics(payload, cap = 14) {
     }
   }
   const lines = [`checked ${s.files_checked} file(s): ${s.errors} error(s), ${s.warnings} warning(s)`]
+  // An engine may report per-file numbers that cannot carry what it did not check
+  // (a partly covered C++ build): the caller must see that with the counts.
+  if (payload.engine_note) lines.push(`note: ${payload.engine_note}`)
   lines.push(...rows.slice(0, cap))
   if (rows.length > cap) lines.push(`… and ${rows.length - cap} more`)
   return lines.join('\n')

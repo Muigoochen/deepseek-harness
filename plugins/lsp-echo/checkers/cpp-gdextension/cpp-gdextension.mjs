@@ -349,6 +349,13 @@ const LOCK_DIR = () => path.join(process.env.DSH_HOME || path.join(os.homedir(),
 // create (the create is atomic, the write is not): treat it as held until it is
 // older than this, so a waiter cannot steal it inside that window.
 const LOCK_UNREADABLE_GRACE_MS = 5_000
+// Longer than any budget a caller can set through the plugin (seconds to a few
+// minutes): reaching it means the record outlived its build, so a recycled pid
+// cannot wedge the directory forever.
+const LOCK_MAX_AGE_MS = 24 * 60 * 60_000
+// A wait that leaves less than this is not worth starting a build for: the build
+// would be killed mid-way, which is the work the lock exists to prevent.
+const MIN_BUILD_MS = 10_000
 
 function lockPath(hit) {
   const key = crypto.createHash('sha1').update(path.resolve(hit.dir).toLowerCase()).digest('hex').slice(0, 12)
@@ -382,6 +389,9 @@ function lockIsStale(file, held) {
   if (!held) {
     try { return Date.now() - fs.statSync(file).mtimeMs > LOCK_UNREADABLE_GRACE_MS } catch { return true }
   }
+  // Self-healing against a recycled pid: no real build can hold a lock this long
+  // (every budget is under four minutes), so an ancient record is a leftover.
+  if (Date.now() - Number(held.at || 0) > LOCK_MAX_AGE_MS) return true
   if (pidAlive(Number(held.pid))) return false
   if (held.childPid && pidAlive(Number(held.childPid))) return false
   return true
@@ -407,24 +417,37 @@ function takeOverStaleLock(file, held) {
     return
   }
   // We raced a fresh locker: put its lock back (unless a third one already
-  // created another file, in which case ours is the odd one out).
-  try { fs.renameSync(taken, file) } catch { try { fs.unlinkSync(taken) } catch { /* best effort */ } }
+  // created another file, in which case ours is the odd one out). The link fails
+  // on an existing destination, so it can never replace a third waiter's lock.
+  try {
+    fs.linkSync(taken, file)
+    fs.unlinkSync(taken)
+  } catch {
+    try { fs.unlinkSync(taken) } catch { /* best effort */ }
+  }
 }
 
 /**
- * Wait for the build lock, then run `fn(record)`. `record(childPid)` is how the
- * build child becomes part of the lock (see lockIsStale). Waiting never exceeds
- * the caller's own budget: it fails with what is actually happening instead of
- * starting a second build or answering past its deadline.
+ * Wait for the build lock, then run `fn(record, window)`. `record(childPid)` is
+ * how the build child becomes part of the lock (see lockIsStale); `window` is
+ * what is left of the caller's single budget, so waiting and building share one
+ * deadline instead of taking one each. A wait that would leave too little of the
+ * budget to build refuses instead of starting a build it must kill.
  * Failure to *take* the lock is reported; a failure from `fn` propagates.
  * @param {{dir: string}} hit build directory
  * @param {number} budgetMs the caller's own time budget
- * @param {(record: (childPid: number) => void) => Promise<any>} fn the build
+ * @param {(record: (childPid: number) => void, window: {leftMs: number, waitedMs: number}) => Promise<any>} fn the build
  * @returns {Promise<{ok: true, value: any} | {ok: false, error: string}>}
  */
 async function withBuildLock(hit, budgetMs, fn) {
   const file = lockPath(hit)
-  const deadline = Date.now() + Math.max(1_000, budgetMs)
+  const startedAt = Date.now()
+  const deadline = startedAt + Math.max(1_000, budgetMs)
+  const refuse = (held, left) => {
+    const who = held && held.childPid ? `pid ${held.pid}, build pid ${held.childPid}` : `pid ${held && held.pid}`
+    const why = left > 0 ? `this check has ${(left / 1000).toFixed(0)}s of its budget left, too little to build` : 'this check ran out of its budget waiting'
+    return { ok: false, error: `another check is already building ${hit.dir} (${who}); ${why} (lock: ${file})` }
+  }
   for (;;) {
     try {
       fs.mkdirSync(LOCK_DIR(), { recursive: true })
@@ -439,11 +462,9 @@ async function withBuildLock(hit, budgetMs, fn) {
         takeOverStaleLock(file, held)
         continue
       }
-      if (Date.now() + 1_000 >= deadline) {
-        const who = held && held.childPid ? `pid ${held.pid}, build pid ${held.childPid}` : `pid ${held && held.pid}`
-        return { ok: false, error: `another check is already building ${hit.dir} (${who}); try again when it finishes` }
-      }
-      await new Promise((r) => setTimeout(r, 500))
+      const left = deadline - Date.now()
+      if (left <= MIN_BUILD_MS) return refuse(held, left)
+      await new Promise((r) => setTimeout(r, Math.min(500, left)))
     }
   }
   const record = (childPid) => {
@@ -452,7 +473,8 @@ async function withBuildLock(hit, budgetMs, fn) {
     } catch { /* the lock keeps the taker pid, which still guards it */ }
   }
   try {
-    return { ok: true, value: await fn(record) }
+    const leftMs = Math.max(1_000, deadline - Date.now())
+    return { ok: true, value: await fn(record, { leftMs, waitedMs: Date.now() - startedAt }) }
   } finally {
     try { fs.unlinkSync(file) } catch { /* already released */ }
   }
@@ -467,21 +489,22 @@ async function runBuild(hit, sweep, flags, toolchain) {
   const budget = Number(flags['build-timeout-ms']) > 0
     ? Number(flags['build-timeout-ms'])
     : (sweep ? SWEEP_TIMEOUT_MS : MAIN_TIMEOUT_MS)
-  const locked = await withBuildLock(hit, budget, async (record) => {
-    const deadline = Date.now() + budget
+  const locked = await withBuildLock(hit, budget, async (record, window) => {
+    // One budget for the whole call: the wait above already spent part of it.
+    const deadline = Date.now() + window.leftMs
     // build.ps1 takes `-Target both`; the bare SCons path runs twice.
     const targets = hit.kind === 'ps1' ? ['debug'] : (sweep ? ['debug', 'release'] : ['debug'])
     let out = ''
     const commands = []
     for (const target of targets) {
       const left = deadline - Date.now()
-      if (left <= 1000) return { timedOut: true, out, commands, budgetMs: budget, timedOutOn: target }
+      if (left <= 1000) return { timedOut: true, out, commands, budgetMs: window.leftMs, waitedMs: window.waitedMs, timedOutOn: target }
       const r = await runOnce(hit, target, left, { both: sweep && hit.kind === 'ps1' }, toolchain, record)
       out += `${r.out}\n`
       commands.push(`${r.text} -> exit ${r.code}${r.timedOut ? ' (killed)' : ''}`)
-      if (r.timedOut) return { timedOut: true, out, commands, budgetMs: budget, timedOutOn: target }
+      if (r.timedOut) return { timedOut: true, out, commands, budgetMs: window.leftMs, waitedMs: window.waitedMs, timedOutOn: target }
     }
-    return { out, commands, budgetMs: budget }
+    return { out, commands, budgetMs: window.leftMs, waitedMs: window.waitedMs }
   })
   if (!locked.ok) return { lockError: locked.error, out: '', commands: [], budgetMs: budget }
   return locked.value
@@ -651,9 +674,10 @@ async function checkOnce(project, requestedAbs, sweep, flags) {
   if (built.lockError) return { ok: false, error: built.lockError }
   if (built.timedOut) {
     const secs = (built.budgetMs / 1000).toFixed(1)
+    const waited = built.waitedMs > 1_500 ? ` after waiting ${(built.waitedMs / 1000).toFixed(1)}s for another check` : ''
     return {
       ok: false, out: built.out,
-      error: `build did not finish within ${secs}s (${built.timedOutOn} target); run it manually to see the full log`,
+      error: `build did not finish within ${secs}s${waited} (${built.timedOutOn} target); run it manually to see the full log`,
     }
   }
   const byKey = parseDiagnostics(built.out, project, hit.dir)

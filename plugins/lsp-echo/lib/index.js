@@ -232,7 +232,7 @@ function buildEchoText(engineId, payload, cap = 10) {
     }
   }
   if (!rows.length) return note
-  const head = `[lsp-echo] ${engineId} 检测到 ${s.errors} 个编译错误(${s.files_with_errors.length} 个文件),来自最近的编辑:`
+  const head = `[lsp-echo] ${engineId} 检测到 ${s.errors} 个编译错误(${s.files_with_errors.length ? `${s.files_with_errors.length} 个文件` : '链接/构建阶段'}),来自最近的编辑:`
   const lines = rows.slice(0, cap)
   if (rows.length > cap) lines.push(`… 还有 ${rows.length - cap} 条`)
   if (note) lines.push(note)
@@ -1972,7 +1972,7 @@ export function apply(ctx, config) {
     const errs = s ? s.errors : 0
     const filesErr = s && s.files_with_errors ? s.files_with_errors.length : 0
     if (!s || errs === 0) return `[lsp-echo] 首次全量诊断完成：扫描 ${scanned} 个文件，0 个编译错误`
-    const head = `[lsp-echo] 首次全量诊断完成：${errs} 个编译错误(${filesErr} 个文件):`
+    const head = `[lsp-echo] 首次全量诊断完成：${errs} 个编译错误(${filesErr ? `${filesErr} 个文件` : '链接/构建阶段'}):`
     const lines = []
     for (const rel of Object.keys(payload.files || {})) {
       for (const d of payload.files[rel].diagnostics || []) {

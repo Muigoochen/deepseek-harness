@@ -187,7 +187,11 @@ export function pruneSnapshot(project, keepExts, keepSynthetic) {
         if (ext ? keepSet.has(ext) : keepSynth.has(rel)) files[rel] = oldFiles[rel]
       }
     }
+    const nextSynthetic = keepSynthetic && keepSynthetic.length ? keepSynthetic : undefined
+    // The declaration is part of what a prune rewrites, so it takes part in the
+    // decision to write: it can go away while every file key stays.
     const changed = Object.keys(files).length !== Object.keys(oldFiles).length
+      || JSON.stringify(existing.synthetic_keys || []) !== JSON.stringify(nextSynthetic || [])
     if (!changed) return false
     if (!Object.keys(files).length) {
       // nothing left bound → drop the file entirely (GUI reads absence as
@@ -204,7 +208,7 @@ export function pruneSnapshot(project, keepExts, keepSynthetic) {
       engine_note: existing.engine_note,
       // Recomputed from the still-bound engines, not copied: the declaration must
       // not outlive the engine that owns it.
-      synthetic_keys: keepSynthetic && keepSynthetic.length ? keepSynthetic : undefined,
+      synthetic_keys: nextSynthetic,
       updated_at: new Date().toISOString(),
       files,
       summary: recomputeSummary(files, keepSynthetic),
