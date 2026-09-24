@@ -68,8 +68,13 @@ UTF-8(Windows PowerShell 5.1 默认按 ANSI 解码子进程输出,会把非 ASCI
 一个构建目录可能被不止一个检查进程碰到:宿主在 clientd 超时后会退回一次性 `check`,或者第二个 DSH
 实例正在查同一个项目。同目录里两个 SCons 会互相抢 object 文件与输出 DLL,所以每次构建先取锁
 (`$DSH_HOME/lsp-echo-runtime/cpp-build-<hash>.lock`,**不写进项目树**):拿不到就等,等到自己的预算
-用完就如实回"另一个检查正在构建 `<dir>`"(exit 2,不假装通过);持锁进程已经不在、或锁超过 15 分钟
-算陈旧,自动接管。
+用完就如实回"另一个检查正在构建 `<dir>`"(exit 2,不假装通过)。
+
+锁记录**取锁进程 pid 与构建子进程 pid**:杀掉检查进程并不会杀掉它启动的编译器,所以**任一 pid 还活着
+就当作有人在构建** —— 否则重试会跟那个"孤儿构建"同时跑。记录读不出来时按 5 秒宽限当作被持有
+(创建与写入之间有个窗口),接管陈旧锁用 rename 保证只有一个等待者抢到。已知边界:锁只覆盖共享
+同一个 `DSH_HOME` 的进程;两个项目共用一份 `godot-cpp` 检出时,各编各的扩展仍可能在依赖目录里互相踩
+(按构建目录分锁、不做全局串行,是刻意的取舍)。
 
 ## 诚实性规则
 
@@ -87,7 +92,7 @@ UTF-8(Windows PowerShell 5.1 默认按 ANSI 解码子进程输出,会把非 ASCI
 ## 自检
 
 ```powershell
-# 诊断解析 / 协议 / 诚实性路径 / 每文件构建目录 / 并发构建锁 + 真实 MSVC 端到端(54 项)
+# 诊断解析 / 协议 / 诚实性路径 / 每文件构建目录 / 并发构建锁 + 真实 MSVC 端到端(58 项)
 node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\probe.mjs --real-msvc
 
 # evidence 绑定 + 快照合并/作用域语义(可指向任意真实 GDExtension 项目)

@@ -1423,6 +1423,10 @@ export function apply(ctx, config) {
               ok: true,
               project: abs,
               updated_at: parsed.updated_at || null,
+              // The GUI renders both: the engine's own note, and which snapshot
+              // keys are synthetic buckets rather than file paths.
+              engine_note: parsed.engine_note || null,
+              synthetic_keys: Array.isArray(parsed.synthetic_keys) ? parsed.synthetic_keys : [],
               summary: parsed.summary || null,
               files: parsed.files || {},
             })

@@ -306,7 +306,7 @@ function killTree(child) {
  * to stderr).
  * @returns {Promise<{code: number|undefined, out: string, timedOut: boolean, text: string}>}
  */
-function runOnce(hit, target, timeoutMs, flags, toolchain) {
+function runOnce(hit, target, timeoutMs, flags, toolchain, record) {
   const cmd = commandFor(hit, target, flags, toolchain)
   const text = `${path.basename(cmd.exe)} ${cmd.args.join(' ')}`
   return new Promise((resolve) => {
@@ -317,6 +317,9 @@ function runOnce(hit, target, timeoutMs, flags, toolchain) {
       resolve({ code: undefined, out: `spawn failed: ${(error && error.message) || error}`, timedOut: false, text })
       return
     }
+    // The build child outlives a killed checker, so the lock records it: a waiter
+    // must see this build as still running even after our process is gone.
+    if (record && child.pid) record(child.pid)
     let out = ''
     let timedOut = false
     const timer = setTimeout(() => {
@@ -342,7 +345,10 @@ function runOnce(hit, target, timeoutMs, flags, toolchain) {
  * the plugin runtime dir (never in the project tree).
  */
 const LOCK_DIR = () => path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'lsp-echo-runtime')
-const LOCK_STALE_MS = 15 * 60_000
+// A lock file that exists but cannot be parsed is a writer's half-finished
+// create (the create is atomic, the write is not): treat it as held until it is
+// older than this, so a waiter cannot steal it inside that window.
+const LOCK_UNREADABLE_GRACE_MS = 5_000
 
 function lockPath(hit) {
   const key = crypto.createHash('sha1').update(path.resolve(hit.dir).toLowerCase()).digest('hex').slice(0, 12)
@@ -351,6 +357,7 @@ function lockPath(hit) {
 
 /** True while `pid` exists (`EPERM` means it exists but is not ours). */
 function pidAlive(pid) {
+  if (!Number.isFinite(pid)) return false
   try {
     process.kill(pid, 0)
     return true
@@ -359,11 +366,60 @@ function pidAlive(pid) {
   }
 }
 
+function readLock(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return undefined }
+}
+
 /**
- * Wait for the build lock, then run `fn`. A holder that died leaves the lock
- * behind, so a lock whose pid is gone (or that is older than the staleness
- * window) is taken over. Waiting beyond the caller's own budget is pointless:
- * it fails with what is actually happening instead of starting a second build.
+ * A lock is stale only when nobody behind it can still be building. Killing the
+ * checker does not kill the compiler it started (the manager kills the bridge,
+ * not its build tree), so the record names both: while either the taker or the
+ * build child is alive the lock is held, and the retry waits or reports instead
+ * of starting a second SCons in the same directory. A record that cannot be read
+ * is trusted for a grace window rather than stolen on sight.
+ */
+function lockIsStale(file, held) {
+  if (!held) {
+    try { return Date.now() - fs.statSync(file).mtimeMs > LOCK_UNREADABLE_GRACE_MS } catch { return true }
+  }
+  if (pidAlive(Number(held.pid))) return false
+  if (held.childPid && pidAlive(Number(held.childPid))) return false
+  return true
+}
+
+/**
+ * Remove a stale lock. The rename is what makes it safe: exactly one waiter wins
+ * it, and the winner verifies it really took the stale record (a fresh locker may
+ * have replaced it between the read and the rename) before letting go of it.
+ */
+function takeOverStaleLock(file, held) {
+  const taken = `${file}.stale-${process.pid}-${Date.now()}`
+  try {
+    fs.renameSync(file, taken)
+  } catch {
+    return // another waiter got there first
+  }
+  const content = readLock(taken)
+  const same = !held || !content || (Number(content.pid) === Number(held.pid) && Number(content.at || 0) === Number(held.at || 0))
+  if (same) {
+    try { fs.unlinkSync(taken) } catch { /* best effort */ }
+    log('taking over a stale build lock')
+    return
+  }
+  // We raced a fresh locker: put its lock back (unless a third one already
+  // created another file, in which case ours is the odd one out).
+  try { fs.renameSync(taken, file) } catch { try { fs.unlinkSync(taken) } catch { /* best effort */ } }
+}
+
+/**
+ * Wait for the build lock, then run `fn(record)`. `record(childPid)` is how the
+ * build child becomes part of the lock (see lockIsStale). Waiting never exceeds
+ * the caller's own budget: it fails with what is actually happening instead of
+ * starting a second build or answering past its deadline.
+ * Failure to *take* the lock is reported; a failure from `fn` propagates.
+ * @param {{dir: string}} hit build directory
+ * @param {number} budgetMs the caller's own time budget
+ * @param {(record: (childPid: number) => void) => Promise<any>} fn the build
  * @returns {Promise<{ok: true, value: any} | {ok: false, error: string}>}
  */
 async function withBuildLock(hit, budgetMs, fn) {
@@ -372,29 +428,33 @@ async function withBuildLock(hit, budgetMs, fn) {
   for (;;) {
     try {
       fs.mkdirSync(LOCK_DIR(), { recursive: true })
-      const fd = fs.openSync(file, 'wx')
-      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now(), dir: hit.dir }))
-      fs.closeSync(fd)
-      try {
-        return { ok: true, value: await fn() }
-      } finally {
-        try { fs.unlinkSync(file) } catch { /* already released */ }
-      }
+      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, at: Date.now(), dir: hit.dir }), { flag: 'wx' })
+      break
     } catch (error) {
-      if (!error || error.code !== 'EEXIST') return { ok: false, error: `cannot take the build lock ${file}: ${(error && error.message) || error}` }
-      let held
-      try { held = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { held = undefined }
-      const stale = !held || !pidAlive(Number(held.pid)) || Date.now() - Number(held.at || 0) > LOCK_STALE_MS
-      if (stale) {
-        log(`taking over a stale build lock (${held && held.pid} is gone)`)
-        try { fs.unlinkSync(file) } catch { /* someone else won the race */ }
+      if (!error || error.code !== 'EEXIST') {
+        return { ok: false, error: `cannot take the build lock ${file}: ${(error && error.message) || error}` }
+      }
+      const held = readLock(file)
+      if (lockIsStale(file, held)) {
+        takeOverStaleLock(file, held)
         continue
       }
       if (Date.now() + 1_000 >= deadline) {
-        return { ok: false, error: `another check is already building ${hit.dir} (pid ${held.pid}); try again when it finishes` }
+        const who = held && held.childPid ? `pid ${held.pid}, build pid ${held.childPid}` : `pid ${held && held.pid}`
+        return { ok: false, error: `another check is already building ${hit.dir} (${who}); try again when it finishes` }
       }
       await new Promise((r) => setTimeout(r, 500))
     }
+  }
+  const record = (childPid) => {
+    try {
+      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, childPid, at: Date.now(), dir: hit.dir }))
+    } catch { /* the lock keeps the taker pid, which still guards it */ }
+  }
+  try {
+    return { ok: true, value: await fn(record) }
+  } finally {
+    try { fs.unlinkSync(file) } catch { /* already released */ }
   }
 }
 
@@ -407,7 +467,7 @@ async function runBuild(hit, sweep, flags, toolchain) {
   const budget = Number(flags['build-timeout-ms']) > 0
     ? Number(flags['build-timeout-ms'])
     : (sweep ? SWEEP_TIMEOUT_MS : MAIN_TIMEOUT_MS)
-  const locked = await withBuildLock(hit, budget, async () => {
+  const locked = await withBuildLock(hit, budget, async (record) => {
     const deadline = Date.now() + budget
     // build.ps1 takes `-Target both`; the bare SCons path runs twice.
     const targets = hit.kind === 'ps1' ? ['debug'] : (sweep ? ['debug', 'release'] : ['debug'])
@@ -416,7 +476,7 @@ async function runBuild(hit, sweep, flags, toolchain) {
     for (const target of targets) {
       const left = deadline - Date.now()
       if (left <= 1000) return { timedOut: true, out, commands, budgetMs: budget, timedOutOn: target }
-      const r = await runOnce(hit, target, left, { both: sweep && hit.kind === 'ps1' }, toolchain)
+      const r = await runOnce(hit, target, left, { both: sweep && hit.kind === 'ps1' }, toolchain, record)
       out += `${r.out}\n`
       commands.push(`${r.text} -> exit ${r.code}${r.timedOut ? ' (killed)' : ''}`)
       if (r.timedOut) return { timedOut: true, out, commands, budgetMs: budget, timedOutOn: target }
@@ -557,12 +617,13 @@ function payloadFor(project, requestedAbs, byKey, hit) {
     // exactly these keys on the next write and lets no other engine evict them.
     syntheticKeys: [LINK_KEY],
     summary: {
-      // The synthetic bucket is not a checked file: it counts its errors, not an
-      // extra "file" in the totals a caller reports.
+      // The synthetic bucket is not a checked file, and it is not a file with
+      // errors either: its errors are counted, but no caller may see it as an
+      // extra entry in the file totals.
       files_checked: Object.keys(files).filter((k) => k !== LINK_KEY).length,
       errors,
       warnings,
-      files_with_errors: Object.keys(files).filter((k) => files[k].errors > 0),
+      files_with_errors: Object.keys(files).filter((k) => k !== LINK_KEY && files[k].errors > 0),
     },
   }
 }

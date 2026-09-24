@@ -40,10 +40,16 @@ export function engineScope(payload, extList, syntheticKeys) {
     out[rel] = rec
     errors += (rec && rec.errors) || 0
     warnings += (rec && rec.warnings) || 0
-    if (rec && rec.errors > 0) filesWithErrors.push(rel)
+    if (rec && rec.errors > 0 && !synth.has(rel)) filesWithErrors.push(rel)
   }
   return {
     files: out,
-    summary: { files_checked: Object.keys(out).length, errors, warnings, files_with_errors: filesWithErrors },
+    // A synthetic bucket contributes its errors but is not a checked file.
+    summary: {
+      files_checked: Object.keys(out).filter((rel) => !synth.has(rel)).length,
+      errors,
+      warnings,
+      files_with_errors: filesWithErrors,
+    },
   }
 }

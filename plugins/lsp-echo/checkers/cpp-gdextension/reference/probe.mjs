@@ -15,6 +15,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
@@ -149,6 +150,7 @@ async function main() {
     ok(link.some((d) => /ld returned/.test(d.message)), 'collect2 failure reported', JSON.stringify(link))
     ok(p3.summary.errors >= 3, `link errors count toward the summary (${p3.summary.errors})`)
     ok(p3.summary.files_checked === 1, 'the synthetic bucket is not counted as a checked file', JSON.stringify(p3.summary))
+    ok(!p3.summary.files_with_errors.includes('<link>'), 'nor listed as a file with errors', JSON.stringify(p3.summary.files_with_errors))
   }
 
   // ---- 4. clean build ----------------------------------------------------
@@ -339,6 +341,25 @@ exit 0
   const firstResult = await firstRun
   ok(firstResult.code === 2 && /did not finish within/.test(firstResult.err),
     'the first build still answers with its own verdict', `${firstResult.code} ${firstResult.err.trim()}`)
+  // Killing the checker does not kill the compiler it started, so a lock must
+  // read as held while either pid lives — otherwise the retry would build
+  // concurrently with the orphan.
+  const lockDir = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'lsp-echo-runtime')
+  const lockKey = crypto.createHash('sha1').update(path.resolve(slowTwo.native).toLowerCase()).digest('hex').slice(0, 12)
+  const lockFile = path.join(lockDir, `cpp-build-${lockKey}.lock`)
+  fs.mkdirSync(lockDir, { recursive: true })
+  const locked = (extra) => fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999999, at: Date.now(), dir: slowTwo.native, ...extra }))
+  locked({ childPid: process.pid }) // taker gone, its build child (this probe) alive
+  const orphanRun = await run(['check', path.join(slowTwo.native, 'src', 'hello.cpp'), '--project', slowTwo.project,
+    '--out', path.join(ROOT, 'slow3.json'), '--build-timeout-ms', '2000'])
+  ok(orphanRun.code === 2 && /already building/.test(orphanRun.err),
+    'a lock whose build child is still alive is not stolen', `${orphanRun.code} ${orphanRun.err.trim()}`)
+  locked({}) // taker and build child both gone
+  const takeoverRun = await run(['check', path.join(slowTwo.native, 'src', 'hello.cpp'), '--project', slowTwo.project,
+    '--out', path.join(ROOT, 'slow4.json'), '--build-timeout-ms', '2500'])
+  ok(takeoverRun.code === 2 && /did not finish within/.test(takeoverRun.err),
+    'a lock whose taker and build child are both gone is taken over', `${takeoverRun.code} ${takeoverRun.err.trim()}`)
+  ok(!fs.existsSync(lockFile), 'the taken-over lock is released again')
 
   console.log(`\n${failures ? 'FAILED' : 'PASSED'}: ${checks - failures}/${checks} checks`)
   if (!KEEP) {

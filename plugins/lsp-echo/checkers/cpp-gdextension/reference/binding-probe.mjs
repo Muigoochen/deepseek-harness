@@ -129,6 +129,8 @@ console.log('\n[4] snapshot merge and scope')
   ok(!read().files['<link>'], 'the next cpp write replaces it (a clean build clears the key)', Object.keys(read().files).join(', '))
   const scoped = engineScope({ files: { 'native/src/a.cpp': blank(), '<link>': { errors: 1, warnings: 0 } } }, cpp.extensions, cpp.syntheticKeys)
   ok(!!scoped.files['<link>'] && scoped.summary.errors === 1, 'the owning engine scope keeps it, so its round can report it', JSON.stringify(scoped))
+  ok(scoped.summary.files_checked === 1 && !scoped.summary.files_with_errors.includes('<link>'),
+    'but its scope does not count it as a checked file', JSON.stringify(scoped.summary))
   ok(!engineScope({ files: { 'main.gd': blank() } }, cpp.extensions, cpp.syntheticKeys).files['main.gd'], 'the scope still drops other engines\' files')
   ok(!engineScope({ files: { '<link>': { errors: 1 } } }, ['.gd'], undefined).files['<link>'],
     'another engine\'s round does not inherit it')
@@ -143,6 +145,12 @@ console.log('\n[4] snapshot merge and scope')
   await writeSnapshot(proj, cppPayload(true), cpp.extensions, both)
   await pruneSnapshot(proj, cpp.extensions, ['<link>'])
   ok(!!read().files['<link>'], 'pruning keeps the synthetic key a still-bound engine declares', Object.keys(read().files).join(', '))
+  ok(Array.isArray(read().synthetic_keys) && read().synthetic_keys.includes('<link>'),
+    'and recomputes the declaration from the bound engines', JSON.stringify(read().synthetic_keys))
+  await pruneSnapshot(proj, cpp.extensions, [])
+  ok(!read().synthetic_keys, 'a declaration cannot outlive the engine that owns it', JSON.stringify(read().synthetic_keys))
+  ok(read().summary.files_checked === 1 && read().summary.errors === 0,
+    'the merged summary counts files, not synthetic buckets', JSON.stringify(read().summary))
 }
 
 console.log(`\n${failures ? 'FAILED' : 'PASSED'}: ${checks - failures}/${checks} checks`)

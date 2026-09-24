@@ -58,7 +58,13 @@ function atomicWriteJson(file, obj) {
   }
 }
 
-function recomputeSummary(files) {
+/**
+ * Summary over a merged keyspace. Declared synthetic keys (`synthetic_keys`)
+ * contribute their errors and warnings but are not files: counting them would
+ * report one more checked file than the engine that produced them did.
+ */
+function recomputeSummary(files, syntheticKeys) {
+  const synth = new Set(Array.isArray(syntheticKeys) ? syntheticKeys : [])
   let errors = 0
   let warnings = 0
   const filesWithErrors = []
@@ -66,9 +72,14 @@ function recomputeSummary(files) {
     const rec = files[rel]
     errors += rec && rec.errors ? rec.errors : 0
     warnings += rec && rec.warnings ? rec.warnings : 0
-    if (rec && rec.errors > 0) filesWithErrors.push(rel)
+    if (rec && rec.errors > 0 && !synth.has(rel)) filesWithErrors.push(rel)
   }
-  return { files_checked: Object.keys(files).length, errors, warnings, files_with_errors: filesWithErrors }
+  return {
+    files_checked: Object.keys(files).filter((rel) => !synth.has(rel)).length,
+    errors,
+    warnings,
+    files_with_errors: filesWithErrors,
+  }
 }
 
 /**
@@ -120,6 +131,11 @@ export function writeSnapshot(project, payload, ownedExts, keepExts) {
       }
       for (const rel of Object.keys(payload.files || {})) files[rel] = payload.files[rel]
     }
+    // Declared synthetic keys of this write, sticky so that a later writer that
+    // declares none does not erase the declaration a kept key still needs.
+    const synthKeys = Array.isArray(payload.syntheticKeys) && payload.syntheticKeys.length
+      ? payload.syntheticKeys
+      : existing.synthetic_keys
     const merged = {
       tool: payload.tool,
       version: payload.version,
@@ -127,15 +143,10 @@ export function writeSnapshot(project, payload, ownedExts, keepExts) {
       server: payload.server,
       port: payload.port,
       engine_note: payload.engine_note,
-      // Recorded so readers without the engine table (GUI rows, pruning) can tell
-      // a synthetic key from a file path. Sticky: a write from an engine that
-      // declares none must not erase the declaration the kept key still needs.
-      synthetic_keys: Array.isArray(payload.syntheticKeys) && payload.syntheticKeys.length
-        ? payload.syntheticKeys
-        : existing.synthetic_keys,
+      synthetic_keys: synthKeys,
       updated_at: new Date().toISOString(),
       files,
-      summary: recomputeSummary(files),
+      summary: recomputeSummary(files, synthKeys),
     }
     atomicWriteJson(out, merged)
     return merged
@@ -191,10 +202,12 @@ export function pruneSnapshot(project, keepExts, keepSynthetic) {
       server: existing.server,
       port: existing.port,
       engine_note: existing.engine_note,
-      synthetic_keys: existing.synthetic_keys,
+      // Recomputed from the still-bound engines, not copied: the declaration must
+      // not outlive the engine that owns it.
+      synthetic_keys: keepSynthetic && keepSynthetic.length ? keepSynthetic : undefined,
       updated_at: new Date().toISOString(),
       files,
-      summary: recomputeSummary(files),
+      summary: recomputeSummary(files, keepSynthetic),
     })
     return true
   }
