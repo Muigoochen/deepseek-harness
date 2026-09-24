@@ -101,7 +101,7 @@ console.log('\n[4] snapshot merge and scope')
 {
   process.env.DSH_HOME = path.join(ROOT, 'dsh-home')
   fs.mkdirSync(process.env.DSH_HOME, { recursive: true })
-  const { writeSnapshot, diagnosticsPath } = await import('../../../lib/manager.js')
+  const { writeSnapshot, pruneSnapshot, diagnosticsPath } = await import('../../../lib/manager.js')
   const { engineScope } = await import('../../../lib/scope.js')
   const proj = path.join(ROOT, 'merge-proj')
   fs.mkdirSync(proj, { recursive: true })
@@ -133,6 +133,16 @@ console.log('\n[4] snapshot merge and scope')
   ok(!engineScope({ files: { '<link>': { errors: 1 } } }, ['.gd'], undefined).files['<link>'],
     'another engine\'s round does not inherit it')
   ok(!!cpp.syntheticKeys && cpp.syntheticKeys.includes('<link>'), 'the engine declares its synthetic key in engine.json', JSON.stringify(cpp.syntheticKeys))
+  ok(Array.isArray(read().synthetic_keys) && read().synthetic_keys.includes('<link>'),
+    'the snapshot records the declaration for readers without the engine table', JSON.stringify(read().synthetic_keys))
+  // Pruning follows the same rule as the write path: a config change must not
+  // evict a key that a still-bound engine still owns.
+  await writeSnapshot(proj, cppPayload(true), cpp.extensions, both)
+  await pruneSnapshot(proj, cpp.extensions, [])
+  ok(!read().files['<link>'], 'pruning without a declaration drops an unowned synthetic key', Object.keys(read().files).join(', '))
+  await writeSnapshot(proj, cppPayload(true), cpp.extensions, both)
+  await pruneSnapshot(proj, cpp.extensions, ['<link>'])
+  ok(!!read().files['<link>'], 'pruning keeps the synthetic key a still-bound engine declares', Object.keys(read().files).join(', '))
 }
 
 console.log(`\n${failures ? 'FAILED' : 'PASSED'}: ${checks - failures}/${checks} checks`)

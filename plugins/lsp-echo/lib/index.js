@@ -219,6 +219,9 @@ function projectRootOf(dir, markersList) {
 function buildEchoText(engineId, payload, cap = 10) {
   const s = payload && payload.summary
   if (!s) return undefined
+  // An engine may report something the per-file numbers cannot carry (this check
+  // did not compile every requested file). Say it even when there is no error.
+  const note = payload.engine_note ? `[lsp-echo] ${engineId}: ${payload.engine_note}` : undefined
   const rows = []
   for (const rel of Object.keys(payload.files || {})) {
     for (const d of payload.files[rel].diagnostics || []) {
@@ -228,21 +231,14 @@ function buildEchoText(engineId, payload, cap = 10) {
       }
     }
   }
-  if (!rows.length) return undefined
+  if (!rows.length) return note
   const head = `[lsp-echo] ${engineId} 检测到 ${s.errors} 个编译错误(${s.files_with_errors.length} 个文件),来自最近的编辑:`
   const lines = rows.slice(0, cap)
   if (rows.length > cap) lines.push(`… 还有 ${rows.length - cap} 条`)
+  if (note) lines.push(note)
   return [head, ...lines].join('\n')
 }
 
-/**
- * Engine-scoped view of one merged snapshot: keep only the files whose
- * extension belongs to `extList`, recompute the summary over that subset, and
- * return a payload-shaped object ({files, summary}). Consumers that report per
- * engine (pre-step echo, baselines, tools) must read THIS — the merged
- * snapshot on disk holds every engine's keyspace, so summing its full summary
- * per engine double-counts when a project carries more than one engine.
- */
 /**
  * Activate the plugin.
  * @param {import('@deepseek-ai/cordis').Context} ctx
@@ -257,34 +253,43 @@ export function apply(ctx, config) {
   const engineByBridge = (bridge) => Object.values(engineTable).find((e) => e.bridge === bridge)
   const absPath = (p, project) => (path.isAbsolute(p) ? path.resolve(p) : path.resolve(project, p))
 
-  // Smart engine detection: first registered engine whose marker exists at the
-  // project root wins (a marker may be a glob, e.g. `*.gdextension`); no marker
-  // hit falls back to the engine that declares itself the fallback (godot-lsp),
-  // never to filesystem order.
-  const detectEngine = (root) => {
-    const ids = enginesList()
-    if (!ids.length) return undefined
-    for (const id of ids) {
-      const eng = engine(id)
-      if (eng && eng.marker && markerHit(root, eng.marker)) return id
-    }
-    return ids.find((id) => engine(id) && engine(id).fallback) || ids[0]
-  }
   /**
-   * Engines a project's own root markers prove it needs, in registry order.
-   * Every hit counts: `project.godot` and a `*.gdextension` can sit in the same
-   * directory (a Godot project whose native extension lives at its root), and
-   * binding only the first hit would silently stop checking the other language.
-   * No hit at all falls back to {@link detectEngine}'s declared fallback.
+   * Engines whose marker sits at `root`, with the engine that declares itself
+   * the project's default first. Marker hits decide membership; the default
+   * engine decides who is `lsp[0]`, which is the engine host/stop/status act on
+   * and the one the projects list calls the project's engine — a Godot project
+   * that keeps a `*.gdextension` at its root must not hand that role to the C++
+   * checker just because the filesystem lists it first.
    * @param {string} root project root
-   * @returns {string[]} engine ids
+   * @returns {string[]} engine ids, default engine first
    */
-  const seedEngines = (root) => {
+  const markerEngines = (root) => {
     const hits = []
     for (const id of enginesList()) {
       const eng = engine(id)
       if (eng && eng.marker && markerHit(root, eng.marker)) hits.push(id)
     }
+    const first = hits.find((id) => engine(id) && engine(id).fallback)
+    return first ? [first, ...hits.filter((id) => id !== first)] : hits
+  }
+  const detectEngine = (root) => {
+    const ids = enginesList()
+    if (!ids.length) return undefined
+    const hits = markerEngines(root)
+    if (hits.length) return hits[0]
+    return ids.find((id) => engine(id) && engine(id).fallback) || ids[0]
+  }
+  /**
+   * Engines a project's own root markers prove it needs. Every hit counts:
+   * `project.godot` and a `*.gdextension` can sit in the same directory (a Godot
+   * project whose native extension lives at its root), and binding only the
+   * first hit would silently stop checking the other language. No hit at all
+   * falls back to {@link detectEngine}'s declared default.
+   * @param {string} root project root
+   * @returns {string[]} engine ids, default engine first
+   */
+  const seedEngines = (root) => {
+    const hits = markerEngines(root)
     if (hits.length) return hits
     const d = detectEngine(root)
     return d ? [d] : []
@@ -953,9 +958,20 @@ export function apply(ctx, config) {
     }
     return exts
   }
+  // Extensionless snapshot keys (an engine's `<link>`-style buckets) of the
+  // engines still bound: prune must keep them for the same reason the write path
+  // refuses to evict them — no extension table can see them.
+  const boundSynthetic = (rec) => {
+    const keys = []
+    for (const e of rec.lsp || []) {
+      const eng = engine(e.engine)
+      for (const k of (eng && eng.syntheticKeys) || []) if (!keys.includes(k)) keys.push(k)
+    }
+    return keys
+  }
   const pruneProjectSnapshot = async (absRoot) => {
     const rec = known.get(path.resolve(absRoot).toLowerCase())
-    await pruneSnapshot(absRoot, rec ? boundExtensions(rec) : [])
+    await pruneSnapshot(absRoot, rec ? boundExtensions(rec) : [], rec ? boundSynthetic(rec) : [])
   }
   const ensureWatcher = (rec) => {
     const key = rec.path.toLowerCase()
@@ -1889,7 +1905,7 @@ export function apply(ctx, config) {
       if (eng) maybeToastEngineWarn(eng, rec.path)
       if (!payload) continue
       const scope = engineScope(payload, eng ? eng.extensions : undefined, eng ? eng.syntheticKeys : undefined)
-      const scoped = { files: scope.files, summary: scope.summary }
+      const scoped = { files: scope.files, summary: scope.summary, engine_note: payload && payload.engine_note }
       for (const rel of Object.keys(scoped.files)) {
         if (!roundRel.has(rel)) continue
         checked += 1

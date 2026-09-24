@@ -63,6 +63,14 @@ UTF-8(Windows PowerShell 5.1 默认按 ANSI 解码子进程输出,会把非 ASCI
 免得用户只看到一句"请求超时"。注意首次检查若撞上 godot-cpp 需要重编(改过依赖版本之后),
 大概率超预算;手动跑一次 `build.ps1` 之后就是增量了。
 
+## 并发(同一构建目录)
+
+一个构建目录可能被不止一个检查进程碰到:宿主在 clientd 超时后会退回一次性 `check`,或者第二个 DSH
+实例正在查同一个项目。同目录里两个 SCons 会互相抢 object 文件与输出 DLL,所以每次构建先取锁
+(`$DSH_HOME/lsp-echo-runtime/cpp-build-<hash>.lock`,**不写进项目树**):拿不到就等,等到自己的预算
+用完就如实回"另一个检查正在构建 `<dir>`"(exit 2,不假装通过);持锁进程已经不在、或锁超过 15 分钟
+算陈旧,自动接管。
+
 ## 诚实性规则
 
 - 构建退出码非 0、却解析不出任何源码诊断 → 当作**检查失败**(exit 2),**不写 payload**:
@@ -79,7 +87,7 @@ UTF-8(Windows PowerShell 5.1 默认按 ANSI 解码子进程输出,会把非 ASCI
 ## 自检
 
 ```powershell
-# 诊断解析 / 协议 / 诚实性路径 / 每文件构建目录 + 真实 MSVC 端到端(41 项)
+# 诊断解析 / 协议 / 诚实性路径 / 每文件构建目录 / 并发构建锁 + 真实 MSVC 端到端(54 项)
 node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\probe.mjs --real-msvc
 
 # evidence 绑定 + 快照合并/作用域语义(可指向任意真实 GDExtension 项目)

@@ -127,6 +127,12 @@ export function writeSnapshot(project, payload, ownedExts, keepExts) {
       server: payload.server,
       port: payload.port,
       engine_note: payload.engine_note,
+      // Recorded so readers without the engine table (GUI rows, pruning) can tell
+      // a synthetic key from a file path. Sticky: a write from an engine that
+      // declares none must not erase the declaration the kept key still needs.
+      synthetic_keys: Array.isArray(payload.syntheticKeys) && payload.syntheticKeys.length
+        ? payload.syntheticKeys
+        : existing.synthetic_keys,
       updated_at: new Date().toISOString(),
       files,
       summary: recomputeSummary(files),
@@ -143,14 +149,16 @@ export function writeSnapshot(project, payload, ownedExts, keepExts) {
 /**
  * Evict every stale keyspace from a project's snapshot after an lsp config
  * change (RFC §8). Only keys whose extension is still bound to the project
- * survive; when keepExts is empty (project unbound or removed) the whole
- * snapshot file is deleted so the GUI stops showing stale error counts.
+ * survive, plus the extensionless keys a still-bound engine declares
+ * (`keepSynthetic`); when nothing survives the whole snapshot file is deleted so
+ * the GUI stops showing stale error counts.
  * Serialized through the same per-project queue as writeSnapshot.
  * @param {string} project project root
  * @param {string[]} keepExts extensions still bound in the current config
+ * @param {string[]} [keepSynthetic] extensionless keys of the still-bound engines
  * @returns {Promise<boolean>} true when the snapshot was changed or removed
  */
-export function pruneSnapshot(project, keepExts) {
+export function pruneSnapshot(project, keepExts, keepSynthetic) {
   const key = path.resolve(project).toLowerCase()
   const run = async () => {
     const out = diagnosticsPath(project)
@@ -159,11 +167,13 @@ export function pruneSnapshot(project, keepExts) {
       existing = JSON.parse(fs.readFileSync(out, 'utf8'))
     } catch { return false } // no snapshot to prune
     const keepSet = keepExts && keepExts.length ? new Set(keepExts) : null
+    const keepSynth = new Set(keepSynthetic || [])
     const oldFiles = existing.files && typeof existing.files === 'object' ? existing.files : {}
     const files = {}
     if (keepSet) {
       for (const rel of Object.keys(oldFiles)) {
-        if (keepSet.has(extOf(rel))) files[rel] = oldFiles[rel]
+        const ext = extOf(rel)
+        if (ext ? keepSet.has(ext) : keepSynth.has(rel)) files[rel] = oldFiles[rel]
       }
     }
     const changed = Object.keys(files).length !== Object.keys(oldFiles).length
@@ -181,6 +191,7 @@ export function pruneSnapshot(project, keepExts) {
       server: existing.server,
       port: existing.port,
       engine_note: existing.engine_note,
+      synthetic_keys: existing.synthetic_keys,
       updated_at: new Date().toISOString(),
       files,
       summary: recomputeSummary(files),
@@ -344,6 +355,10 @@ export function stopClientd(bridge, project) {
       entry.reject(new Error('clientd stopped'))
     }
     try { if (state.child.stdin) state.child.stdin.end() } catch { /* closed */ }
+    // Only the clientd process: a bridge may reach the user's own editor engine
+    // (attach mode) through it, and killing the tree would reach that engine too.
+    // A build a bridge started is torn down by the bridge's own timeout path,
+    // and its build-directory lock keeps the retry from building concurrently.
     try { state.child.kill() } catch { /* gone */ }
   }
 }
@@ -413,8 +428,18 @@ export async function checkFiles(bridge, project, files, timeoutMs = 120_000, ro
     if (reply && reply.ok && reply.payload) {
       return writeSnapshot(project, reply.payload, ownedExts, keepExts)
     }
-    throw new Error((reply && reply.error) || 'clientd returned a failed reply')
+    // The bridge answered with a verdict (`{ ok: false, error }`): the check
+    // itself failed — a build that overran its budget, a missing toolchain. That
+    // is a result, not a broken channel, and retrying it as a one-shot `check`
+    // would start a second build right after this one was killed.
+    if (reply && reply.ok === false) {
+      const verdict = new Error(reply.error || 'the engine reported a failed check')
+      verdict.engineVerdict = true
+      throw verdict
+    }
+    throw new Error('clientd returned a failed reply')
   } catch (clientError) {
+    if (clientError && clientError.engineVerdict) throw clientError
     // The engine host is a single-session LSP server. When the clientd call
     // itself failed (timeout / exit / superseded), retire any still-alive
     // clientd BEFORE the legacy one-shot `check` opens its own session —

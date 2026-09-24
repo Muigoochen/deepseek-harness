@@ -94,6 +94,7 @@ window.__ModuleLoader__.load({
       '.lspi-body{flex:1;min-height:0;overflow:auto;padding:6px 0 10px;}',
       '.lspi-status{padding:18px 14px;text-align:center;opacity:.65;font-size:13px;}',
       '.lspi-file{margin:4px 8px 0;}',
+      '.lspi-enginenote{margin:6px 12px 0;font-size:12px;line-height:1.5;opacity:.8;}',
       '.lspi-fname{display:flex;align-items:center;gap:6px;padding:4px 6px;font-weight:600;border-radius:6px;cursor:pointer;}',
       '.lspi-fname:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05));}',
       '.lspi-fcaret{flex:none;width:10px;text-align:center;opacity:.55;font-size:10px;}',
@@ -435,9 +436,12 @@ window.__ModuleLoader__.load({
             }
           }
           if (errs === 0 && warns === 0 && !rec.engine_note) continue // 无内容不展示
-          // A key without an extension is engine-synthetic (the cpp checker's
+          // An extensionless key is engine-synthetic (the cpp checker's
           // link/build bucket): show what it stands for instead of a raw `<link>`.
-          var label = rel.indexOf('.') >= 0 ? rel : T('overlay.row.synthetic')
+          // The snapshot records which keys are synthetic, so this follows the
+          // declaration rather than guessing from the name.
+          var syntheticKeys = diag && Array.isArray(diag.synthetic_keys) ? diag.synthetic_keys : []
+          var label = syntheticKeys.indexOf(rel) >= 0 ? T('overlay.row.synthetic') : rel
           fileRows.push({ rel: rel, label: label, rec: rec, errs: errs, warns: warns })
         }
       }
@@ -542,13 +546,18 @@ window.__ModuleLoader__.load({
         body = React.createElement('div', { key: 'body', className: 'lspi-body' }, groups)
       }
 
+      // 引擎自述(例如"这次构建没覆盖到哪几个文件"):不属于任何单个文件行,单独一行说清楚
+      var engineNote = diag && diag.engine_note
+        ? React.createElement('div', { key: 'en', className: 'lspi-note lspi-enginenote' }, diag.engine_note)
+        : null
+
       return React.createElement('div', {
         ref: rootRef,
         className: 'lspi-panel',
         style: stylePos,
         role: 'dialog',
         'aria-label': T('overlay.label'),
-      }, [head, tools, hintText ? React.createElement('div', { key: 'hint', className: 'lspi-hint' }, hintText) : null, body])
+      }, [head, tools, hintText ? React.createElement('div', { key: 'hint', className: 'lspi-hint' }, hintText) : null, engineNote, body])
     }
 
     // ============================================================

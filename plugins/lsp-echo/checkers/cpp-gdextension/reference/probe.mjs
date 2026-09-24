@@ -322,6 +322,24 @@ exit 0
     'a root-level build entry is found for its own files', JSON.stringify(p12e && p12e.build))
   ok(p12e && !!p12e.files['src/flat.cpp'], 'its file is stamped project-relative', JSON.stringify(p12e && Object.keys(p12e.files)))
 
+  // ---- 13. one build per build directory ---------------------------------
+  console.log('\n[13] concurrent builds in one directory')
+  // Two checker processes can reach one build directory (the host retries a
+  // one-shot check, or a second DSH instance checks the same project). Two
+  // concurrent SCons runs there fight over the same object files.
+  const slowTwo = project('slow-two', SLOW_OUT, source)
+  const firstRun = run(['check', path.join(slowTwo.native, 'src', 'hello.cpp'), '--project', slowTwo.project,
+    '--out', path.join(ROOT, 'slow1.json'), '--build-timeout-ms', '6000'])
+  await new Promise((r) => setTimeout(r, 1500)) // let the first process take the lock
+  const secondRun = await run(['check', path.join(slowTwo.native, 'src', 'hello.cpp'), '--project', slowTwo.project,
+    '--out', path.join(ROOT, 'slow2.json'), '--build-timeout-ms', '2000'])
+  ok(secondRun.code === 2 && /already building/.test(secondRun.err),
+    'a second build on the same directory is refused, not raced', `${secondRun.code} ${secondRun.err.trim()}`)
+  ok(!fs.existsSync(path.join(ROOT, 'slow2.json')), 'the refused check wrote no payload')
+  const firstResult = await firstRun
+  ok(firstResult.code === 2 && /did not finish within/.test(firstResult.err),
+    'the first build still answers with its own verdict', `${firstResult.code} ${firstResult.err.trim()}`)
+
   console.log(`\n${failures ? 'FAILED' : 'PASSED'}: ${checks - failures}/${checks} checks`)
   if (!KEEP) {
     try { fs.rmSync(ROOT, { recursive: true, force: true }) } catch { /* windows lock: leave the temp dir */ }

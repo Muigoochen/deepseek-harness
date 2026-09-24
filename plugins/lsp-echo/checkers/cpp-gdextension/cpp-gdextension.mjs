@@ -11,10 +11,15 @@
 //   node <bridge> check <file...> --project <dir> [--sweep] [--out <json>]
 //   node <bridge> clientd --project <dir>   (persistent: JSON-lines on stdin,
 //        each line { id, files, sweep } -> reply { id, ok, payload })
+// Extra flags: --dir <dir> pins the build directory, --toolchain auto|msvc|mingw
+// overrides the toolchain detected from the project's artifacts,
+// --build-timeout-ms <n> overrides the 110s/190s budget.
 // Payload files keyed by project-relative path; each value
 //   { checked_at, errors, warnings, diagnostics: [{ severity, severityName,
 //     message, source, code, line, column, file }] } — same shape as the godot
-//     and typescript bridges.
+//     and typescript bridges. Link/build-system failures land under the
+//     extensionless key `<link>` (declared in engine.json `syntheticKeys` and in
+//     the payload's `syntheticKeys`, so only this engine replaces it).
 // Exit codes: 0 = no errors, 1 = errors found, 2 = failure to check.
 //
 // Which build: <dir>/build.ps1 when the GDExtension ships one (it owns the
@@ -26,6 +31,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 
 const log = (...a) => console.log('[cpp]', ...a)
@@ -329,27 +335,96 @@ function runOnce(hit, target, timeoutMs, flags, toolchain) {
 }
 
 /**
+ * A build directory may be reached by more than one checker process: the host
+ * retries a one-shot `check` after a clientd timeout, and a second DSH instance
+ * can check the same project. Two concurrent SCons runs in one directory fight
+ * over the same object files and the same DLL, so every build takes a lock in
+ * the plugin runtime dir (never in the project tree).
+ */
+const LOCK_DIR = () => path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'lsp-echo-runtime')
+const LOCK_STALE_MS = 15 * 60_000
+
+function lockPath(hit) {
+  const key = crypto.createHash('sha1').update(path.resolve(hit.dir).toLowerCase()).digest('hex').slice(0, 12)
+  return path.join(LOCK_DIR(), `cpp-build-${key}.lock`)
+}
+
+/** True while `pid` exists (`EPERM` means it exists but is not ours). */
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error && error.code === 'EPERM'
+  }
+}
+
+/**
+ * Wait for the build lock, then run `fn`. A holder that died leaves the lock
+ * behind, so a lock whose pid is gone (or that is older than the staleness
+ * window) is taken over. Waiting beyond the caller's own budget is pointless:
+ * it fails with what is actually happening instead of starting a second build.
+ * @returns {Promise<{ok: true, value: any} | {ok: false, error: string}>}
+ */
+async function withBuildLock(hit, budgetMs, fn) {
+  const file = lockPath(hit)
+  const deadline = Date.now() + Math.max(1_000, budgetMs)
+  for (;;) {
+    try {
+      fs.mkdirSync(LOCK_DIR(), { recursive: true })
+      const fd = fs.openSync(file, 'wx')
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now(), dir: hit.dir }))
+      fs.closeSync(fd)
+      try {
+        return { ok: true, value: await fn() }
+      } finally {
+        try { fs.unlinkSync(file) } catch { /* already released */ }
+      }
+    } catch (error) {
+      if (!error || error.code !== 'EEXIST') return { ok: false, error: `cannot take the build lock ${file}: ${(error && error.message) || error}` }
+      let held
+      try { held = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { held = undefined }
+      const stale = !held || !pidAlive(Number(held.pid)) || Date.now() - Number(held.at || 0) > LOCK_STALE_MS
+      if (stale) {
+        log(`taking over a stale build lock (${held && held.pid} is gone)`)
+        try { fs.unlinkSync(file) } catch { /* someone else won the race */ }
+        continue
+      }
+      if (Date.now() + 1_000 >= deadline) {
+        return { ok: false, error: `another check is already building ${hit.dir} (pid ${held.pid}); try again when it finishes` }
+      }
+      await new Promise((r) => setTimeout(r, 500))
+    }
+  }
+}
+
+/**
  * Build the requested targets. A sweep builds debug and release (release-only
- * failures are real); the two share one time budget.
+ * failures are real); the two share one time budget, and the whole run holds the
+ * build-directory lock.
  */
 async function runBuild(hit, sweep, flags, toolchain) {
   const budget = Number(flags['build-timeout-ms']) > 0
     ? Number(flags['build-timeout-ms'])
     : (sweep ? SWEEP_TIMEOUT_MS : MAIN_TIMEOUT_MS)
-  const deadline = Date.now() + budget
-  // build.ps1 takes `-Target both`; the bare SCons path runs twice.
-  const targets = hit.kind === 'ps1' ? ['debug'] : (sweep ? ['debug', 'release'] : ['debug'])
-  let out = ''
-  const commands = []
-  for (const target of targets) {
-    const left = deadline - Date.now()
-    if (left <= 1000) return { timedOut: true, out, commands, budgetMs: budget, timedOutOn: target }
-    const r = await runOnce(hit, target, left, { both: sweep && hit.kind === 'ps1' }, toolchain)
-    out += `${r.out}\n`
-    commands.push(`${r.text} -> exit ${r.code}${r.timedOut ? ' (killed)' : ''}`)
-    if (r.timedOut) return { timedOut: true, out, commands, budgetMs: budget, timedOutOn: target }
-  }
-  return { out, commands, budgetMs: budget }
+  const locked = await withBuildLock(hit, budget, async () => {
+    const deadline = Date.now() + budget
+    // build.ps1 takes `-Target both`; the bare SCons path runs twice.
+    const targets = hit.kind === 'ps1' ? ['debug'] : (sweep ? ['debug', 'release'] : ['debug'])
+    let out = ''
+    const commands = []
+    for (const target of targets) {
+      const left = deadline - Date.now()
+      if (left <= 1000) return { timedOut: true, out, commands, budgetMs: budget, timedOutOn: target }
+      const r = await runOnce(hit, target, left, { both: sweep && hit.kind === 'ps1' }, toolchain)
+      out += `${r.out}\n`
+      commands.push(`${r.text} -> exit ${r.code}${r.timedOut ? ' (killed)' : ''}`)
+      if (r.timedOut) return { timedOut: true, out, commands, budgetMs: budget, timedOutOn: target }
+    }
+    return { out, commands, budgetMs: budget }
+  })
+  if (!locked.ok) return { lockError: locked.error, out: '', commands: [], budgetMs: budget }
+  return locked.value
 }
 
 // ---------- diagnostics parsing ----------
@@ -512,6 +587,7 @@ async function checkOnce(project, requestedAbs, sweep, flags) {
     return { ok: false, error: (error && error.message) || String(error) }
   }
   const built = await runBuild(hit, sweep, flags, toolchain)
+  if (built.lockError) return { ok: false, error: built.lockError }
   if (built.timedOut) {
     const secs = (built.budgetMs / 1000).toFixed(1)
     return {
