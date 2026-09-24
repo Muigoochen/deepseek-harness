@@ -497,11 +497,29 @@ async function withBuildLock(hit, budgetMs, fn) {
     }
   }
   let kept = false
+  /**
+   * Rewrite the lock we hold. Ownership is re-read first: a process whose lock was
+   * taken over (the user deleted the file, a >24 h suspend) must not stamp its
+   * record over the new owner's. The record goes through a temp file because a
+   * reader that catches a half-written record treats it as held for 5 s.
+   */
+  const writeLock = (data) => {
+    const cur = readLock(file)
+    if (cur && Number(cur.pid) !== process.pid) return false
+    const tmp = `${file}.${process.pid}.tmp`
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(data))
+      fs.renameSync(tmp, file)
+      return true
+    } catch {
+      try { fs.unlinkSync(tmp) } catch { /* never created */ }
+      return false
+    }
+  }
   const lock = {
     record: (childPid) => {
-      try {
-        fs.writeFileSync(file, JSON.stringify({ pid: process.pid, childPid, at: Date.now(), dir: hit.dir }))
-      } catch { /* the lock keeps the taker pid, which still guards it */ }
+      // A failed write means the lock is no longer ours: nothing left to guard with.
+      writeLock({ pid: process.pid, childPid, at: Date.now(), dir: hit.dir })
     },
     /**
      * A build we could not kill is still writing into this directory. Leave the
@@ -509,11 +527,15 @@ async function withBuildLock(hit, budgetMs, fn) {
      * the next check waits for it instead of starting a second build beside it.
      */
     orphan: (childPid) => {
-      try {
-        fs.writeFileSync(file, JSON.stringify({ childPid, at: Date.now(), dir: hit.dir }))
+      if (writeLock({ childPid, at: Date.now(), dir: hit.dir })) {
         kept = true
-      } catch { /* nothing better to do than release normally */ }
+        lock.orphaned = true
+      }
     },
+    /** True once a build survived its kill and the lock was left for it. */
+    orphaned: false,
+    /** The lock file, for messages that must name what to clear. */
+    file,
   }
   try {
     const leftMs = Math.max(1_000, deadline - Date.now())
@@ -541,19 +563,20 @@ async function runBuild(hit, sweep, flags, toolchain) {
   const locked = await withBuildLock(hit, budget, async (lock, window) => {
     // One budget for the whole call: the wait above already spent part of it.
     const deadline = Date.now() + window.leftMs
+    const outcome = (extra) => ({ ...extra, budgetMs: window.leftMs, waitedMs: window.waitedMs, orphaned: lock.orphaned, lockFile: lock.file })
     // build.ps1 takes `-Target both`; the bare SCons path runs twice.
     const targets = hit.kind === 'ps1' ? ['debug'] : (sweep ? ['debug', 'release'] : ['debug'])
     let out = ''
     const commands = []
     for (const target of targets) {
       const left = deadline - Date.now()
-      if (left <= 1000) return { timedOut: true, out, commands, budgetMs: window.leftMs, waitedMs: window.waitedMs, timedOutOn: target }
+      if (left <= 1000) return outcome({ timedOut: true, out, commands, timedOutOn: target })
       const r = await runOnce(hit, target, left, { both: sweep && hit.kind === 'ps1' }, toolchain, lock)
       out += `${r.out}\n`
       commands.push(`${r.text} -> exit ${r.code}${r.timedOut ? ' (killed)' : ''}`)
-      if (r.timedOut) return { timedOut: true, out, commands, budgetMs: window.leftMs, waitedMs: window.waitedMs, timedOutOn: target }
+      if (r.timedOut) return outcome({ timedOut: true, out, commands, timedOutOn: target })
     }
-    return { out, commands, budgetMs: window.leftMs, waitedMs: window.waitedMs }
+    return outcome({ out, commands })
   })
   if (!locked.ok) return { lockError: locked.error, out: '', commands: [], budgetMs: budget }
   return locked.value
@@ -724,9 +747,12 @@ async function checkOnce(project, requestedAbs, sweep, flags) {
   if (built.timedOut) {
     const secs = (built.budgetMs / 1000).toFixed(1)
     const waited = built.waitedMs > 1_500 ? ` after waiting ${(built.waitedMs / 1000).toFixed(1)}s for another check` : ''
+    // The build could not be killed: say so here, instead of leaving it to the
+    // next check's refusal to reveal that something may still be writing.
+    const orphan = built.orphaned ? `; its process survived the kill and may still be building, so the next check waits for it (lock: ${built.lockFile})` : ''
     return {
       ok: false, out: built.out,
-      error: `build did not finish within ${secs}s${waited} (${built.timedOutOn} target); run it manually to see the full log`,
+      error: `build did not finish within ${secs}s${waited} (${built.timedOutOn} target); run it manually to see the full log${orphan}`,
     }
   }
   const byKey = parseDiagnostics(built.out, project, hit.dir)
