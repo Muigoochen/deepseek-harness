@@ -9,10 +9,13 @@ SCons 增量构建只重编改动的 TU,报出来的错就是真构建会遇到�
 ## 桥 CLI
 
 ```
-node cpp-gdextension.mjs check <file...> --project <dir> [--sweep] [--out <json>] [--dir <dir>] [--toolchain auto|msvc|mingw] [--build-timeout-ms N]
+node cpp-gdextension.mjs check <file...> --project <dir> [--sweep] [--out <json>] [--dir <dir>] [--toolchain auto|msvc|mingw] [--build-timeout-ms N] [--no-wait] [--kill-on-timeout]
 node cpp-gdextension.mjs clientd --project <dir>      # 常驻 JSON-lines,与其它引擎同一协议
 node cpp-gdextension.mjs host|status|stop [--project <dir>]
 ```
+
+`clientd` 的每条请求可以带 `budgetMs`(这次构建的预算)与 `noWait`(构架目录正忙时立刻回答、不排队等);
+插件的 pre-step 通道就是用它把"自动检查"限在 40 秒内,而模型显式要求检查时走 110s/190s。
 
 退出码:`0` 无错误 / `1` 有错误 / `2` **没能检查**(工具链缺失、超时、构建脚本自身失败)。
 
@@ -20,6 +23,11 @@ node cpp-gdextension.mjs host|status|stop [--project <dir>]
 
 - **先看这次要查的文件**:从每个文件所在目录往上找到最近的构建入口,那才是它的构建目录 ——
   一个项目里有两个 GDExtension 时,改动属于哪个就编哪个,不会拿另一个的"编过"冒充;
+- **只有构建入口、没有 `*.gdextension` 的目录不算这个项目的构建**:项目里 vendored 的依赖检出
+  (典型是 `godot-cpp`,它自带 `SConstruct`)就是这种形状 —— 拿它当构建入口会去编别人的源码,并在
+  `api_version` 上直接失败。这种情况继续往上找带 `.gdextension` 的扩展目录;真找不到才退回最近的入口。
+  依赖目录里的文件因此**永远不会被报成"检查通过"**:它们落在构建目录之外,payload 的
+  `engine_note` 会说明"有 N 个文件没被这次构建覆盖";
 - 没有可用文件时才走遍历:从项目根往下找(深度 ≤ 6;跳过
   `.git/.godot/node_modules/.venv/dist/build/bin/obj/godot-cpp` 等);
 - **同目录里既有构建入口、又有 `*.gdextension`** = 命中,立刻用;找不到这样的目录时退而使用
@@ -59,9 +67,20 @@ UTF-8(Windows PowerShell 5.1 默认按 ANSI 解码子进程输出,会把非 ASCI
 ## 时间预算
 
 插件给一次检查 120s(main)/ 200s(baseline);桥用 **110s / 190s** 的预算先作答,超时就回
-`build did not finish within Xs (target); run it manually…` —— 抢在插件那边的 clientd 超时之前,
-免得用户只看到一句"请求超时"。注意首次检查若撞上 godot-cpp 需要重编(改过依赖版本之后),
-大概率超预算;手动跑一次 `build.ps1` 之后就是增量了。
+`build did not finish within Xs (target)…` —— 抢在插件那边的 clientd 超时之前,免得用户只看到
+一句"请求超时"。**自动检查(pre-step 通道)另有一份 40 秒的预算**(`engine.json` 的 `budgetMs`),
+因为一次冷启动重编可能好几分钟,不该把用户的一轮对话卡在那里;模型显式调用 `lsp_echo check` 时
+才用 110s/190s。
+
+**超时不再杀构建**(默认):杀掉 SCons 会扔掉它已做完的工作、并把 `.sconsign.dblite` 留在半写状态,
+于是**下一次检查要重编更多** —— 实测过一个 21MB 签名库被打断后,下一次要重编 1119 个 godot-cpp
+对象(112 秒)。所以超时后桥把锁交给那个构建(记成"孤儿"记录)、立刻回答
+`… the build is still running (pid N) and the next check waits for it`;构建在后台跑完,下一次检查
+只要 4 秒。要真的杀掉(例如测试清理)显式加 `--kill-on-timeout`;`--no-wait` 则让检查在构建目录
+正忙时立刻回答而不是排队等。
+
+注意首次检查若撞上 godot-cpp 需要重编(改过依赖版本、或被中断过),会超预算;等它在后台跑完、
+或手动跑一次 `build.ps1` 之后就是增量。
 
 ## 并发(同一构建目录)
 
@@ -101,7 +120,7 @@ UTF-8(Windows PowerShell 5.1 默认按 ANSI 解码子进程输出,会把非 ASCI
 ## 自检
 
 ```powershell
-# 诊断解析 / 协议 / 诚实性路径 / 每文件构建目录 / 并发构建锁 + 真实 MSVC 端到端(65 项)
+# 诊断解析 / 协议 / 诚实性路径 / 每文件构建目录 / 依赖检出排除 / 并发构建锁 + 真实 MSVC 端到端(69 项)
 node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\probe.mjs --real-msvc
 
 # evidence 绑定 + 快照合并/作用域语义(可指向任意真实 GDExtension 项目)

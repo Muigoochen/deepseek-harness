@@ -339,7 +339,7 @@ function ensureClientd(bridge, project, role = 'main', editorPort) {
   return state
 }
 
-function clientdRequest(bridge, project, files, timeoutMs, role = 'main', editorPort, reloadFiles) {
+function clientdRequest(bridge, project, files, timeoutMs, role = 'main', editorPort, reloadFiles, buildBudgetMs, noWait) {
   return new Promise((resolve, reject) => {
     let state
     try { state = ensureClientd(bridge, project, role, editorPort) } catch (e) { reject(e); return }
@@ -355,6 +355,10 @@ function clientdRequest(bridge, project, files, timeoutMs, role = 'main', editor
     // before it reads diagnostics; omit the field entirely when there is none.
     const request = { id, files, sweep }
     if (Array.isArray(reloadFiles) && reloadFiles.length) request.didsave = reloadFiles
+    // A build-backed engine may cap its own build and refuse to wait for a busy
+    // build directory; the bridge honours both per request.
+    if (buildBudgetMs > 0) request.budgetMs = buildBudgetMs
+    if (noWait) request.noWait = true
     try { state.child.stdin.write(JSON.stringify(request) + '\n') } catch (e) { reject(e) }
   })
 }
@@ -439,9 +443,9 @@ export function rescanEngine(bridge, project, port) {
  *        persistent clientd path reloads them before reading diagnostics. The
  *        legacy one-shot fallback does not carry them.
  */
-export async function checkFiles(bridge, project, files, timeoutMs = 120_000, role = 'main', ownedExts, keepExts, editorPort, reloadFiles) {
+export async function checkFiles(bridge, project, files, timeoutMs = 120_000, role = 'main', ownedExts, keepExts, editorPort, reloadFiles, buildBudgetMs, noWait) {
   try {
-    const reply = await clientdRequest(bridge, project, files, timeoutMs, role, editorPort, reloadFiles)
+    const reply = await clientdRequest(bridge, project, files, timeoutMs, role, editorPort, reloadFiles, buildBudgetMs, noWait)
     if (reply && reply.ok && reply.payload) {
       return writeSnapshot(project, reply.payload, ownedExts, keepExts)
     }
@@ -470,7 +474,11 @@ export async function checkFiles(bridge, project, files, timeoutMs = 120_000, ro
     const tmpOut = path.join(runtimeRoot(), `.tmp-check-${safeName(project)}-${role}-${process.pid}-${Date.now()}.json`)
     const sweepArgs = role === 'baseline' ? ['--sweep'] : []
     const portArgs = editorPort ? ['--editor-port', String(editorPort)] : []
-    const r = await runBridge(bridge, ['check', ...sweepArgs, ...portArgs, ...reserveArgs(), ...files, '--project', project, '--out', tmpOut], timeoutMs)
+    // The one-shot path must carry the same limits the clientd request did, or a
+    // retry would build with the bridge's interactive default instead.
+    const budgetArgs = buildBudgetMs > 0 ? ['--build-timeout-ms', String(buildBudgetMs)] : []
+    const waitArgs = noWait ? ['--no-wait'] : []
+    const r = await runBridge(bridge, ['check', ...sweepArgs, ...portArgs, ...budgetArgs, ...waitArgs, ...reserveArgs(), ...files, '--project', project, '--out', tmpOut], timeoutMs)
     if (r.fatal) {
       try { fs.unlinkSync(tmpOut) } catch { /* best effort */ }
       throw new Error(r.stderr.trim() || r.stdout.trim() || 'bridge check failed')

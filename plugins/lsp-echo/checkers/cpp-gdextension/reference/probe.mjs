@@ -174,7 +174,7 @@ async function main() {
 
   console.log('\n[6] a build that overruns the budget is a failure')
   const slow = project('slow', SLOW_OUT, source)
-  const r6 = await run(['check', path.join(slow.native, 'src', 'hello.cpp'), '--project', slow.project, '--build-timeout-ms', '1500'])
+  const r6 = await run(['check', path.join(slow.native, 'src', 'hello.cpp'), '--project', slow.project, '--build-timeout-ms', '1500', '--kill-on-timeout'])
   ok(r6.code === 2, 'exit code 2 on timeout', `got ${r6.code}`)
   ok(/did not finish within/.test(r6.err), 'stderr says it did not finish', r6.err.trim())
 
@@ -324,12 +324,40 @@ exit 0
     'a root-level build entry is found for its own files', JSON.stringify(p12e && p12e.build))
   ok(p12e && !!p12e.files['src/flat.cpp'], 'its file is stamped project-relative', JSON.stringify(p12e && Object.keys(p12e.files)))
 
+  // A vendored dependency checkout inside the project carries an SConstruct too
+  // (godot-cpp does), and it is not this project's build: a file there must not
+  // drag the checker into building the dependency, and must never be reported clean.
+  const vend = path.join(ROOT, 'vendored')
+  const vendNative = path.join(vend, 'addons', 'probe_ext', 'platform', 'native')
+  fs.mkdirSync(path.join(vendNative, 'src'), { recursive: true })
+  fs.mkdirSync(path.join(vend, 'dep', 'src'), { recursive: true })
+  fs.writeFileSync(path.join(vendNative, 'SConstruct'), '# fixture\n', 'utf8')
+  fs.writeFileSync(path.join(vendNative, 'probe.gdextension'), '[configuration]\ncompatibility_minimum = "4.7"\n', 'utf8')
+  fs.writeFileSync(path.join(vendNative, 'build.ps1'), CLEAN_OUT, 'utf8')
+  fs.writeFileSync(path.join(vendNative, 'src', 'hello.cpp'), 'int main() { return 0; }\n', 'utf8')
+  fs.writeFileSync(path.join(vend, 'dep', 'SConstruct'), '# dependency build entry\n', 'utf8')
+  fs.writeFileSync(path.join(vend, 'dep', 'src', 'dep.cpp'), 'int dep() { return 0; }\n', 'utf8')
+  const out12f = path.join(ROOT, 'vendored.json')
+  const r12f = await run(['check', path.join(vend, 'dep', 'src', 'dep.cpp'), '--project', vend, '--out', out12f])
+  const p12f = readJson(out12f)
+  ok(r12f.code === 0 && p12f && path.resolve(p12f.build.dir) === path.resolve(vendNative),
+    'a vendored dependency\'s SConstruct is not this project\'s build',
+    `${r12f.code} ${JSON.stringify(p12f && p12f.build)} ${r12f.err.trim()}`)
+  ok(p12f && !p12f.files['dep/src/dep.cpp'] && /were not compiled/.test(p12f.engine_note || ''),
+    'the dependency file is never reported clean',
+    JSON.stringify(p12f && { files: Object.keys(p12f.files), note: p12f.engine_note }))
+
   // ---- 13. one build per build directory ---------------------------------
   console.log('\n[13] concurrent builds in one directory')
   // Two checker processes can reach one build directory (the host retries a
   // one-shot check, or a second DSH instance checks the same project). Two
   // concurrent SCons runs there fight over the same object files.
   const slowTwo = project('slow-two', SLOW_OUT, source)
+  const lockDir = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'lsp-echo-runtime')
+  const lockFor = (dir) => path.join(lockDir, `cpp-build-${crypto.createHash('sha1').update(path.resolve(dir).toLowerCase()).digest('hex').slice(0, 12)}.lock`)
+  const lockFile = lockFor(slowTwo.native)
+  fs.mkdirSync(lockDir, { recursive: true })
+  const locked = (extra) => fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999999, at: Date.now(), dir: slowTwo.native, ...extra }))
   const firstRun = run(['check', path.join(slowTwo.native, 'src', 'hello.cpp'), '--project', slowTwo.project,
     '--out', path.join(ROOT, 'slow1.json'), '--build-timeout-ms', '6000'])
   await new Promise((r) => setTimeout(r, 1500)) // let the first process take the lock
@@ -341,14 +369,17 @@ exit 0
   const firstResult = await firstRun
   ok(firstResult.code === 2 && /did not finish within/.test(firstResult.err),
     'the first build still answers with its own verdict', `${firstResult.code} ${firstResult.err.trim()}`)
+  ok(/still running \(pid \d+\)/.test(firstResult.err),
+    'and says the build it did not wait for is still running', firstResult.err.trim())
+  // Killing a build throws away SCons's incremental state and makes the next check
+  // rebuild more, so a check that runs out of budget leaves the build running and
+  // hands it the lock instead (probe [6] opts into the kill for cleanup).
+  const heldRecord = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
+  ok(!heldRecord.pid && heldRecord.childPid, 'the lock is left naming only that build (orphan record)', JSON.stringify(heldRecord))
+  try { fs.unlinkSync(lockFile) } catch { /* released by then */ }
   // Killing the checker does not kill the compiler it started, so a lock must
   // read as held while either pid lives — otherwise the retry would build
   // concurrently with the orphan.
-  const lockDir = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'lsp-echo-runtime')
-  const lockKey = crypto.createHash('sha1').update(path.resolve(slowTwo.native).toLowerCase()).digest('hex').slice(0, 12)
-  const lockFile = path.join(lockDir, `cpp-build-${lockKey}.lock`)
-  fs.mkdirSync(lockDir, { recursive: true })
-  const locked = (extra) => fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999999, at: Date.now(), dir: slowTwo.native, ...extra }))
   locked({ childPid: process.pid }) // taker gone, its build child (this probe) alive
   const orphanRun = await run(['check', path.join(slowTwo.native, 'src', 'hello.cpp'), '--project', slowTwo.project,
     '--out', path.join(ROOT, 'slow3.json'), '--build-timeout-ms', '2000'])
@@ -366,13 +397,15 @@ exit 0
     '--out', path.join(ROOT, 'slow4.json'), '--build-timeout-ms', '2500'])
   ok(takeoverRun.code === 2 && /did not finish within/.test(takeoverRun.err),
     'a lock whose taker and build child are both gone is taken over', `${takeoverRun.code} ${takeoverRun.err.trim()}`)
-  ok(!fs.existsSync(lockFile), 'the taken-over lock is released again')
+  const takeoverRecord = JSON.parse(fs.readFileSync(lockFile, 'utf8'))
+  ok(!takeoverRecord.pid && takeoverRecord.childPid,
+    'the taken-over lock is handed to the build that outran its budget', JSON.stringify(takeoverRecord))
+  try { fs.unlinkSync(lockFile) } catch { /* released by then */ }
   ok(/already building .*\(lock: .*cpp-build-/.test(orphanRun.err), 'the refusal names the lock file to clear', orphanRun.err.trim())
   // Waiting comes out of the same budget as the build: with a 25s budget and a 6s
   // wait the build gets ~19s, so the whole check answers inside its budget.
   const waitSlow = project('wait-slow', SLOW_OUT, source)
   const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 6000)'], { stdio: 'ignore' })
-  const lockFor = (dir) => path.join(lockDir, `cpp-build-${crypto.createHash('sha1').update(path.resolve(dir).toLowerCase()).digest('hex').slice(0, 12)}.lock`)
   const holderLock = lockFor(waitSlow.native)
   fs.writeFileSync(holderLock, JSON.stringify({ pid: 999999999, childPid: holder.pid, at: Date.now(), dir: waitSlow.native }))
   const waitStart = Date.now()
@@ -382,14 +415,17 @@ exit 0
   ok(waitRun.code === 2 && /did not finish within/.test(waitRun.err) && waitElapsed < 28_000,
     'a check that waits builds inside the same budget, not a second one', `${waitRun.code} ${waitElapsed}ms ${waitRun.err.trim()}`)
   ok(/after waiting .*s for another check/.test(waitRun.err), 'and says that it had to wait', waitRun.err.trim())
-  ok(!fs.existsSync(holderLock), 'the waited-out lock is released again')
+  const waitedRecord = JSON.parse(fs.readFileSync(holderLock, 'utf8'))
+  ok(!waitedRecord.pid && waitedRecord.childPid,
+    'the waited-out lock is handed to the build that outran its budget', JSON.stringify(waitedRecord))
+  try { fs.unlinkSync(holderLock) } catch { /* released by then */ }
   // A short remaining window still gets a build attempt: refusing would trade a
   // possible result for a certain failure, and the bridge answers its own timeout
   // before the host's timer, so there is nothing dangerous to start.
   const holder2 = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 6000)'], { stdio: 'ignore' })
   fs.writeFileSync(holderLock, JSON.stringify({ pid: 999999999, childPid: holder2.pid, at: Date.now(), dir: waitSlow.native }))
   const nearRun = await run(['check', path.join(waitSlow.native, 'src', 'hello.cpp'), '--project', waitSlow.project,
-    '--out', path.join(ROOT, 'near.json'), '--build-timeout-ms', '12000'])
+    '--out', path.join(ROOT, 'near.json'), '--build-timeout-ms', '12000', '--kill-on-timeout'])
   ok(nearRun.code === 2 && /did not finish within/.test(nearRun.err) && !/already building/.test(nearRun.err),
     'a small remaining window still gets a build attempt, not a refusal', `${nearRun.code} ${nearRun.err.trim()}`)
   // A record no build can still be behind is cleared, so a recycled pid cannot
@@ -400,6 +436,25 @@ exit 0
   const agedRun = await run(['check', path.join(waitClean.native, 'src', 'hello.cpp'), '--project', waitClean.project,
     '--out', path.join(ROOT, 'aged.json'), '--build-timeout-ms', '20000'])
   ok(agedRun.code === 0, 'an aged record with a live pid is cleared, not waited on', `${agedRun.code} ${agedRun.err.trim()}`)
+
+  // Locks these fixture builds left behind (they name builds that outran their
+  // budget and were not killed): every record pointing into a probe fixture is
+  // swept, including leftovers of an earlier probe run whose root is long gone.
+  try {
+    const tempLower = path.resolve(os.tmpdir()).toLowerCase()
+    for (const name of fs.readdirSync(lockDir)) {
+      if (!name.startsWith('cpp-build-') || !name.endsWith('.lock')) continue
+      const p = path.join(lockDir, name)
+      let rec
+      try { rec = JSON.parse(fs.readFileSync(p, 'utf8')) } catch { rec = undefined }
+      if (!rec || typeof rec.dir !== 'string') continue
+      const dir = path.resolve(rec.dir)
+      const inTemp = dir.toLowerCase().startsWith(tempLower) && path.basename(dir).startsWith('dsh-cpp-')
+      if (inTemp) {
+        try { fs.unlinkSync(p) } catch { /* best effort */ }
+      }
+    }
+  } catch { /* no runtime dir */ }
 
   console.log(`\n${failures ? 'FAILED' : 'PASSED'}: ${checks - failures}/${checks} checks`)
   if (!KEEP) {

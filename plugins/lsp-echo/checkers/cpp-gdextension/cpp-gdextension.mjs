@@ -133,10 +133,13 @@ function isUnder(root, child) {
  * Locate the directory that holds this project's GDExtension build. The files
  * a check was asked about decide first: their nearest ancestor carrying a build
  * entry owns them, so a project with two GDExtensions builds the right one
- * instead of reporting the other extension's files clean. Without usable
- * requested files the walk prefers a directory carrying a `.gdextension` next to
- * its build entry, then any build entry, so a project that keeps the
- * `.gdextension` elsewhere still builds.
+ * instead of reporting the other extension's files clean. An entry whose
+ * directory has no `.gdextension` is not an extension build — that is what a
+ * vendored dependency checkout (`godot-cpp/SConstruct`) looks like, and building
+ * it fails on `api_version` while compiling someone else's sources — so the walk
+ * keeps going and prefers the extension directory above it. Without a usable hit
+ * the project-wide walk decides: a directory carrying a `.gdextension` next to
+ * its build entry first, then any build entry.
  * @param {string} project project root
  * @param {object} flags parsed CLI flags (`--dir` overrides the walk)
  * @param {string[]} [requestedAbs] absolute files this check was asked about
@@ -151,6 +154,7 @@ function findBuildDir(project, flags, requestedAbs = []) {
     return { dir, ...entry, gdexts, apiVersion: apiVersionOf(gdexts) }
   }
   const root = path.resolve(project)
+  let nearest
   for (const abs of requestedAbs) {
     let dir = path.dirname(path.resolve(abs))
     for (;;) {
@@ -158,7 +162,9 @@ function findBuildDir(project, flags, requestedAbs = []) {
       const entry = entryOf(dir)
       if (entry) {
         const gdexts = gdextensionFiles(dir)
-        return { dir, ...entry, gdexts, apiVersion: apiVersionOf(gdexts) }
+        // The extension's own build directory (it ships the .gdextension).
+        if (gdexts.length) return { dir, ...entry, gdexts, apiVersion: apiVersionOf(gdexts) }
+        if (!nearest) nearest = { dir, ...entry, gdexts, apiVersion: undefined }
       }
       if (dir === root) break
       const parent = path.dirname(dir)
@@ -185,7 +191,7 @@ function findBuildDir(project, flags, requestedAbs = []) {
     }
     return undefined
   }
-  const hit = walk(root, 0) || fallback
+  const hit = walk(root, 0) || nearest || fallback
   if (!hit) {
     throw new Error(`no build.ps1/SConstruct within ${MAX_BUILD_DIR_DEPTH} levels of ${root} — is this a GDExtension project?`)
   }
@@ -336,16 +342,26 @@ function runOnce(hit, target, timeoutMs, flags, toolchain, lock) {
     let grace
     const timer = setTimeout(() => {
       timedOut = true
-      killTree(child)
-      // A killed tree normally closes its stdio. A grandchild that keeps the pipe
-      // open would stall that forever, and the answer matters more than the log.
-      // The lock then stays behind as an orphan record: the build we failed to
-      // kill is still writing here, so the next check must wait, not race it.
-      grace = setTimeout(() => {
-        if (lock && lock.orphan && child.pid) lock.orphan(child.pid)
-        resolve({ code: undefined, out, timedOut: true, text })
-      }, 5_000)
-      if (typeof grace.unref === 'function') grace.unref()
+      if (flags.killOnTimeout) {
+        killTree(child)
+        // A killed tree normally closes its stdio. A grandchild that keeps the pipe
+        // open would stall that forever, and the answer matters more than the log.
+        // The lock then stays behind as an orphan record: the build we failed to
+        // kill is still writing here, so the next check must wait, not race it.
+        grace = setTimeout(() => {
+          if (lock && lock.orphan && child.pid) lock.orphan(child.pid)
+          resolve({ code: undefined, out, timedOut: true, text })
+        }, 5_000)
+        if (typeof grace.unref === 'function') grace.unref()
+        return
+      }
+      // Killing a build throws away the work SCons already did and leaves its
+      // signature database half written, so the next check rebuilds more than this
+      // one did. A check that ran out of budget therefore leaves the build running,
+      // hands the lock to it and answers now: the next check waits for that build
+      // and finds the work already done.
+      if (lock && lock.orphan && child.pid) lock.orphan(child.pid)
+      resolve({ code: undefined, out, timedOut: true, text, stillRunning: child.pid })
     }, timeoutMs)
     const onData = (d) => { out += d }
     child.stdout.on('data', onData)
@@ -461,10 +477,11 @@ function takeOverStaleLock(file, held) {
  * Failure to *take* the lock is reported; a failure from `fn` propagates.
  * @param {{dir: string}} hit build directory
  * @param {number} budgetMs the caller's own time budget
+ * @param {{noWait?: boolean}} opts `noWait`: report a held lock at once instead of waiting it out
  * @param {(lock: {record: (childPid: number) => void, orphan: (childPid: number) => void}, window: {leftMs: number, waitedMs: number}) => Promise<any>} fn the build
  * @returns {Promise<{ok: true, value: any} | {ok: false, error: string}>}
  */
-async function withBuildLock(hit, budgetMs, fn) {
+async function withBuildLock(hit, budgetMs, opts, fn) {
   const file = lockPath(hit)
   const startedAt = Date.now()
   const deadline = startedAt + Math.max(1_000, budgetMs)
@@ -474,7 +491,9 @@ async function withBuildLock(hit, budgetMs, fn) {
       : held.childPid
         ? (held.pid ? `pid ${held.pid}, build pid ${held.childPid}` : `build pid ${held.childPid} (orphan)`)
         : `pid ${held.pid}`
-    const why = left > 0 ? `this check has ${(left / 1000).toFixed(0)}s of its budget left, too little to build` : 'this check ran out of its budget waiting'
+    const why = opts && opts.noWait
+      ? 'this check does not wait for another build'
+      : left > 0 ? `this check has ${(left / 1000).toFixed(0)}s of its budget left, too little to build` : 'this check ran out of its budget waiting'
     return { ok: false, error: `another check is already building ${hit.dir} (${who}); ${why} (lock: ${file})` }
   }
   for (;;) {
@@ -492,6 +511,7 @@ async function withBuildLock(hit, budgetMs, fn) {
         continue
       }
       const left = deadline - Date.now()
+      if (opts && opts.noWait) return refuse(held, left)
       if (left <= MIN_BUILD_MS) return refuse(held, left)
       await new Promise((r) => setTimeout(r, Math.min(500, left)))
     }
@@ -522,18 +542,22 @@ async function withBuildLock(hit, budgetMs, fn) {
       writeLock({ pid: process.pid, childPid, at: Date.now(), dir: hit.dir })
     },
     /**
-     * A build we could not kill is still writing into this directory. Leave the
-     * record naming only that child (no taker pid, which is this live process) so
-     * the next check waits for it instead of starting a second build beside it.
+     * A build we could not kill (or chose not to kill) is still writing into this
+     * directory. Leave the record naming only that child (no taker pid, which is
+     * this live process) so the next check waits for it instead of starting a
+     * second build beside it.
      */
     orphan: (childPid) => {
       if (writeLock({ childPid, at: Date.now(), dir: hit.dir })) {
         kept = true
         lock.orphaned = true
+        lock.orphanPid = childPid
       }
     },
-    /** True once a build survived its kill and the lock was left for it. */
+    /** True once a build survived its budget or its kill and the lock was left for it. */
     orphaned: false,
+    /** Pid of that build, for messages that must name the process still running. */
+    orphanPid: undefined,
     /** The lock file, for messages that must name what to clear. */
     file,
   }
@@ -560,10 +584,17 @@ async function runBuild(hit, sweep, flags, toolchain) {
   const budget = Number(flags['build-timeout-ms']) > 0
     ? Number(flags['build-timeout-ms'])
     : (sweep ? SWEEP_TIMEOUT_MS : MAIN_TIMEOUT_MS)
-  const locked = await withBuildLock(hit, budget, async (lock, window) => {
+  const locked = await withBuildLock(hit, budget, { noWait: flags['no-wait'] === true }, async (lock, window) => {
     // One budget for the whole call: the wait above already spent part of it.
     const deadline = Date.now() + window.leftMs
-    const outcome = (extra) => ({ ...extra, budgetMs: window.leftMs, waitedMs: window.waitedMs, orphaned: lock.orphaned, lockFile: lock.file })
+    const outcome = (extra) => ({
+      ...extra,
+      budgetMs: window.leftMs,
+      waitedMs: window.waitedMs,
+      orphaned: lock.orphaned,
+      orphanPid: lock.orphanPid,
+      lockFile: lock.file,
+    })
     // build.ps1 takes `-Target both`; the bare SCons path runs twice.
     const targets = hit.kind === 'ps1' ? ['debug'] : (sweep ? ['debug', 'release'] : ['debug'])
     let out = ''
@@ -571,7 +602,10 @@ async function runBuild(hit, sweep, flags, toolchain) {
     for (const target of targets) {
       const left = deadline - Date.now()
       if (left <= 1000) return outcome({ timedOut: true, out, commands, timedOutOn: target })
-      const r = await runOnce(hit, target, left, { both: sweep && hit.kind === 'ps1' }, toolchain, lock)
+      const r = await runOnce(hit, target, left, {
+        both: sweep && hit.kind === 'ps1',
+        killOnTimeout: flags['kill-on-timeout'] === true,
+      }, toolchain, lock)
       out += `${r.out}\n`
       commands.push(`${r.text} -> exit ${r.code}${r.timedOut ? ' (killed)' : ''}`)
       if (r.timedOut) return outcome({ timedOut: true, out, commands, timedOutOn: target })
@@ -747,12 +781,12 @@ async function checkOnce(project, requestedAbs, sweep, flags) {
   if (built.timedOut) {
     const secs = (built.budgetMs / 1000).toFixed(1)
     const waited = built.waitedMs > 1_500 ? ` after waiting ${(built.waitedMs / 1000).toFixed(1)}s for another check` : ''
-    // The build could not be killed: say so here, instead of leaving it to the
-    // next check's refusal to reveal that something may still be writing.
-    const orphan = built.orphaned ? `; its process survived the kill and may still be building, so the next check waits for it (lock: ${built.lockFile})` : ''
+    const tail = built.orphanPid
+      ? `; the build is still running (pid ${built.orphanPid}) and the next check waits for it — or run it manually to see the full log`
+      : '; run it manually to see the full log'
     return {
       ok: false, out: built.out,
-      error: `build did not finish within ${secs}s${waited} (${built.timedOutOn} target); run it manually to see the full log${orphan}`,
+      error: `build did not finish within ${secs}s${waited} (${built.timedOutOn} target)${tail}`,
     }
   }
   const byKey = parseDiagnostics(built.out, project, hit.dir)
@@ -815,9 +849,18 @@ function cmdClientd(project, flags) {
     if (draining) return
     draining = true
     while (queue.length) {
-      const { id, files, sweep } = queue.shift()
+      const { id, files, sweep, budgetMs, noWait, killOnTimeout } = queue.shift()
       try {
-        const r = await checkOnce(project, (files || []).map((f) => path.resolve(project, f)), !!sweep, flags)
+        // A request may carry its own build budget and waiting policy: the plugin
+        // asks for a short, non-blocking check before a step and a patient one
+        // when a model explicitly asks for a check.
+        const perRequest = {
+          ...flags,
+          'build-timeout-ms': budgetMs > 0 ? budgetMs : flags['build-timeout-ms'],
+          'no-wait': noWait === true || flags['no-wait'] === true,
+          'kill-on-timeout': killOnTimeout === true,
+        }
+        const r = await checkOnce(project, (files || []).map((f) => path.resolve(project, f)), !!sweep, perRequest)
         if (r.ok) reply(id, { ok: true, payload: r.payload })
         else reply(id, { ok: false, error: r.error })
       } catch (error) {
@@ -836,7 +879,7 @@ function cmdClientd(project, flags) {
       if (!line.trim()) continue
       let req
       try { req = JSON.parse(line) } catch { continue }
-      queue.push({ id: req && req.id, files: req.files, sweep: req.sweep })
+      queue.push({ id: req && req.id, files: req.files, sweep: req.sweep, budgetMs: req && req.budgetMs, noWait: req && req.noWait, killOnTimeout: req && req.killOnTimeout })
       void drain()
     }
   })
@@ -871,7 +914,10 @@ otherwise \`py -m SCons platform=<os> target=template_<debug|release>\`.
 --sweep builds the release target too; a plain check builds debug only.
 --dir <dir> pins the build directory (default: the changed files decide, else a
 walk); --toolchain auto|msvc|mingw overrides the toolchain detected from the
-project's artifacts; --build-timeout-ms <n> overrides the 110s/190s budget.
+project's artifacts; --build-timeout-ms <n> overrides the 110s/190s budget;
+--no-wait reports a busy build directory instead of waiting for it;
+--kill-on-timeout kills the build at the budget (default: leave it running and
+hand it the lock, because a killed SCons rebuilds more next time).
 exit codes: 0 = no errors, 1 = errors found, 2 = failure to check
 `
 

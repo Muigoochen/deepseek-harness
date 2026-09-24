@@ -4,5 +4,7 @@
   "extensions": [".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"],
   "bridge": "cpp-gdextension.mjs",
   "evidence": ["SConstruct", "*.gdextension"],
-  "syntheticKeys": ["<link>"]
+  "syntheticKeys": ["<link>"],
+  "budgetMs": 40000,
+  "noWait": true
 }

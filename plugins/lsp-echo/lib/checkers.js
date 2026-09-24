@@ -57,6 +57,16 @@ function descriptor(dir) {
     syntheticKeys: Array.isArray(raw.syntheticKeys)
       ? raw.syntheticKeys.filter((k) => typeof k === 'string' && k)
       : undefined,
+    // `budgetMs` caps the build one check may run in the pre-step channel. An
+    // engine whose check is a real build (C++) declares a small budget so a step
+    // is never blocked by a cold rebuild; without it the engine gets the
+    // interactive budget.
+    budgetMs: typeof raw.budgetMs === 'number' && Number.isFinite(raw.budgetMs) && raw.budgetMs > 0
+      ? raw.budgetMs
+      : undefined,
+    // `noWait` marks an engine whose pre-step check must report a busy build
+    // directory at once instead of waiting for it (same reason as budgetMs).
+    noWait: raw.noWait === true,
   }
 }
 
@@ -66,7 +76,7 @@ function descriptor(dir) {
  * resolved to the declared file inside that directory, falling back to
  * bridge.mjs. Directories without a usable descriptor are skipped.
  * @param {string} pluginRoot absolute plugin package root.
- * @returns {Record<string, { id: string; name: string; bridge: string; marker: string; extensions: string[]; evidence?: string[]; fallback?: boolean; syntheticKeys?: string[] }>}
+ * @returns {Record<string, { id: string; name: string; bridge: string; marker: string; extensions: string[]; evidence?: string[]; fallback?: boolean; syntheticKeys?: string[]; budgetMs?: number; noWait?: boolean }>}
  */
 export function engines(pluginRoot) {
   const base = path.join(pluginRoot, 'checkers')
@@ -96,6 +106,8 @@ export function engines(pluginRoot) {
       evidence: desc.evidence,
       fallback: desc.fallback,
       syntheticKeys: desc.syntheticKeys,
+      budgetMs: desc.budgetMs,
+      noWait: desc.noWait,
     }
   }
   return list

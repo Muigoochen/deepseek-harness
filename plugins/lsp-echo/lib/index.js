@@ -111,9 +111,11 @@ const REGISTRY_SCHEMA = z.object({
 const FORCED_SKIP = ['node_modules', '.git', '.godot']
 // Directories skipped by default but open to per-project configuration, because
 // a project may keep authored source there: a Godot addon IS the deliverable for
-// some projects. The plugin's own bridge directory is the one addon that stays
-// skipped — it is copied in by this plugin and its churn is not authored work.
-const DEFAULT_OPTIONAL_SKIP = [`addons/${ADDON_ID}`]
+// some projects. Two entries stay skipped out of the box: this plugin's own
+// bridge addon (copied in by the plugin, its churn is not authored work) and a
+// vendored `godot-cpp` checkout (the dependency, whose own test scripts and
+// sources are neither this project's code nor buildable by its SConstruct).
+const DEFAULT_OPTIONAL_SKIP = [`addons/${ADDON_ID}`, 'godot-cpp']
 const DEFAULT_SKIP = [...FORCED_SKIP, ...DEFAULT_OPTIONAL_SKIP]
 
 /** `res://` path of the engine bridge addon's plugin.cfg inside a project. */
@@ -814,11 +816,14 @@ export function apply(ctx, config) {
    * @param {string[]|undefined} keepExts extensions the snapshot must keep
    * @param {string[]} [reloadFiles] scripts whose disk content changed, for the
    *   engine to reload through the language server before it answers
+   * @param {{budgetMs?: number, noWait?: boolean}} [limits] build-backed engines:
+   *   cap the build and refuse to wait for a busy build directory
    * @returns {Promise<object>} diagnostics payload
    */
-  const checkWithHeal = async (eng, project, files, timeoutMs, role, ownExts, keepExts, reloadFiles) => {
+  const checkWithHeal = async (eng, project, files, timeoutMs, role, ownExts, keepExts, reloadFiles, limits) => {
     const port = enginePortOf(eng.id, project)
-    const payload = await checkFiles(eng.bridge, project, files, timeoutMs, role, ownExts, keepExts, port, reloadFiles)
+    const payload = await checkFiles(eng.bridge, project, files, timeoutMs, role, ownExts, keepExts, port, reloadFiles,
+      limits && limits.budgetMs, limits && limits.noWait)
     if (!eng.rescan) return payload
     const missing = missingTypeNames(payload, project, files)
     if (!missing.length) return payload
@@ -835,7 +840,8 @@ export function apply(ctx, config) {
       // leave the first result in place instead of reporting "no diagnostics".
       // The smaller budget keeps the doubled cost off the pre-step path.
       const retryBudgetMs = Math.min(timeoutMs, 45_000)
-      const healed = await checkFiles(eng.bridge, project, files, retryBudgetMs, role, ownExts, keepExts, port, reloadFiles)
+      const healed = await checkFiles(eng.bridge, project, files, retryBudgetMs, role, ownExts, keepExts, port, reloadFiles,
+        limits && limits.budgetMs, limits && limits.noWait)
       if (missingTypeNames(healed, project, files).length) {
         trace('rescan', eng.id, 're-check still reports unknown types; the engine may not have re-published diagnostics yet')
       }
@@ -1753,6 +1759,10 @@ export function apply(ctx, config) {
     try { fs.appendFileSync(traceLog, `${new Date().toISOString()} ${parts.join(' ')}\n`) } catch { /* never break the step */ }
   }
   const lastInjected = new Map()
+  // Failure notices (per project + engine + message): a check that could not run
+  // is reported once, then at most once per cooldown while it keeps failing.
+  const failNotice = new Map()
+  const FAIL_NOTICE_COOLDOWN_MS = 180_000
   let baselineStarter = null // assigned the guarded startBaseline below
   ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
     const decision = await next()
@@ -1800,6 +1810,12 @@ export function apply(ctx, config) {
     watcher.tick() // full-tree diff at the step boundary (mode B)
     const structural = watcher.drainStructural()
     const dirty = watcher.drain().filter((f) => fs.existsSync(f)) // drop deleted files (routing would throw)
+    // A file created since the last step is new work for every engine that owns
+    // it: without this a new script or C++ file is silently never checked (the
+    // structural signal only exists to make engines rescan their project).
+    const createdOwned = structural.created.filter(
+      (f) => fs.existsSync(f) && boundEngines.some((e) => matchExtension(e, f)),
+    )
     const rescannedThisRound = new Set() // engine ids already rescanned in this round
     // A script created or deleted since the last step may declare a class_name
     // the running engine has not registered yet: refresh rescan-capable engines
@@ -1825,9 +1841,9 @@ export function apply(ctx, config) {
     // A changed script can break the files that reference it, and the engine
     // reports only on the file it is given: check the referencing files in the
     // same round, or a signature change reads as no change at all.
-    let touched = dirty
+    let touched = [...new Set([...dirty, ...createdOwned])]
     try {
-      const changedGd = dirty.filter((f) => f.toLowerCase().endsWith('.gd'))
+      const changedGd = [...dirty, ...createdOwned].filter((f) => f.toLowerCase().endsWith('.gd'))
       // A changed script can break the files that reference it, and the engine
       // reports only on the file it is given: the dependent candidates come from
       // the same file set the class_name index uses, so `addons` is released
@@ -1836,7 +1852,7 @@ export function apply(ctx, config) {
       const candidates = changedGd.length ? scanFiles(rec.path, depSkip, ['.gd']).keys() : []
       const dependents = changedGd.length ? dependentsOf(rec.path, changedGd, candidates) : []
       if (dependents.length) {
-        touched = [...dirty, ...dependents]
+        touched = [...new Set([...touched, ...dependents])]
         trace('pre-step', agentId, `+${dependents.length} dependent file(s) of the changed script(s)`)
       }
     } catch (error) {
@@ -1874,7 +1890,7 @@ export function apply(ctx, config) {
     // rescan deliberately skips a script that is open in the script editor
     // (EditorFileSystem::_should_reload_script), which leaves the parse tree its
     // dependents read with the pre-edit members; didSave rebuilds that tree.
-    const changedScripts = dirty.filter((f) => f.toLowerCase().endsWith('.gd'))
+    const changedScripts = [...dirty, ...createdOwned].filter((f) => f.toLowerCase().endsWith('.gd'))
     const contentStale = boundEngines.filter(
       (e) => e.rescan && !rescannedThisRound.has(e.id) && touched.some((f) => matchExtension(e, f)),
     )
@@ -1886,14 +1902,29 @@ export function apply(ctx, config) {
     for (const eng of boundEngines) {
       const files = byEngine.get(eng.id) || []
       if (!files.length) continue
+      // A build-backed engine declares a small build budget and refuses to wait
+      // for a busy build directory: a step never blocks behind a cold rebuild,
+      // and the files stay pending for the next step instead (see the catch).
+      const limits = (eng.budgetMs || eng.noWait) ? { budgetMs: eng.budgetMs, noWait: eng.noWait } : undefined
+      const hostTimeoutMs = eng.budgetMs ? eng.budgetMs + 20_000 : 120_000
       tasks.push(
-        checkWithHeal(eng, rec.path, files, 120_000, 'main', eng.extensions, keepExts,
-          changedScripts.filter((f) => matchExtension(eng, f)))
+        checkWithHeal(eng, rec.path, files, hostTimeoutMs, 'main', eng.extensions, keepExts,
+          changedScripts.filter((f) => matchExtension(eng, f)), limits)
           .then((payload) => ({ engineId: eng.id, eng, payload }))
           .catch((error) => {
-            console.error(`[lsp-echo] check failed (${eng.id}): ${(error && error.message) || error}`)
-            trace('pre-step', agentId, `check failed (${eng.id}): ${(error && error.message) || error}`)
-            return { engineId: eng.id, eng, payload: undefined }
+            const message = (error && error.message) || String(error)
+            console.error(`[lsp-echo] check failed (${eng.id}): ${message}`)
+            trace('pre-step', agentId, `check failed (${eng.id}): ${message}`)
+            // A check that did not run verified nothing: keep its files pending so
+            // the next step retries them (the build may still be finishing in the
+            // background) instead of dropping the round as if it were clean. Only
+            // a check that gave up on a busy or still-running build is retried —
+            // a project whose build entry is simply wrong would otherwise pay the
+            // same budget on every single step.
+            if (/did not finish within|already building|does not wait/.test(message)) {
+              for (const f of files) watcher.dirty.add(f)
+            }
+            return { engineId: eng.id, eng, payload: undefined, failure: message }
           }),
       )
     }
@@ -1906,10 +1937,22 @@ export function apply(ctx, config) {
     // counts the whole project: count only the files this round asked for, per
     // engine, so totals and echoes never double-count nor report older results.
     const roundRel = new Set(touched.map((f) => path.relative(rec.path, f).split(path.sep).join('/')))
-    for (const { engineId, eng, payload } of results) {
+    for (const { engineId, eng, payload, failure } of results) {
       // An engine that silently fell back to headless (dead editor LSP port)
       // still "succeeds"; surface its host-state warning once per occurrence.
       if (eng) maybeToastEngineWarn(eng, rec.path)
+      if (failure) {
+        // Never let a check that did not run read as a clean round. Repeat the
+        // same failure at most once per cooldown, so a project whose build cannot
+        // keep up does not inject the same sentence on every step.
+        const key = `${rec.path.toLowerCase()}::${engineId}::${failure}`
+        const last = failNotice.get(key)
+        if (!last || Date.now() - last > FAIL_NOTICE_COOLDOWN_MS) {
+          failNotice.set(key, Date.now())
+          parts.push(`[lsp-echo] ${engineId} 这一轮没跑完，你刚才改的文件没有被验证：${failure}\n（文件已留在待检查列表，下一步会自动重试；这不等于没有问题。）`)
+        }
+        continue
+      }
       if (!payload) continue
       const scope = engineScope(payload, eng ? eng.extensions : undefined, eng ? eng.syntheticKeys : undefined)
       const scoped = { files: scope.files, summary: scope.summary, engine_note: payload && payload.engine_note }
