@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 
 const log = (...a) => console.log('[cpp]', ...a)
 const errl = (...a) => console.error('[cpp]', ...a)
@@ -289,15 +289,24 @@ function commandFor(hit, target, flags, toolchain) {
 /**
  * Stop a build and everything it started. On Windows killing the shell leaves
  * SCons and the compiler writing into the same build directory, so a follow-up
- * check would race the build that was supposed to be over.
+ * check would race the build that was supposed to be over. A kill that fails is
+ * followed by the direct one: leaving the tree alive would keep the lock held
+ * (its pid is recorded) and stall the next check.
  * @param {import('node:child_process').ChildProcess} child killed child
  */
 function killTree(child) {
   if (!child || !child.pid) return
   try {
-    if (process.platform === 'win32') spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
-    else child.kill('SIGKILL')
-  } catch { /* the process is already gone */ }
+    if (process.platform === 'win32') {
+      const killed = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+      if (killed && killed.status === 0) return
+    } else {
+      // The child leads its own process group (see runOnce), so the group kill
+      // reaches the compilers it started.
+      try { process.kill(-child.pid, 'SIGKILL'); return } catch { /* not a group leader */ }
+    }
+  } catch { /* taskkill missing or already gone */ }
+  try { child.kill('SIGKILL') } catch { /* already gone */ }
 }
 
 /**
@@ -312,7 +321,9 @@ function runOnce(hit, target, timeoutMs, flags, toolchain, record) {
   return new Promise((resolve) => {
     let child
     try {
-      child = spawn(cmd.exe, cmd.args, { cwd: hit.dir, windowsHide: true, env: cmd.env })
+      // A process group of its own on POSIX, so a timed-out build takes its
+      // compilers with it (killTree); Windows keeps taskkill /T for that.
+      child = spawn(cmd.exe, cmd.args, { cwd: hit.dir, windowsHide: true, env: cmd.env, detached: process.platform !== 'win32' })
     } catch (error) {
       resolve({ code: undefined, out: `spawn failed: ${(error && error.message) || error}`, timedOut: false, text })
       return
@@ -322,9 +333,15 @@ function runOnce(hit, target, timeoutMs, flags, toolchain, record) {
     if (record && child.pid) record(child.pid)
     let out = ''
     let timedOut = false
+    let grace
     const timer = setTimeout(() => {
       timedOut = true
       killTree(child)
+      // A killed tree normally closes its stdio. A grandchild that keeps the pipe
+      // open would stall that forever, and the answer matters more than the log:
+      // report the timeout instead of letting the host's own timer kill us.
+      grace = setTimeout(() => resolve({ code: undefined, out, timedOut: true, text }), 5_000)
+      if (typeof grace.unref === 'function') grace.unref()
     }, timeoutMs)
     const onData = (d) => { out += d }
     child.stdout.on('data', onData)
@@ -332,6 +349,7 @@ function runOnce(hit, target, timeoutMs, flags, toolchain, record) {
     child.on('error', (error) => { out += `\nspawn error: ${(error && error.message) || error}\n` })
     child.on('close', (code) => {
       clearTimeout(timer)
+      if (grace) clearTimeout(grace)
       resolve({ code, out, timedOut, text })
     })
   })
@@ -354,8 +372,10 @@ const LOCK_UNREADABLE_GRACE_MS = 5_000
 // cannot wedge the directory forever.
 const LOCK_MAX_AGE_MS = 24 * 60 * 60_000
 // A wait that leaves less than this is not worth starting a build for: the build
-// would be killed mid-way, which is the work the lock exists to prevent.
-const MIN_BUILD_MS = 10_000
+// would be killed mid-way, which is the work the lock exists to prevent. Kept
+// small: a build that gets a short window still answers its own verdict inside
+// the budget, so refusing costs a result that may well have succeeded.
+const MIN_BUILD_MS = 3_000
 
 function lockPath(hit) {
   const key = crypto.createHash('sha1').update(path.resolve(hit.dir).toLowerCase()).digest('hex').slice(0, 12)
@@ -417,10 +437,10 @@ function takeOverStaleLock(file, held) {
     return
   }
   // We raced a fresh locker: put its lock back (unless a third one already
-  // created another file, in which case ours is the odd one out). The link fails
-  // on an existing destination, so it can never replace a third waiter's lock.
+  // created another file, in which case ours is the odd one out). `wx` cannot
+  // replace an existing lock and, unlike a hard link, works on every filesystem.
   try {
-    fs.linkSync(taken, file)
+    if (content) fs.writeFileSync(file, JSON.stringify(content), { flag: 'wx' })
     fs.unlinkSync(taken)
   } catch {
     try { fs.unlinkSync(taken) } catch { /* best effort */ }
@@ -718,6 +738,7 @@ async function cmdCheck(project, files, outPath, sweep, flags) {
   // which target and which entry the check actually used.
   for (const c of (r.payload.build && r.payload.build.commands) || []) log(c)
   log(`checked ${s.files_checked} file(s): ${s.errors} error(s), ${s.warnings} warning(s)`)
+  if (r.payload.engine_note) log(r.payload.engine_note)
   for (const rel of Object.keys(r.payload.files)) {
     for (const d of r.payload.files[rel].diagnostics) {
       if (d.severity === 1 || d.severity === 2) console.log(`  ${rel}:${d.line}:${d.column || 0}: [${d.severityName}] ${d.message}`)

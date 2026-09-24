@@ -1203,8 +1203,11 @@ export function apply(ctx, config) {
         if (!scanned && !errs && rows.every((r) => r.empty)) return '[lsp-echo] 项目里没有可检查的文件'
         const parts = [`[lsp-echo] 全量诊断完成：${errs} 个编译错误(${scanned} 个文件):`]
         for (const r of rows) {
-          if (r.scope) parts.push(`[${r.eng}] 扫描 ${r.scope.files_checked || 0} 文件，${r.scope.errors || 0} 错误`)
-          else if (r.empty) parts.push(`[${r.eng}] 无此语言文件`)
+          if (r.scope) {
+            parts.push(`[${r.eng}] 扫描 ${r.scope.files_checked || 0} 文件，${r.scope.errors || 0} 错误`)
+            // What the engine did not get to check belongs next to its counts.
+            if (r.payload && r.payload.engine_note) parts.push(`[${r.eng}] ${r.payload.engine_note}`)
+          } else if (r.empty) parts.push(`[${r.eng}] 无此语言文件`)
           else parts.push(`[${r.eng}] 失败: ${r.error}`)
         }
         return parts.join('\n')
@@ -2104,6 +2107,7 @@ export function apply(ctx, config) {
           scanned += scope.files_checked || 0
           errs += scope.errors || 0
           rows.push(`[${r.eng}] 扫描 ${scope.files_checked || 0} 文件，${scope.errors || 0} 错误`)
+          if (r.payload && r.payload.engine_note) rows.push(`[${r.eng}] ${r.payload.engine_note}`)
         } else if (r.empty) {
           rows.push(`[${r.eng}] 无此语言文件`)
         } else {

@@ -376,6 +376,15 @@ exit 0
     'a check that waits builds inside the same budget, not a second one', `${waitRun.code} ${waitElapsed}ms ${waitRun.err.trim()}`)
   ok(/after waiting .*s for another check/.test(waitRun.err), 'and says that it had to wait', waitRun.err.trim())
   ok(!fs.existsSync(holderLock), 'the waited-out lock is released again')
+  // A short remaining window still gets a build attempt: refusing would trade a
+  // possible result for a certain failure, and the bridge answers its own timeout
+  // before the host's timer, so there is nothing dangerous to start.
+  const holder2 = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 6000)'], { stdio: 'ignore' })
+  fs.writeFileSync(holderLock, JSON.stringify({ pid: 999999999, childPid: holder2.pid, at: Date.now(), dir: waitSlow.native }))
+  const nearRun = await run(['check', path.join(waitSlow.native, 'src', 'hello.cpp'), '--project', waitSlow.project,
+    '--out', path.join(ROOT, 'near.json'), '--build-timeout-ms', '12000'])
+  ok(nearRun.code === 2 && /did not finish within/.test(nearRun.err) && !/already building/.test(nearRun.err),
+    'a small remaining window still gets a build attempt, not a refusal', `${nearRun.code} ${nearRun.err.trim()}`)
   // A record no build can still be behind is cleared, so a recycled pid cannot
   // wedge the directory for good.
   const waitClean = project('wait-clean', CLEAN_OUT, source)
