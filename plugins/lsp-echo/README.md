@@ -107,7 +107,7 @@ node "$env:DSH_HOME\profiles\web\node_modules\@dsh-user\lsp-echo\checkers\godot-
 # ② 在会话里让 AI 改坏一个 .gd → 下一轮应自动出现 [lsp-echo] 错误清单
 # ③ 手动:模型工具 lsp_echo: host / status / check files=[...]
 
-# ④ C++(GDExtension)检查:解析/协议/失败路径/每文件构建目录/依赖检出排除/并发构建锁 + 真实编译器端到端(69 项)
+# ④ C++(GDExtension)检查:解析/协议/失败路径/每文件构建目录/依赖检出排除/并发构建锁 + 真实编译器端到端
 node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\probe.mjs --real-msvc
 # ⑤ evidence 绑定是否认得你的 GDExtension 项目
 node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\binding-probe.mjs --project E:\GodotProject\dsh_goochen_assistant

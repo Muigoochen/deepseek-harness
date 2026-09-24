@@ -326,9 +326,9 @@ connected external editor")。
 引擎未在超时内推送诊断时,桥写 `check_error` 且 `errors: 0`(`godot-lsp.mjs:870-879`);而插件侧
 把"没有诊断"与"诊断为空"合并计数。会因它产生假绿的**四处**:
 
-1. `lib/index.js:1420` 的硬编码结论行(`- 结果：编译通过，0 错误` / `- 本结论来自引擎实时检查，
-   无需为这些文件再次运行 LSP/编译检查。`),由 `:1393-1407` 的 `checked` 计数在零错误分支触发的
-   `:1413-1427`;
+1. `lib/index.js:2027` 的硬编码结论行(`- 结果：本次检查 0 错误` / `- 本结论来自引擎实时检查，
+   无需为这些文件再次运行 LSP/编译检查。`),由 `:2000-2014` 的 `checked` 计数在零错误分支触发的
+   `:2020-2034`;
 2. `lib/index.js:1449-1453` `baselineDoneText`:只要 `summary.errors === 0` 就回"扫描 N 个文件,
    0 个编译错误";
 3. `lib/tool.js:7-22` `renderDiagnostics`:面模型的输出只打印 `checked N file(s): 0 error(s)`;

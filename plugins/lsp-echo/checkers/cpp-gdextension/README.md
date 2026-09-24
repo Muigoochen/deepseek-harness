@@ -79,12 +79,14 @@ UTF-8(Windows PowerShell 5.1 默认按 ANSI 解码子进程输出,会把非 ASCI
 **超时不再杀构建**(默认):杀掉 SCons 会扔掉它已做完的工作、并把 `.sconsign.dblite` 留在半写状态,
 于是**下一次检查要重编更多** —— 实测过一个 21MB 签名库被打断后,下一次要重编 1119 个 godot-cpp
 对象(112 秒)。所以超时后桥把锁交给那个构建(记成"孤儿"记录)、立刻回答
-`… the build is still running (pid N) and the next check waits for it`;构建在后台跑完,下一次检查
-只要 4 秒。要真的杀掉(例如测试清理)显式加 `--kill-on-timeout`;`--no-wait` 则让检查在构建目录
-正忙时立刻回答而不是排队等 —— **clientd 里的 `noWait` 请求不排队**:正有一个检查在跑时立刻回
-"另一个检查正在构建",而不是挤进队列等到宿主的短超时把整个 clientd 退休(那会连在跑的那个请求
-一起失败)。交出孤儿记录后,一次性 `check` 会摘掉构建子进程的 stdio 监听并 `unref` 它们,好让
-自己带着已打印的结论按时退出,而不是陪构建跑到结束。
+`… the build is still running (pid N) and the next check waits for it`;下一次检查只要 4 秒。
+"构建在后台继续跑完"是**常驻 `clientd` 通道**的保证:那个进程还活着,继续读构建输出。一次性
+`check` 交出孤儿记录后就自己退出(摘掉构建子进程的 stdio 监听并 `unref`,好带着已打印的结论按时
+退出),它的构建在父进程退出后若还要写输出,可能因管道关闭而中断 —— 所以插件优先走 clientd,
+一次性路径只是 clientd 起不来时的退路。要真的杀掉(例如测试清理)显式加 `--kill-on-timeout`;
+`--no-wait` 则让检查在构建目录正忙时立刻回答而不是排队等 —— **clientd 里的 `noWait` 请求不排队**:
+正有一个检查在跑时立刻回"另一个检查正在构建",而不是挤进队列等到宿主的短超时把整个 clientd
+退休(那会连在跑的那个请求一起失败)。
 
 注意首次检查若撞上 godot-cpp 需要重编(改过依赖版本、或被中断过),会超预算;等它在后台跑完、
 或手动跑一次 `build.ps1` 之后就是增量。
@@ -128,7 +130,7 @@ Windows `taskkill /T /F`,POSIX 整组 SIGKILL,失败再直接 kill;被杀的子�
 ## 自检
 
 ```powershell
-# 诊断解析 / 协议 / 诚实性路径 / 每文件构建目录 / 依赖检出排除 / 并发构建锁 + 真实 MSVC 端到端(69 项)
+# 诊断解析 / 协议 / 诚实性路径 / 每文件构建目录 / 依赖检出排除 / 并发构建锁 + 真实 MSVC 端到端
 node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\probe.mjs --real-msvc
 
 # evidence 绑定 + 快照合并/作用域语义(可指向任意真实 GDExtension 项目)

@@ -1957,7 +1957,7 @@ export function apply(ctx, config) {
       tasks.push(
         checkWithHeal(eng, rec.path, files, hostTimeoutMs, 'main', eng.extensions, keepExts,
           changedScripts.filter((f) => matchExtension(eng, f)), limits)
-          .then((payload) => ({ engineId: eng.id, eng, payload }))
+          .then((payload) => ({ engineId: eng.id, eng, payload, files }))
           .catch((error) => {
             const message = (error && error.message) || String(error)
             console.error(`[lsp-echo] check failed (${eng.id}): ${message}`)
@@ -1994,7 +1994,7 @@ export function apply(ctx, config) {
           failNotice.set(key, { at: Date.now() })
           capMap(failNotice, MAX_NOTICE_ENTRIES)
           const tail = retry && retry.keep.length
-            ? `（文件已留在待检查列表，下一步会自动重试，同一内容最多重试 ${MAX_BUILD_RETRIES} 次；这不等于没有问题。）`
+            ? `（其中 ${retry.keep.length} 个文件已留在待检查列表，下一步会自动重试，同一内容最多重试 ${MAX_BUILD_RETRIES} 次；这不等于没有问题。）`
             : `（已尝试 ${retry ? retry.attempts : 1} 次仍未跑完，不再自动重试；需要时先手动构建一次，或显式调 lsp_echo check；这不等于没有问题。）`
           parts.push(`[lsp-echo] ${engineId} 这一轮没跑完，你刚才改的文件没有被验证：${failure}\n${tail}`)
         }

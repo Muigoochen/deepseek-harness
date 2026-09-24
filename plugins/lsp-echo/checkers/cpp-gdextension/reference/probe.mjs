@@ -28,8 +28,21 @@ const KEEP = ARGS.includes('--keep')
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-cpp-probe-'))
 let checks = 0
 let failures = 0
+// Every assertion runs exactly once per run. A promise handler that fires twice
+// (two `data` events reaching the same assertions) would otherwise hide a skipped
+// assertion behind a repeated one, so the call site is recorded and a repeat is a
+// failure rather than a second tick of the count.
+const okSites = new Map()
 function ok(cond, label, detail) {
+  const site = (new Error().stack || '').split('\n')[2] || 'unknown'
+  const first = okSites.get(site)
   checks++
+  if (first) {
+    failures++
+    console.log(`  FAIL assertion ran twice: ${label} (already counted as "${first}")`)
+    return false
+  }
+  okSites.set(site, label)
   if (cond) { console.log(`  ok   ${label}`); return true }
   failures++
   console.log(`  FAIL ${label}${detail ? `\n       ${detail}` : ''}`)
@@ -181,6 +194,20 @@ async function main() {
   const p4c = readJson(out4c)
   ok(r4c.code === 0 && p4c && /-Target both\b/.test(((p4c.build || {}).commands || []).join(' ')),
     '--sweep before the file is still a boolean', `${r4c.code} ${JSON.stringify(p4c && p4c.build)} ${r4c.err.trim()}`)
+  // The plugin's own call puts the files first and the flags after them (the
+  // manager builds `check <files...> --no-wait --project …`), so a boolean flag
+  // there must neither lose the file nor swallow the flag that follows it.
+  const out4d = path.join(ROOT, 'clean-nowait-after.json')
+  const r4d = await run(['check', cleanFile, '--no-wait', '--project', clean.project, '--out', out4d])
+  const p4d = readJson(out4d)
+  ok(r4d.code === 0 && p4d && Object.keys(p4d.files).length === 1,
+    '--no-wait after the file still checks that file', `${r4d.code} ${r4d.err.trim()}`)
+  // A value-taking flag with nothing after it must fail loud: `Number(true)` is 1,
+  // so a valueless --build-timeout-ms used to become a one-millisecond budget that
+  // reported a timeout without ever building.
+  const r4e = await run(['check', cleanFile, '--project', clean.project, '--build-timeout-ms'])
+  ok(r4e.code === 2 && /--build-timeout-ms needs a value/.test(r4e.err),
+    'a valueless --build-timeout-ms fails loud instead of becoming a 1ms budget', `${r4e.code} ${r4e.err.trim()}`)
 
   // ---- 5. failures are never clean --------------------------------------
   console.log('\n[5] a build that did not produce diagnostics is a failure')
@@ -229,9 +256,21 @@ async function main() {
     const child = spawn(process.execPath, [BRIDGE, 'clientd', '--project', msvc.project], { cwd: ROOT, windowsHide: true })
     let buf = ''
     const replies = []
-    const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } resolve() }, 60_000)
+    let done = false
+    // A silent timeout would skip these four assertions and still print PASSED: a
+    // probe promise that gives up must report the give-up as a failure.
+    const finish = (giveUp) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      try { child.kill() } catch { /* gone */ }
+      if (giveUp) ok(false, giveUp, `replies: ${replies.map((r) => r.id).join(',') || 'none'}`)
+      resolve()
+    }
+    const timer = setTimeout(() => finish('clientd answered both requests within 60s'), 60_000)
     child.stdout.setEncoding('utf8')
     child.stdout.on('data', (d) => {
+      if (done) return
       buf += d
       const lines = buf.split('\n')
       buf = lines.pop() || ''
@@ -242,15 +281,13 @@ async function main() {
       if (replies.length === 1) {
         child.stdin.write(`${JSON.stringify({ id: 2, files: [msvcFile], sweep: true })}\n`)
       } else if (replies.length >= 2) {
-        clearTimeout(timer)
-        try { child.kill() } catch { /* gone */ }
         const first = replies[0]
         const second = replies[1]
         ok(first.id === 1 && first.ok === true && first.payload, 'first request answered with a payload', JSON.stringify(first).slice(0, 200))
         ok(first.payload && first.payload.summary.errors === 2, 'clientd payload matches the one-shot payload', JSON.stringify(first.payload && first.payload.summary))
         ok(second.id === 2 && second.ok === true, 'second (sweep) request answered on the same process', JSON.stringify(second).slice(0, 200))
         ok(second.payload && /-Target both\b/.test(((second.payload.build || {}).commands || []).join(' ')), 'sweep request built both targets', JSON.stringify(second.payload && second.payload.build))
-        resolve()
+        finish()
       }
     })
     child.stdin.write(`${JSON.stringify({ id: 1, files: [msvcFile], sweep: false })}\n`)
@@ -293,6 +330,9 @@ async function main() {
     }, 50)
     child.stdout.setEncoding('utf8')
     child.stdout.on('data', (d) => {
+      // The refusal arrives first and the running request's verdict ~6s later:
+      // without this guard the second event would re-run the first two assertions.
+      if (done) return
       buf += d
       const lines = buf.split('\n')
       buf = lines.pop() || ''
@@ -300,13 +340,14 @@ async function main() {
         if (!line.trim().startsWith('{')) continue
         try { replies.push({ at: Date.now() - started, body: JSON.parse(line) }) } catch { /* chatter */ }
       }
+      // Assert only once both replies are in: asserting on the refusal alone would
+      // re-run those assertions when the running request's verdict arrives.
       const busy = replies.find((x) => x.body.id === 2)
-      if (!busy) return
+      const first = replies.find((x) => x.body.id === 1)
+      if (!busy || !first) return
       ok(busy.body.ok === false && /does not wait|already building/.test(busy.body.error || ''),
         'the no-wait request is refused, not queued', JSON.stringify(busy.body))
       ok(busy.at < 5_000, 'the refusal is immediate, not after the host timeout', `${busy.at}ms`)
-      const first = replies.find((x) => x.body.id === 1)
-      if (!first) return
       ok(busy.at < first.at, 'and it arrives before the running build finishes', `busy@${busy.at}ms first@${first.at}ms`)
       finish()
     })
@@ -472,7 +513,13 @@ exit 0
   const locked = (extra) => fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999999, at: Date.now(), dir: slowTwo.native, ...extra }))
   const firstRun = run(['check', path.join(slowTwo.native, 'src', 'hello.cpp'), '--project', slowTwo.project,
     '--out', path.join(ROOT, 'slow1.json'), '--build-timeout-ms', '6000'])
-  await new Promise((r) => setTimeout(r, 1500)) // let the first process take the lock
+  // Wait for the first process to actually take the lock instead of guessing how
+  // long SCons needs to start: a fixed sleep either races (too short) or wastes
+  // time (too long).
+  const lockDeadline = Date.now() + 15_000
+  while (!fs.existsSync(lockFile) && Date.now() < lockDeadline) {
+    await new Promise((r) => setTimeout(r, 50))
+  }
   const secondRun = await run(['check', path.join(slowTwo.native, 'src', 'hello.cpp'), '--project', slowTwo.project,
     '--out', path.join(ROOT, 'slow2.json'), '--build-timeout-ms', '2000'])
   ok(secondRun.code === 2 && /already building/.test(secondRun.err),
@@ -551,17 +598,27 @@ exit 0
 
   // Locks these fixture builds left behind (they name builds that outran their
   // budget and were not killed): every record pointing into a throwaway fixture
-  // is swept, including leftovers of an earlier run whose root is long gone and
-  // the `.lock.stale-<pid>-<ts>` files a stale-lock takeover renames aside.
+  // is swept, including leftovers of an earlier run whose root is long gone, the
+  // `.lock.stale-<pid>-<ts>` files a stale-lock takeover renames aside, and the
+  // `.lock.<pid>.<ts>.tmp` files a killed writer leaves behind.
   try {
     const tempLower = path.resolve(os.tmpdir()).toLowerCase()
     for (const name of fs.readdirSync(lockDir)) {
-      if (!name.startsWith('cpp-build-') || !/\.lock(\.stale-|$)/.test(name)) continue
+      if (!name.startsWith('cpp-build-') || !/\.lock(\.|$)/.test(name)) continue
       const p = path.join(lockDir, name)
       let rec
       try { rec = JSON.parse(fs.readFileSync(p, 'utf8')) } catch { rec = undefined }
-      const dir = rec && typeof rec.dir === 'string' ? path.resolve(rec.dir) : undefined
-      const underTemp = !!dir && dir.toLowerCase().startsWith(tempLower)
+      if (!rec || typeof rec.dir !== 'string') {
+        // A record that does not parse names no directory. A `.tmp` file is a
+        // half-written record, so it is removable once no writer can still be
+        // finishing it; anything else is left alone because its owner is unknown.
+        try {
+          if (/\.tmp$/.test(name) && Date.now() - fs.statSync(p).mtimeMs > 60_000) fs.unlinkSync(p)
+        } catch { /* best effort */ }
+        continue
+      }
+      const dir = path.resolve(rec.dir)
+      const underTemp = dir.toLowerCase().startsWith(tempLower)
       // The recorded dir is a *subdirectory* of the throwaway root
       // (…/dsh-cpp-probe-XXXX/slow), so look for the root segment, not the basename.
       const throwaway = underTemp && dir.slice(tempLower.length).toLowerCase().includes('dsh-')
@@ -572,12 +629,15 @@ exit 0
     }
   } catch { /* no runtime dir */ }
 
-  // A skipped assertion (a promise that timed out, a section that never ran) must
-  // not print PASSED: the number of assertions executed is part of the contract.
-  const EXPECTED_CHECKS = 81
+  // Every assertion runs exactly once, so the number that ran is knowable: a
+  // skipped assertion (a promise that timed out, a section that never ran) lowers
+  // the count and fails here instead of printing PASSED.
+  const EXPECTED_CHECKS = 77 + (REAL_MSVC ? 4 : 0)
   if (checks !== EXPECTED_CHECKS) {
     failures += 1
     console.log(`  FAIL every check ran: ${checks}/${EXPECTED_CHECKS} executed`)
+  } else {
+    console.log(`  ok   every declared assertion ran exactly once (${checks})`)
   }
 
   console.log(`\n${failures ? 'FAILED' : 'PASSED'}: ${checks - failures}/${checks} checks`)

@@ -59,6 +59,10 @@ const SWEEP_TIMEOUT_MS = 190_000
 // argument, so `check --no-wait src/a.cpp` would both lose that file and stop
 // being a boolean (`flags['no-wait']` would be the path, never `true`).
 const BOOLEAN_FLAGS = new Set(['sweep', 'both', 'no-wait', 'kill-on-timeout'])
+// Flags that require a value. A valueless `--project` would otherwise become the
+// literal `true`, and `--build-timeout-ms` would become `Number(true) === 1`, a
+// one-millisecond budget that reports a timeout without ever building.
+const VALUE_FLAGS = new Set(['project', 'out', 'dir', 'toolchain', 'build-timeout-ms'])
 
 function parseArgs(argv) {
   const flags = {}
@@ -70,7 +74,11 @@ function parseArgs(argv) {
       const key = eq > 0 ? a.slice(2, eq) : a.slice(2)
       if (eq > 0) flags[key] = a.slice(eq + 1)
       else if (BOOLEAN_FLAGS.has(key)) flags[key] = true
-      else flags[key] = i + 1 < argv.length && !argv[i + 1].startsWith('--') ? argv[++i] : true
+      else if (VALUE_FLAGS.has(key)) {
+        const value = i + 1 < argv.length && !argv[i + 1].startsWith('--') ? argv[++i] : undefined
+        if (value === undefined) throw new Error(`--${key} needs a value`)
+        flags[key] = value
+      } else flags[key] = i + 1 < argv.length && !argv[i + 1].startsWith('--') ? argv[++i] : true
     } else files.push(a)
   }
   return { flags, files }
@@ -377,7 +385,7 @@ function runOnce(hit, target, timeoutMs, flags, toolchain, lock) {
         } catch { /* already closed */ }
       }
       try { child.unref() } catch { /* gone */ }
-      resolve({ code: undefined, out, timedOut: true, text, stillRunning: child.pid })
+      resolve({ code: undefined, out, timedOut: true, text })
     }, timeoutMs)
     const onData = (d) => { out += d }
     child.stdout.on('data', onData)
