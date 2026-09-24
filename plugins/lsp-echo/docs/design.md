@@ -194,6 +194,18 @@ lsp-echo 带**静态 client 半**(`lib/client.js`,toast/workspace-files 同款:
 可选能力(engine.json):`rescan` + `rescanPort` + `addon` —— 声明后该引擎可被要求重扫
 (桥需实现 `rescan` 子命令,见 §11),host 侧的自愈与「安装引擎桥」按钮自动对该引擎生效。
 
+`evidence`(pattern 列表):项目树里每个 pattern 都存在才把该引擎绑到项目上,用于构建入口在项目
+深处的引擎 —— Godot GDExtension 的 `SConstruct` + `*.gdextension` 在 `addons/<plugin>/platform/native`
+(深度 4-5),根级 marker 探测与浅层扩展名扫描都到不了。绑定发生在种子层(config/workspace),
+**manual 层逐字采纳**(手绑/删掉的引擎不会被自动改回来),要靠设置页「智能配置」补充。
+
+`fallback`:项目根无任何 marker 时用哪个引擎。原来回退到"目录枚举顺序里的第一个",加引擎目录会让
+这个顺序变化(新增的 `cpp-gdextension` 排在最前),所以改成由引擎自己声明;`godot-lsp` 标了它。
+
+引擎不必有常驻进程:`cpp-gdextension` 用项目自己的构建当引擎(编译错误 = 真构建会遇到的错误,
+含链接阶段),`host/stop` 是预检与空操作,`clientd` 只是把请求串行化(`lib/manager.js` 的
+clientd 契约不变,payload 形状与 godot/typescript 桥一致)。
+
 ## 11. 引擎桥(让运行中的引擎重扫文件系统,2026-09-10 实测定稿)
 
 **问题**:Godot 只在**扫描项目文件系统**时注册全局类名
@@ -282,3 +294,25 @@ addon 并上报端口)。补写失败(只读/被占用、`[editor_plugins]` 列�
   `host-<项目>.log` / 引擎自己写的那份 `lsp_diagnostics-<项目>.json`)。引擎目录内的 `.runtime/` 是
   迁移前的位置,只作**读取兜底**,新写入一律落到 DSH home(`writeHostState` 会顺手清掉旧副本),
   因此桥的两份副本(仓库检出 / profile 安装)看到的是同一份状态。
+- **C++(GDExtension)编译检查的环境前提**:项目自己的构建必须能跑(桥只当调度者,编译参数/工具链
+  发现都留给项目的 `build.ps1`)。工具链按**项目产物**判定(`.a` = MinGW,`.lib`/`.obj` = MSVC,取最新),
+  因为一台机器常常只有一套能编:本机 VS BuildTools 装了但**没装 Windows SDK**,`cl` 连 `stddef.h`
+  都找不到,能编的是 MinGW 14.2 —— 这时若按 `build.ps1` 的默认(MSVC)跑,报出来的是一片
+  "无法打开包括文件" 的环境错误,而不是源码错误。`--toolchain` 可显式覆盖,`status` 会报告它选了什么。
+- **C++ 检查的编码坑**(实测):SCons 是 Python,stdout 接管道时按 ANSI 代码页编码,编译器输出里只要
+  有一个该代码页表示不了的字符,报告就以 `UnicodeEncodeError` 收场、对象被判"失败",真正的错因反而
+  看不见。桥给子进程开 `PYTHONUTF8=1` + `PYTHONIOENCODING=utf-8`,并把 Windows PowerShell 的
+  控制台输出编码抬到 UTF-8(`-Command` 而不是 `-File`)。
+- **C++ 检查的时间与范围**:一次改动检查只编 debug(110s 预算),全量重扫才 debug+release(190s);
+  改过 godot-cpp 之后第一次检查可能要重编依赖、大概率超预算 —— 手动跑一次 `build.ps1` 之后就是增量。
+  链接与构建系统错误统一挂在 `<link>` 条目下,项目外的依赖头文件用 `../` 相对路径如实保留。
+- **C++ 引擎的绑定**:config / workspace 层按 `evidence` 自动绑;manual 层(设置页手绑过项目)逐字采纳,
+  要补 C++ 引擎用设置页的「智能配置」。绑定用的是「所有命中的引擎」而不是「第一个命中的引擎」——
+  `project.godot` 与 `*.gdextension` 可以同处项目根(GDExtension 就放在项目根是常见布局),
+  只绑第一个会让另一种语言**静默停查**(见 `seedEngines`)。**未做**:每项目指定工具链/构建参数的设置页
+  字段(现在只有 CLI `--toolchain`,插件侧不传参)。
+- **合成键**(`<link>` 这类没有扩展名的条目):引擎在 `engine.json` 里用 `syntheticKeys` 声明归属,
+  桥在 payload 里同样声明一次 —— 只有写它的引擎能替换它,别的引擎的快照合并不会把它挤掉,
+  引擎作用域过滤也只在**它自己的轮次**里保留它(扩展名表看不见没有扩展名的键)。没有这条,
+  链接错误会在下一次 `.gd` 检查写快照时被静默删除;有了这条,它既不会消失,也不会在无关轮次里
+  伪装成本轮结果,更不会每轮重复注入。

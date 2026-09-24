@@ -5,6 +5,7 @@ import { execFile, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { extOf } from './scope.js'
 
 /** Runtime artifacts live under the DSH home so they never dirty the plugin tree. */
 export function runtimeRoot() {
@@ -70,11 +71,6 @@ function recomputeSummary(files) {
   return { files_checked: Object.keys(files).length, errors, warnings, files_with_errors: filesWithErrors }
 }
 
-function extOf(file) {
-  const i = file.lastIndexOf('.')
-  return i >= 0 ? file.slice(i).toLowerCase() : ''
-}
-
 /**
  * Serialize one snapshot write for a project (RFC §8). Merges into the
  * existing file: keys whose extension belongs to `ownedExts` are dropped
@@ -106,12 +102,18 @@ export function writeSnapshot(project, payload, ownedExts, keepExts) {
     const oldFiles = existing.files && typeof existing.files === 'object' ? existing.files : {}
     const keepSet = keepExts && keepExts.length ? new Set(keepExts) : null
     const ownSet = ownedExts && ownedExts.length ? new Set(ownedExts) : null
+    // Keys the writing engine declares as its own but that carry no extension
+    // (the cpp bridge's `<link>`). They are replaced by this write, and no other
+    // engine may evict them — an extension-based rule cannot see them.
+    const synthSet = new Set(Array.isArray(payload.syntheticKeys) ? payload.syntheticKeys : [])
     if (!ownSet && !keepSet) {
       // v1 replace semantics (single engine without extension table)
       Object.assign(files, payload.files || {})
     } else {
       for (const rel of Object.keys(oldFiles)) {
         const ext = extOf(rel)
+        if (synthSet.has(rel)) continue // this engine's synthetic key, replaced below
+        if (!ext) { files[rel] = oldFiles[rel]; continue } // another engine's synthetic key
         if (keepSet && !keepSet.has(ext)) continue // engine removed from project → evict
         if (ownSet && ownSet.has(ext)) continue // this engine's keyspace, replaced below
         files[rel] = oldFiles[rel]

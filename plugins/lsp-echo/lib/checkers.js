@@ -3,6 +3,9 @@
 //   { name, marker, extensions: ['.gd', …], bridge: '<file>.mjs' }
 // and ships the bridge CLI (<file>.mjs) with host|status|stop|check subcommands.
 // Adding a language = adding one directory here; no registry-row edit needed.
+// A descriptor may also declare `evidence`: file-name patterns whose presence
+// anywhere in a project proves the engine applies there (build layouts whose
+// entry points sit deep below the project root).
 import path from 'node:path'
 import fs from 'node:fs'
 
@@ -39,6 +42,21 @@ function descriptor(dir) {
       ? raw.rescanPort
       : undefined,
     addon: typeof raw.addon === 'string' && raw.addon ? raw.addon : undefined,
+    // `evidence` patterns are checked by lib/index.js against a project tree:
+    // every listed pattern must be present for the engine to be bound.
+    evidence: Array.isArray(raw.evidence)
+      ? raw.evidence.filter((p) => typeof p === 'string' && p)
+      : undefined,
+    // `fallback` marks the engine a project gets when no marker matched. Without
+    // it the winner would be whichever directory the filesystem lists first.
+    fallback: raw.fallback === true,
+    // `syntheticKeys` are snapshot keys this engine writes without a file behind
+    // them (the cpp bridge's `<link>` for link/build failures). They belong to
+    // exactly this engine: it may replace them, no other engine evicts them, and
+    // they surface in this engine's rounds only.
+    syntheticKeys: Array.isArray(raw.syntheticKeys)
+      ? raw.syntheticKeys.filter((k) => typeof k === 'string' && k)
+      : undefined,
   }
 }
 
@@ -48,7 +66,7 @@ function descriptor(dir) {
  * resolved to the declared file inside that directory, falling back to
  * bridge.mjs. Directories without a usable descriptor are skipped.
  * @param {string} pluginRoot absolute plugin package root.
- * @returns {Record<string, { id: string; name: string; bridge: string; marker: string; extensions: string[] }>}
+ * @returns {Record<string, { id: string; name: string; bridge: string; marker: string; extensions: string[]; evidence?: string[]; fallback?: boolean; syntheticKeys?: string[] }>}
  */
 export function engines(pluginRoot) {
   const base = path.join(pluginRoot, 'checkers')
@@ -75,6 +93,9 @@ export function engines(pluginRoot) {
       rescan: desc.rescan,
       rescanPort: desc.rescanPort,
       addon: desc.addon,
+      evidence: desc.evidence,
+      fallback: desc.fallback,
+      syntheticKeys: desc.syntheticKeys,
     }
   }
   return list

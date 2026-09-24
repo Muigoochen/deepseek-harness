@@ -178,6 +178,7 @@
   "overlay.notScanned": "尚未扫描",
   "overlay.reading": "读取中…",
   "overlay.noSnapshot": "还没有诊断快照 —— 点「全量重扫」生成。",
+  "overlay.row.synthetic": "链接 / 构建",
   "overlay.clean": "✓ 无错误、无警告。",
   "note.addLsp.ok": "已为项目添加 LSP:{engine}",
   "note.addLsp.exists": "{engine} 已在项目中",

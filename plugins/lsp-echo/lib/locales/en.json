@@ -178,6 +178,7 @@
   "overlay.notScanned": "Not scanned yet",
   "overlay.reading": "Reading...",
   "overlay.noSnapshot": "No diagnostics snapshot yet. Use \"Full rescan\" to create one.",
+  "overlay.row.synthetic": "link / build",
   "overlay.clean": "No errors, no warnings.",
   "note.addLsp.ok": "Added LSP to the project: {engine}",
   "note.addLsp.exists": "{engine} is already on this project",

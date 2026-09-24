@@ -40,10 +40,19 @@ plugins/lsp-echo/
 │  ├─ dependents.js        改动脚本的反向引用扫描(class_name 词边界 + res:// 路径字面,含 addons/)
 │  ├─ addon.js             引擎桥 addon 的安装/端口发现/探测(installAddonInto/ensureEditorPluginEnabled/discoverBridgePort)
 │  ├─ registry.js          工作区扫描/判定原语(存储=harness settings 命名空间)
-│  └─ checkers.js          引擎注册表(engine.json: name/marker/extensions/bridge[/rescan/rescanPort/addon])
+│  ├─ scope.js             键空间作用域/扩展名判定(引擎作用域过滤 + 快照合并共用,含无扩展名合成键)
+│  └─ checkers.js          引擎注册表(engine.json: name/marker/extensions/bridge[/rescan/rescanPort/addon/evidence/fallback/syntheticKeys])
 ├─ checkers/               ← 引擎程序(每语言一目录,加目录即注册)
+│  ├─ cpp-gdextension/     第二个引擎:C++(GDExtension)编译检查 —— 项目自己的构建就是引擎
+│  │  ├─ engine.json       注册表描述(marker=*.gdextension, extensions=[.cpp/.cc/.cxx/.h/.hpp/.hxx], evidence=[SConstruct,*.gdextension], syntheticKeys=[<link>])
+│  │  ├─ cpp-gdextension.mjs  桥 CLI: host/status/stop/check/clientd(无常驻 LSP 进程)
+│  │  ├─ README.md         桥自身文档(构建入口发现/时间预算/诚实性规则)
+│  │  └─ reference/        probe.mjs(解析·协议·失败路径) + binding-probe.mjs(evidence 绑定)
+│  ├─ typescript/          第三个引擎(tsserver,含 clientd)
+│  │  ├─ engine.json       marker=tsconfig.json, bridge=typescript-lsp.mjs
+│  │  └─ typescript-lsp.mjs
 │  └─ godot-lsp/           第一个引擎(原 godot-lsp-tooling 迁入)
-│     ├─ engine.json       注册表描述(name/marker/extensions/bridge/rescan/rescanPort/addon)
+│     ├─ engine.json       注册表描述(name/marker/extensions/bridge/rescan/rescanPort/addon/fallback)
 │     ├─ godot-lsp.mjs     桥 CLI: host/status/stop/check/smoke/watch/rescan
 │     ├─ addon/dsh_echo_bridge/  随引擎分发的 Godot 编辑器插件(控制socket → scan_sources())
 │     ├─ godot-lsp.config.example.json
@@ -96,6 +105,13 @@ node "$env:DSH_HOME\profiles\web\node_modules\@dsh-user\lsp-echo\checkers\godot-
 
 # ② 在会话里让 AI 改坏一个 .gd → 下一轮应自动出现 [lsp-echo] 错误清单
 # ③ 手动:模型工具 lsp_echo: host / status / check files=[...]
+
+# ④ C++(GDExtension)检查:解析/协议/失败路径 + 真实编译器端到端(41 项)
+node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\probe.mjs --real-msvc
+# ⑤ evidence 绑定是否认得你的 GDExtension 项目
+node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\binding-probe.mjs --project E:\GodotProject\dsh_goochen_assistant
+# ⑥ 手动跑一次 C++ 检查(会真的构建项目;debug target)
+node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\cpp-gdextension.mjs check <项目>\addons\<插件>\platform\native\src\*.cpp --project <项目> --out "$env:TEMP\cpp-check.json"
 ```
 
 ## 配置(装载行)
@@ -338,6 +354,16 @@ Godot 任何 `--editor` 实例都会打开调试适配器(DAP),默认端口正�
    设置页引擎卡/智能配置/编辑路由/管理工具全部零改动**;若该引擎也能"被要求重扫",可再声明
    `{ rescan: true, rescanPort: <端口>, addon: <随引擎附带的 addon 目录名> }`,并在桥里实现
    `rescan [--project <dir>] [--bridge-port <n>]` 子命令(向 addon 的控制端口发一行 `rescan` 并等待 `ok`);
-3. 自动反馈/管理/生命周期代码无需改动。
+3. 构建入口藏在项目**深处**、或根本没有常驻进程的引擎(编译器就是引擎),再声明两个可选字段:
+   - `{ evidence: ["SConstruct", "*.gdextension"] }` —— 项目树里**每个** pattern 都存在时,该引擎
+     自动绑到这个项目上(fixtures:深度 ≤6,跳过 `.git/.godot/node_modules/bin/obj/godot-cpp` 等)。
+     GDExtension 的 `addons/<plugin>/platform/native` 就在这个深度,根级 marker 与浅层扩展名扫描都看不见它;
+   - `{ fallback: true }` —— 项目根没有任何 marker 时用哪个引擎(不标就按目录枚举顺序挑,不确定);
+   - `{ syntheticKeys: ["<link>"] }` —— 引擎会写**没有文件对应**的快照键时声明归属:只有它能替换这个键、
+     别的引擎的快照合并不挤掉它、它也只在这个引擎自己的轮次里出现(否则一句链接错误会每次都被当成
+     "本轮结果"重复注入)。桥在 payload 里同样声明一次,宿主据此做快照合并。
+   C++ 引擎是这套写法的样板:`host/stop` 退化成预检与空操作,每次检查跑一次项目构建
+   (详细契约见 `checkers/cpp-gdextension/README.md`);
+4. 自动反馈/管理/生命周期代码无需改动。
 
 详见 `docs/design.md`。

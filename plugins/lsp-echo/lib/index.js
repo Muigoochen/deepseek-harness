@@ -24,7 +24,8 @@ import { ADDON_ID, addonResPath, discoverBridgePortAsync, installAddonInto, isAd
 import { dependentsOf } from './dependents.js'
 import { ProjectWatcher, normalizeSkipEntry, sameSkipEntry, scanFiles } from './watcher.js'
 import { registerTool } from './tool.js'
-import { scanProjectRoots } from './registry.js'
+import { evidenceEngines, markerHit, scanProjectRoots } from './registry.js'
+import { engineScope } from './scope.js'
 import { allDictionaries, getActiveLocale, localeIds, setActiveLocale, tLine } from './i18n.js'
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -208,7 +209,7 @@ function primaryEngine(rec) {
 function projectRootOf(dir, markersList) {
   let d = path.resolve(dir)
   for (;;) {
-    if (markersList.some((m) => fs.existsSync(path.join(d, m)))) return d
+    if (markersList.some((m) => markerHit(d, m))) return d
     const parent = path.dirname(d)
     if (parent === d) return undefined
     d = parent
@@ -242,32 +243,6 @@ function buildEchoText(engineId, payload, cap = 10) {
  * snapshot on disk holds every engine's keyspace, so summing its full summary
  * per engine double-counts when a project carries more than one engine.
  */
-function engineScope(payload, extList) {
-  const files = payload && payload.files && typeof payload.files === 'object' ? payload.files : {}
-  const own = new Set((extList || []).map((e) => String(e).toLowerCase()))
-  const out = {}
-  let errors = 0
-  let warnings = 0
-  const filesWithErrors = []
-  for (const rel of Object.keys(files)) {
-    if (!own.has(extOf(rel))) continue
-    const rec = files[rel]
-    out[rel] = rec
-    errors += (rec && rec.errors) || 0
-    warnings += (rec && rec.warnings) || 0
-    if (rec && rec.errors > 0) filesWithErrors.push(rel)
-  }
-  return {
-    files: out,
-    summary: { files_checked: Object.keys(out).length, errors, warnings, files_with_errors: filesWithErrors },
-  }
-}
-
-function extOf(rel) {
-  const dot = rel.lastIndexOf('.')
-  return dot >= 0 ? rel.slice(dot).toLowerCase() : ''
-}
-
 /**
  * Activate the plugin.
  * @param {import('@deepseek-ai/cordis').Context} ctx
@@ -282,22 +257,62 @@ export function apply(ctx, config) {
   const engineByBridge = (bridge) => Object.values(engineTable).find((e) => e.bridge === bridge)
   const absPath = (p, project) => (path.isAbsolute(p) ? path.resolve(p) : path.resolve(project, p))
 
-  // Smart engine detection: first registered engine whose marker file exists
-  // at the project root wins; no marker hit falls back to the first engine.
+  // Smart engine detection: first registered engine whose marker exists at the
+  // project root wins (a marker may be a glob, e.g. `*.gdextension`); no marker
+  // hit falls back to the engine that declares itself the fallback (godot-lsp),
+  // never to filesystem order.
   const detectEngine = (root) => {
     const ids = enginesList()
     if (!ids.length) return undefined
     for (const id of ids) {
       const eng = engine(id)
-      if (eng && eng.marker && fs.existsSync(path.join(path.resolve(root), eng.marker))) return id
+      if (eng && eng.marker && markerHit(root, eng.marker)) return id
     }
-    return ids[0]
+    return ids.find((id) => engine(id) && engine(id).fallback) || ids[0]
+  }
+  /**
+   * Engines a project's own root markers prove it needs, in registry order.
+   * Every hit counts: `project.godot` and a `*.gdextension` can sit in the same
+   * directory (a Godot project whose native extension lives at its root), and
+   * binding only the first hit would silently stop checking the other language.
+   * No hit at all falls back to {@link detectEngine}'s declared fallback.
+   * @param {string} root project root
+   * @returns {string[]} engine ids
+   */
+  const seedEngines = (root) => {
+    const hits = []
+    for (const id of enginesList()) {
+      const eng = engine(id)
+      if (eng && eng.marker && markerHit(root, eng.marker)) hits.push(id)
+    }
+    if (hits.length) return hits
+    const d = detectEngine(root)
+    return d ? [d] : []
+  }
+
+  // Engine evidence (registry.js) is a filesystem walk, so the answer is cached:
+  // it runs for every project at seed and suggestion time.
+  const EVIDENCE_CACHE_MS = 600_000
+  const evidenceCache = new Map() // lowercased root -> { at, ids }
+  /**
+   * Engine ids whose declared evidence exists under `root`, cached briefly.
+   * @param {string} root project root
+   * @returns {string[]}
+   */
+  const evidenceFor = (root, fresh = false) => {
+    const key = path.resolve(root).toLowerCase()
+    const hit = evidenceCache.get(key)
+    if (!fresh && hit && Date.now() - hit.at < EVIDENCE_CACHE_MS) return hit.ids
+    const ids = evidenceEngines(root, engineTable)
+    if (evidenceCache.size >= 64) evidenceCache.clear()
+    evidenceCache.set(key, { at: Date.now(), ids })
+    return ids
   }
 
   // Suggest LSP engines for a project (RFC §4.2): marker hit at the root is the
   // strongest signal (godot-lsp for project.godot); shallow extension evidence
   // adds more engines, guarding against node_modules/.git/vendor pollution.
-  const suggestLsp = (root) => {
+  const suggestLsp = (root, fresh = false) => {
     const absRoot = path.resolve(root)
     // Engine evidence comes from project sources, so build/VCS noise is skipped;
     // `addons` is NOT skipped here either — a plugin-style project keeps its
@@ -310,10 +325,13 @@ export function apply(ctx, config) {
     // 1) marker-based: an engine whose marker sits at the project root
     for (const id of enginesList()) {
       const eng = engine(id)
-      if (eng && eng.marker && fs.existsSync(path.join(absRoot, eng.marker))) {
+      if (eng && eng.marker && markerHit(absRoot, eng.marker)) {
         if (!suggested.includes(id)) suggested.push(id)
       }
     }
+    // 1b) evidence-based: an engine whose declared build layout exists deeper
+    // down (a GDExtension's SConstruct + .gdextension under addons/<plugin>/…)
+    for (const id of evidenceFor(absRoot, fresh)) if (!suggested.includes(id)) suggested.push(id)
     // 2) shallow extension evidence (depth <= 3), skip dirs excluded
     const hits = {} // engineId -> count
     const walk = (dir, depth) => {
@@ -855,6 +873,12 @@ export function apply(ctx, config) {
       skipDirs: skipDirs === undefined ? (prev ? prev.skipDirs : undefined) : skipDirs,
     })
   }
+  /** Seed engine list plus every engine whose declared evidence this project carries. */
+  const withEvidence = (root, lsp) => {
+    const out = lsp.slice()
+    for (const id of evidenceFor(root)) if (!out.some((x) => x.engine === id)) out.push({ engine: id })
+    return out
+  }
   const seedKnown = () => {
     known.clear()
     // Order: config seeds first, then discovered (addKnown, first-wins so config
@@ -863,17 +887,20 @@ export function apply(ctx, config) {
     for (const p of config.projects || []) {
       const e = normalizeProjectEntry(p)
       if (!e) continue
-      let lsp = entryEngineIds(e).map((engine) => ({ engine }))
-      if (!lsp.length) {
-        const d = detectEngine(e.path)
-        if (d) lsp = [{ engine: d }]
-      }
-      addKnown(e.path, lsp, e.autoInject, 'config', e.skipDirs)
+      let lsp = entryEngineIds(e).map((id) => ({ engine: id }))
+      if (!lsp.length) lsp = seedEngines(e.path).map((id) => ({ engine: id }))
+      addKnown(e.path, withEvidence(e.path, lsp), e.autoInject, 'config', e.skipDirs)
     }
     for (const ws of store.discovered) {
       if (!ws) continue
-      for (const root of ws.projects || []) addKnown(root, [{ engine: detectEngine(root) || 'godot-lsp' }], true, 'workspace')
+      for (const root of ws.projects || []) {
+        addKnown(root, withEvidence(root, seedEngines(root).map((id) => ({ engine: id }))), true, 'workspace')
+      }
     }
+    // The manual layer is the user's own binding and is adopted verbatim: an
+    // explicit empty list means "no engines", and an engine removed by hand must
+    // not reappear. The settings page supplements it on request (`?action=smart`),
+    // which is where a by-hand binding gains an evidence engine.
     for (const m of store.manual) {
       if (!m || !m.path) continue
       setKnown(m.path, entryEngineIds(m).map((engine) => ({ engine })), m.autoInject, 'manual', m.skipDirs)
@@ -1049,7 +1076,7 @@ export function apply(ctx, config) {
       try {
         const payload = await checkWithHeal(eng, rec.path, files, timeoutMs, 'baseline', eng.extensions, keepExts)
         // merged snapshot holds every engine's keyspace; per-engine view only
-        const scope = engineScope(payload, eng.extensions)
+        const scope = engineScope(payload, eng.extensions, eng.syntheticKeys)
         rows.push({ eng: eng.id, payload, scope: scope.summary, files: scope.files })
       } catch (e) {
         rows.push({ eng: eng.id, error: (e && e.message) || String(e) })
@@ -1088,11 +1115,29 @@ export function apply(ctx, config) {
         if (!root && cwd) root = projectRootOf(cwd, mks)
       }
       if (!root) return undefined
-      const rec = known.get(root.toLowerCase())
-      const engineId = (rec && primaryEngine(rec)) || detectEngine(root) || 'godot-lsp'
+      // A marker found inside a registered project (a GDExtension's SConstruct,
+      // for example) resolves to that inner directory, while the project the user
+      // configured is the outer one. Prefer the deepest known record containing
+      // the resolved root, so the tool and the pre-step report into one keyspace.
+      let rec = known.get(root.toLowerCase())
+      if (!rec) {
+        const lower = root.toLowerCase()
+        for (const r of known.values()) {
+          const rp = r.path.toLowerCase()
+          if (rp !== lower && !lower.startsWith(rp + path.sep)) continue
+          if (!rec || r.path.length > rec.path.length) rec = r
+        }
+      }
+      // Route by the extension of a file that exists: one project can carry
+      // several engines, and its primary engine may not own this file.
+      const picked = (files || []).find((f) => fs.existsSync(path.resolve(f)))
+      const byFile = rec && picked
+        ? (rec.lsp || []).map((x) => engine(x.engine)).find((e) => e && matchExtension(e, picked))
+        : undefined
+      const engineId = (byFile && byFile.id) || (rec && primaryEngine(rec)) || detectEngine(root) || 'godot-lsp'
       const eng = engine(engineId)
       if (!eng) throw new Error(`lsp-echo: engine '${engineId}' not bundled under checkers/`)
-      return { project: root, engineId, bridge: eng.bridge }
+      return { project: rec ? rec.path : root, engineId, bridge: eng.bridge }
     },
     abs: absPath,
     ensure: (bridge, project) => ensureHost(bridge, project, portForBridge(bridge, project)),
@@ -1123,7 +1168,7 @@ export function apply(ctx, config) {
         // inherit an existing config/workspace exemption, do not unmute
         const prevRec = known.get(abs.toLowerCase())
         const inherit = prevRec && prevRec.autoInject === false
-        manual.push(normalizeProjectEntry({ path: abs, lsp: [{ engine: detectEngine(abs) || 'godot-lsp' }], autoInject: inherit ? false : undefined }))
+        manual.push(normalizeProjectEntry({ path: abs, lsp: seedEngines(abs).map((id) => ({ engine: id })), autoInject: inherit ? false : undefined }))
       }
       if (manual.length !== store.manual.length) {
         store.manual = manual
@@ -1215,7 +1260,7 @@ export function apply(ctx, config) {
         }
         // ---- settings-page management actions (no engine host required) ----
         if (action === 'engines') {
-          const detail = Object.values(engineTable).map((e) => ({ id: e.id, name: e.name, marker: e.marker, extensions: e.extensions, rescan: !!e.rescan, addon: e.addon || null }))
+          const detail = Object.values(engineTable).map((e) => ({ id: e.id, name: e.name, marker: e.marker, extensions: e.extensions, rescan: !!e.rescan, addon: e.addon || null, evidence: e.evidence || null }))
           return json(res, 200, { ok: true, engines: detail })
         }
         // In-project engine bridge addon: copy it into the project and register
@@ -1422,7 +1467,7 @@ export function apply(ctx, config) {
           const req = requireProject(p)
           if (req.error) return json(res, 400, { ok: false, error: req.error })
           const abs = req.abs
-          const suggested = suggestLsp(abs)
+          const suggested = suggestLsp(abs, true)
           if (manualIndex(abs) >= 0) {
             return json(res, 200, {
               ok: true, applied: false, project: abs,
@@ -1843,7 +1888,7 @@ export function apply(ctx, config) {
       // still "succeeds"; surface its host-state warning once per occurrence.
       if (eng) maybeToastEngineWarn(eng, rec.path)
       if (!payload) continue
-      const scope = engineScope(payload, eng ? eng.extensions : undefined)
+      const scope = engineScope(payload, eng ? eng.extensions : undefined, eng ? eng.syntheticKeys : undefined)
       const scoped = { files: scope.files, summary: scope.summary }
       for (const rel of Object.keys(scoped.files)) {
         if (!roundRel.has(rel)) continue
@@ -2035,7 +2080,7 @@ export function apply(ctx, config) {
         if (r.payload) {
           const eng = boundEngines.find((e) => e.id === r.eng)
           // merged snapshot holds every engine's keyspace — scope to this engine
-          const scope = engineScope(r.payload, eng ? eng.extensions : undefined).summary
+          const scope = engineScope(r.payload, eng ? eng.extensions : undefined, eng ? eng.syntheticKeys : undefined).summary
           scanned += scope.files_checked || 0
           errs += scope.errors || 0
           rows.push(`[${r.eng}] 扫描 ${scope.files_checked || 0} 文件，${scope.errors || 0} 错误`)

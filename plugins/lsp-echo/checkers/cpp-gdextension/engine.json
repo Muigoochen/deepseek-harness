@@ -1,0 +1,8 @@
+{
+  "name": "cpp-gdextension",
+  "marker": "*.gdextension",
+  "extensions": [".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"],
+  "bridge": "cpp-gdextension.mjs",
+  "evidence": ["SConstruct", "*.gdextension"],
+  "syntheticKeys": ["<link>"]
+}

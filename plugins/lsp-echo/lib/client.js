@@ -435,7 +435,10 @@ window.__ModuleLoader__.load({
             }
           }
           if (errs === 0 && warns === 0 && !rec.engine_note) continue // 无内容不展示
-          fileRows.push({ rel: rel, rec: rec, errs: errs, warns: warns })
+          // A key without an extension is engine-synthetic (the cpp checker's
+          // link/build bucket): show what it stands for instead of a raw `<link>`.
+          var label = rel.indexOf('.') >= 0 ? rel : T('overlay.row.synthetic')
+          fileRows.push({ rel: rel, label: label, rec: rec, errs: errs, warns: warns })
         }
       }
 
@@ -527,7 +530,7 @@ window.__ModuleLoader__.load({
               }(fr.rel),
             }, [
               caret,
-              React.createElement('span', { key: 'p', className: 'lspi-fpath' }, fr.rel),
+              React.createElement('span', { key: 'p', className: 'lspi-fpath' }, fr.label),
               React.createElement('span', { key: 'n', className: 'lspi-fcount' },
                 (fr.errs > 0 ? T('overlay.fileCount.error', { n: fr.errs }) : '')
                 + (fr.errs > 0 && fr.warns > 0 ? ' · ' : '')

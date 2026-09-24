@@ -30,7 +30,7 @@ export function registerTool(ctx, deps) {
   ctx.tools.register(defineTool({
     name: 'lsp_echo',
     description:
-      'Manage bundled language-diagnostics engines and compile-check files. action: host (ensure running), stop, status, check (files), baseline (full-project diagnostic sweep now), projects (list registered Godot projects), or scan (one-shot scan of a workspace root for Godot projects). The bundled godot-lsp engine serves .gd/.gdshader; project is auto-detected from the session workspace or the files when not given.',
+      'Manage bundled language-diagnostics engines and compile-check files. action: host (ensure running), stop, status, check (files), baseline (full-project diagnostic sweep now), projects (list registered Godot projects), or scan (one-shot scan of a workspace root for Godot projects). Bundled engines: godot-lsp (.gd/.gdshader), cpp-gdextension (C++ GDExtension projects; it builds the project with its own SCons setup) and typescript (tsserver). project is auto-detected from the session workspace or the files when not given.',
     parameters: {
       action: { type: 'string', required: true, enum: ACTIONS, description: 'host | stop | status | check | baseline | projects | scan' },
       engine: { type: 'string', description: "engine id; default 'godot-lsp'" },

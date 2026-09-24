@@ -5,5 +5,6 @@
   "bridge": "godot-lsp.mjs",
   "rescan": true,
   "rescanPort": 6089,
-  "addon": "addon"
+  "addon": "addon",
+  "fallback": true
 }
