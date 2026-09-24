@@ -354,6 +354,13 @@ exit 0
     '--out', path.join(ROOT, 'slow3.json'), '--build-timeout-ms', '2000'])
   ok(orphanRun.code === 2 && /already building/.test(orphanRun.err),
     'a lock whose build child is still alive is not stolen', `${orphanRun.code} ${orphanRun.err.trim()}`)
+  // The record a failed kill leaves behind: only the build child, no taker pid
+  // (that process is the live check that could not kill it).
+  fs.writeFileSync(lockFile, JSON.stringify({ childPid: process.pid, at: Date.now(), dir: slowTwo.native }))
+  const orphanRecord = await run(['check', path.join(slowTwo.native, 'src', 'hello.cpp'), '--project', slowTwo.project,
+    '--out', path.join(ROOT, 'slow-orphan.json'), '--build-timeout-ms', '2000'])
+  ok(orphanRecord.code === 2 && /build pid \d+ \(orphan\)/.test(orphanRecord.err),
+    'the orphan record a failed kill leaves is honoured and named', `${orphanRecord.code} ${orphanRecord.err.trim()}`)
   locked({}) // taker and build child both gone
   const takeoverRun = await run(['check', path.join(slowTwo.native, 'src', 'hello.cpp'), '--project', slowTwo.project,
     '--out', path.join(ROOT, 'slow4.json'), '--build-timeout-ms', '2500'])

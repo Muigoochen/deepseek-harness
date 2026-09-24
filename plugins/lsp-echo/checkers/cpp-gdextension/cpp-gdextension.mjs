@@ -315,7 +315,7 @@ function killTree(child) {
  * to stderr).
  * @returns {Promise<{code: number|undefined, out: string, timedOut: boolean, text: string}>}
  */
-function runOnce(hit, target, timeoutMs, flags, toolchain, record) {
+function runOnce(hit, target, timeoutMs, flags, toolchain, lock) {
   const cmd = commandFor(hit, target, flags, toolchain)
   const text = `${path.basename(cmd.exe)} ${cmd.args.join(' ')}`
   return new Promise((resolve) => {
@@ -330,7 +330,7 @@ function runOnce(hit, target, timeoutMs, flags, toolchain, record) {
     }
     // The build child outlives a killed checker, so the lock records it: a waiter
     // must see this build as still running even after our process is gone.
-    if (record && child.pid) record(child.pid)
+    if (lock && lock.record && child.pid) lock.record(child.pid)
     let out = ''
     let timedOut = false
     let grace
@@ -338,9 +338,13 @@ function runOnce(hit, target, timeoutMs, flags, toolchain, record) {
       timedOut = true
       killTree(child)
       // A killed tree normally closes its stdio. A grandchild that keeps the pipe
-      // open would stall that forever, and the answer matters more than the log:
-      // report the timeout instead of letting the host's own timer kill us.
-      grace = setTimeout(() => resolve({ code: undefined, out, timedOut: true, text }), 5_000)
+      // open would stall that forever, and the answer matters more than the log.
+      // The lock then stays behind as an orphan record: the build we failed to
+      // kill is still writing here, so the next check must wait, not race it.
+      grace = setTimeout(() => {
+        if (lock && lock.orphan && child.pid) lock.orphan(child.pid)
+        resolve({ code: undefined, out, timedOut: true, text })
+      }, 5_000)
       if (typeof grace.unref === 'function') grace.unref()
     }, timeoutMs)
     const onData = (d) => { out += d }
@@ -448,15 +452,16 @@ function takeOverStaleLock(file, held) {
 }
 
 /**
- * Wait for the build lock, then run `fn(record, window)`. `record(childPid)` is
- * how the build child becomes part of the lock (see lockIsStale); `window` is
- * what is left of the caller's single budget, so waiting and building share one
- * deadline instead of taking one each. A wait that would leave too little of the
- * budget to build refuses instead of starting a build it must kill.
+ * Wait for the build lock, then run `fn(lock, window)`. `lock.record(childPid)`
+ * is how the build child becomes part of the lock (see lockIsStale), `lock.orphan`
+ * keeps the lock behind when the build could not be killed, and `window` is what
+ * is left of the caller's single budget — waiting and building share one deadline
+ * instead of taking one each. A wait that would leave too little of the budget to
+ * build refuses instead of starting a build it must kill.
  * Failure to *take* the lock is reported; a failure from `fn` propagates.
  * @param {{dir: string}} hit build directory
  * @param {number} budgetMs the caller's own time budget
- * @param {(record: (childPid: number) => void, window: {leftMs: number, waitedMs: number}) => Promise<any>} fn the build
+ * @param {(lock: {record: (childPid: number) => void, orphan: (childPid: number) => void}, window: {leftMs: number, waitedMs: number}) => Promise<any>} fn the build
  * @returns {Promise<{ok: true, value: any} | {ok: false, error: string}>}
  */
 async function withBuildLock(hit, budgetMs, fn) {
@@ -464,7 +469,11 @@ async function withBuildLock(hit, budgetMs, fn) {
   const startedAt = Date.now()
   const deadline = startedAt + Math.max(1_000, budgetMs)
   const refuse = (held, left) => {
-    const who = held && held.childPid ? `pid ${held.pid}, build pid ${held.childPid}` : `pid ${held && held.pid}`
+    const who = !held
+      ? 'an unknown holder'
+      : held.childPid
+        ? (held.pid ? `pid ${held.pid}, build pid ${held.childPid}` : `build pid ${held.childPid} (orphan)`)
+        : `pid ${held.pid}`
     const why = left > 0 ? `this check has ${(left / 1000).toFixed(0)}s of its budget left, too little to build` : 'this check ran out of its budget waiting'
     return { ok: false, error: `another check is already building ${hit.dir} (${who}); ${why} (lock: ${file})` }
   }
@@ -487,16 +496,36 @@ async function withBuildLock(hit, budgetMs, fn) {
       await new Promise((r) => setTimeout(r, Math.min(500, left)))
     }
   }
-  const record = (childPid) => {
-    try {
-      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, childPid, at: Date.now(), dir: hit.dir }))
-    } catch { /* the lock keeps the taker pid, which still guards it */ }
+  let kept = false
+  const lock = {
+    record: (childPid) => {
+      try {
+        fs.writeFileSync(file, JSON.stringify({ pid: process.pid, childPid, at: Date.now(), dir: hit.dir }))
+      } catch { /* the lock keeps the taker pid, which still guards it */ }
+    },
+    /**
+     * A build we could not kill is still writing into this directory. Leave the
+     * record naming only that child (no taker pid, which is this live process) so
+     * the next check waits for it instead of starting a second build beside it.
+     */
+    orphan: (childPid) => {
+      try {
+        fs.writeFileSync(file, JSON.stringify({ childPid, at: Date.now(), dir: hit.dir }))
+        kept = true
+      } catch { /* nothing better to do than release normally */ }
+    },
   }
   try {
     const leftMs = Math.max(1_000, deadline - Date.now())
-    return { ok: true, value: await fn(record, { leftMs, waitedMs: Date.now() - startedAt }) }
+    return { ok: true, value: await fn(lock, { leftMs, waitedMs: Date.now() - startedAt }) }
   } finally {
-    try { fs.unlinkSync(file) } catch { /* already released */ }
+    if (!kept) {
+      // Only our own lock: a takeover may have replaced it while we built.
+      const cur = readLock(file)
+      if (!cur || Number(cur.pid) === process.pid) {
+        try { fs.unlinkSync(file) } catch { /* already released */ }
+      }
+    }
   }
 }
 
@@ -509,7 +538,7 @@ async function runBuild(hit, sweep, flags, toolchain) {
   const budget = Number(flags['build-timeout-ms']) > 0
     ? Number(flags['build-timeout-ms'])
     : (sweep ? SWEEP_TIMEOUT_MS : MAIN_TIMEOUT_MS)
-  const locked = await withBuildLock(hit, budget, async (record, window) => {
+  const locked = await withBuildLock(hit, budget, async (lock, window) => {
     // One budget for the whole call: the wait above already spent part of it.
     const deadline = Date.now() + window.leftMs
     // build.ps1 takes `-Target both`; the bare SCons path runs twice.
@@ -519,7 +548,7 @@ async function runBuild(hit, sweep, flags, toolchain) {
     for (const target of targets) {
       const left = deadline - Date.now()
       if (left <= 1000) return { timedOut: true, out, commands, budgetMs: window.leftMs, waitedMs: window.waitedMs, timedOutOn: target }
-      const r = await runOnce(hit, target, left, { both: sweep && hit.kind === 'ps1' }, toolchain, record)
+      const r = await runOnce(hit, target, left, { both: sweep && hit.kind === 'ps1' }, toolchain, lock)
       out += `${r.out}\n`
       commands.push(`${r.text} -> exit ${r.code}${r.timedOut ? ' (killed)' : ''}`)
       if (r.timedOut) return { timedOut: true, out, commands, budgetMs: window.leftMs, waitedMs: window.waitedMs, timedOutOn: target }

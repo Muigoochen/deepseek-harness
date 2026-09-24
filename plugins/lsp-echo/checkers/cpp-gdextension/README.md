@@ -77,8 +77,10 @@ UTF-8(Windows PowerShell 5.1 默认按 ANSI 解码子进程输出,会把非 ASCI
 
 **等待与构建共用同一份预算**:`--build-timeout-ms`(默认 110s/190s)是这一次检查的总预算,等锁花掉的
 时间从里面扣;只有等到剩余不足 3 秒才提前拒绝 —— 短窗口照样编,因为桥会在自己的预算内给出结论,
-拒绝等于拿"可能成功"换"一定失败"。超时先 `taskkill /T /F`(POSIX 用进程组,失败再直接 kill),
-被杀的子进程若仍握着管道,5 秒后也照样作答,不会拖过预算把宿主那边的 clientd 计时器引爆。
+拒绝等于拿"可能成功"换"一定失败"。预算到点先杀构建树:Windows `taskkill /T /F`,POSIX 整组 SIGKILL,
+失败再直接 kill;被杀的子进程若仍握着继承来的管道,5 秒后也照样作答(**预算 + 最多 5 秒**,仍在宿主的
+120s/200s 之内)。这时锁会留成"孤儿构建"记录(只记 `childPid`、不带取锁 pid,因为那个进程正是还活着的
+检查自己),下一次检查会等它或如实报它,而不是并排再开一个 SCons。
 
 已知边界:锁只覆盖共享同一个 `DSH_HOME` 的进程;两个项目共用一份 `godot-cpp` 检出时,各编各的扩展仍可能在依赖目录里互相踩
 (按构建目录分锁、不做全局串行,是刻意的取舍)。
@@ -99,7 +101,7 @@ UTF-8(Windows PowerShell 5.1 默认按 ANSI 解码子进程输出,会把非 ASCI
 ## 自检
 
 ```powershell
-# 诊断解析 / 协议 / 诚实性路径 / 每文件构建目录 / 并发构建锁 + 真实 MSVC 端到端(64 项)
+# 诊断解析 / 协议 / 诚实性路径 / 每文件构建目录 / 并发构建锁 + 真实 MSVC 端到端(65 项)
 node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\probe.mjs --real-msvc
 
 # evidence 绑定 + 快照合并/作用域语义(可指向任意真实 GDExtension 项目)
