@@ -1608,9 +1608,13 @@ function cmdClientd(project, flags) {
       }
       const want = String((req && req.stage) || 'build').toLowerCase()
       if (want === 'syntax' || want === 'auto') {
-        // A request that refuses to wait must not sit behind a syntax check either:
-        // that check carries a budget of its own, so the wait can outlast the host's
-        // timeout and retire this clientd with the request already running.
+        // A request that refuses to wait is refused here too, exactly as the build
+        // queue refuses it. That deliberately costs a short overlap: two sessions
+        // sharing one clientd would otherwise let the second pre-step wait about a
+        // second and succeed. It buys a bounded wait instead — the running batch's
+        // own budget unbounds it, and outlasting the host's short timeout would
+        // retire this clientd with both requests. A refused file stays in the
+        // caller's pending set, so the next step asks again.
         if (entry.noWait === true && syntaxBusy) {
           reply(entry.id, { ok: false, error: `the syntax stage is already checking files for ${project}; this check does not wait for it` })
           continue
