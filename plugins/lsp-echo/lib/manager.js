@@ -159,7 +159,7 @@ export function writeSnapshot(project, payload, ownedExts, keepExts) {
       server: wrote ? payload.server : existing.server,
       port: wrote ? payload.port : existing.port,
       engine_note: wrote ? payload.engine_note : existing.engine_note,
-      stage: wrote ? payload.stage || existing.stage : existing.stage,
+      stage: wrote ? payload.stage : existing.stage,
       synthetic_keys: synthKeys,
       updated_at: wrote ? new Date().toISOString() : existing.updated_at,
       files,
@@ -356,7 +356,7 @@ function ensureClientd(bridge, project, role = 'main', editorPort) {
   return state
 }
 
-function clientdRequest(bridge, project, files, timeoutMs, role = 'main', editorPort, reloadFiles, buildBudgetMs, noWait) {
+function clientdRequest(bridge, project, files, timeoutMs, role = 'main', editorPort, reloadFiles, buildBudgetMs, noWait, stage) {
   return new Promise((resolve, reject) => {
     let state
     try { state = ensureClientd(bridge, project, role, editorPort) } catch (e) { reject(e); return }
@@ -376,6 +376,11 @@ function clientdRequest(bridge, project, files, timeoutMs, role = 'main', editor
     // build directory; the bridge honours both per request.
     if (buildBudgetMs > 0) request.budgetMs = buildBudgetMs
     if (noWait) request.noWait = true
+    // Which of the engine's stages answers this request. Omitted means the
+    // engine's own default (the cpp bridge builds), which keeps a request that
+    // does not care about stages — a baseline sweep, an unknown engine — on the
+    // path it has always taken.
+    if (stage) request.stage = stage
     try { state.child.stdin.write(JSON.stringify(request) + '\n') } catch (e) { reject(e) }
   })
 }
@@ -459,10 +464,19 @@ export function rescanEngine(bridge, project, port) {
  * @param {string[]} [reloadFiles] scripts whose disk content changed; the
  *        persistent clientd path reloads them before reading diagnostics. The
  *        legacy one-shot fallback does not carry them.
+ * @param {number} [buildBudgetMs] cap on one build-backed check, passed through to
+ *        the bridge (0/absent means the bridge's interactive budget)
+ * @param {boolean} [noWait] report a busy build directory at once instead of
+ *        waiting for the build already running there
+ * @param {string} [stage] which stage of a build-backed engine answers: the cpp
+ *        bridge's `syntax` is the fast compiler-only check, `build` the
+ *        authoritative one (link and build-script failures) and `auto` prefers
+ *        syntax, falling back to the build when it cannot run here. Omitted means
+ *        the engine's default.
  */
-export async function checkFiles(bridge, project, files, timeoutMs = 120_000, role = 'main', ownedExts, keepExts, editorPort, reloadFiles, buildBudgetMs, noWait) {
+export async function checkFiles(bridge, project, files, timeoutMs = 120_000, role = 'main', ownedExts, keepExts, editorPort, reloadFiles, buildBudgetMs, noWait, stage) {
   try {
-    const reply = await clientdRequest(bridge, project, files, timeoutMs, role, editorPort, reloadFiles, buildBudgetMs, noWait)
+    const reply = await clientdRequest(bridge, project, files, timeoutMs, role, editorPort, reloadFiles, buildBudgetMs, noWait, stage)
     if (reply && reply.ok && reply.payload) {
       return writeSnapshot(project, reply.payload, ownedExts, keepExts)
     }
@@ -495,9 +509,12 @@ export async function checkFiles(bridge, project, files, timeoutMs = 120_000, ro
     // retry would build with the bridge's interactive default instead.
     const budgetArgs = buildBudgetMs > 0 ? ['--build-timeout-ms', String(buildBudgetMs)] : []
     const waitArgs = noWait ? ['--no-wait'] : []
+    // The one-shot fallback must ask for the same stage, or a request that wanted
+    // the fast compiler-only check would silently start a full build instead.
+    const stageArgs = stage ? ['--stage', stage] : []
     // The files come first: a valueless flag followed by a path would otherwise
     // eat the file it precedes (the bridge's parser gives a flag the next token).
-    const r = await runBridge(bridge, ['check', ...files, ...sweepArgs, ...portArgs, ...budgetArgs, ...waitArgs, ...reserveArgs(), '--project', project, '--out', tmpOut], timeoutMs)
+    const r = await runBridge(bridge, ['check', ...files, ...sweepArgs, ...portArgs, ...budgetArgs, ...waitArgs, ...stageArgs, ...reserveArgs(), '--project', project, '--out', tmpOut], timeoutMs)
     if (r.fatal) {
       try { fs.unlinkSync(tmpOut) } catch { /* best effort */ }
       throw new Error(r.stderr.trim() || r.stdout.trim() || 'bridge check failed')

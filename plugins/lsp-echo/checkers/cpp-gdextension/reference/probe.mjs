@@ -751,6 +751,63 @@ exit 0
   ok(r14m.code === 2 && !readJson(out14m) && /does not exist/.test(r14m.err),
     'an explicit --flags that does not exist is refused instead of replaced by the layout',
     `${r14m.code} payload=${JSON.stringify(readJson(out14m))} ${r14m.err.trim()}`)
+  // A stage request that has to fall back to the build must obey the no-wait rule
+  // while doing so: otherwise it queues behind the running build and the host's
+  // pre-step timeout retires this clientd together with that build. The fixture
+  // raises a flag file the moment its build starts (so the second request is sent
+  // while the first provably runs), and the minimal PATH leaves the syntax stage
+  // without a compiler — the exact combination that reaches the fallback.
+  console.log('\n[14c] a stage request that must fall back refuses to queue')
+  const queueRun = mingwProject('syntax-queue', SLOW_FLAG_OUT, { 'src/q.cpp': 'int probe_q() { return 0; }\n' })
+  const queueFlag = path.join(queueRun.native, 'build-started.flag')
+  const queueFile = path.join(queueRun.native, 'src', 'q.cpp')
+  await new Promise((resolve) => {
+    const child = spawn(process.execPath, [BRIDGE, 'clientd', '--project', queueRun.project],
+      { cwd: ROOT, windowsHide: true, env: { ...process.env, ...noCompiler } })
+    let buf = ''
+    const replies = []
+    const started = Date.now()
+    let sentSecond = false
+    let done = false
+    // A silent timeout would skip these assertions and still print PASSED: a probe
+    // promise that gives up must report the give-up as a failure.
+    const finish = (giveUp) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      clearInterval(poll)
+      try { child.kill() } catch { /* gone */ }
+      if (giveUp) ok(false, giveUp, `replies: ${replies.map((x) => `${x.body.id}@${x.at}ms`).join(', ') || 'none'}`)
+      resolve()
+    }
+    const timer = setTimeout(() => finish('the stage-fallback refusal answered within 60s'), 60_000)
+    const poll = setInterval(() => {
+      if (sentSecond || !fs.existsSync(queueFlag)) return
+      sentSecond = true
+      child.stdin.write(`${JSON.stringify({ id: 2, files: [queueFile], budgetMs: 6000, noWait: true, stage: 'auto' })}\n`)
+    }, 50)
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (d) => {
+      if (done) return
+      buf += d
+      const lines = buf.split('\n')
+      buf = lines.pop() || ''
+      for (const line of lines) {
+        if (!line.trim().startsWith('{')) continue
+        try { replies.push({ at: Date.now() - started, body: JSON.parse(line) }) } catch { /* chatter */ }
+      }
+      const busy = replies.find((x) => x.body.id === 2)
+      const first = replies.find((x) => x.body.id === 1)
+      if (!busy || !first) return
+      ok(busy.body.ok === false && /does not wait|already building/.test(busy.body.error || ''),
+        'a stage request that must fall back to the build is refused while one runs',
+        JSON.stringify(busy.body).slice(0, 240))
+      ok(busy.at < 5_000 && busy.at < first.at, 'and the refusal is immediate, before that build finishes',
+        `busy@${busy.at}ms first@${first.at}ms`)
+      finish()
+    })
+    child.stdin.write(`${JSON.stringify({ id: 1, files: [queueFile], budgetMs: 6000 })}\n`)
+  })
   // A successful build teaches the stage: the flags SCons printed are the ones
   // the project really compiles with, including defines no heuristic can guess.
   const teachOut = String.raw`param([string]$Target = 'both')
@@ -855,7 +912,7 @@ exit 0
   // Every assertion runs exactly once, so the number that ran is knowable: a
   // skipped assertion (a promise that timed out, a section that never ran) lowers
   // the count and fails here instead of printing PASSED.
-  const EXPECTED_CHECKS = 95 + (REAL_MSVC ? 7 : 0)
+  const EXPECTED_CHECKS = 97 + (REAL_MSVC ? 7 : 0)
   if (checks !== EXPECTED_CHECKS) {
     failures += 1
     console.log(`  FAIL every check ran: ${checks}/${EXPECTED_CHECKS} executed`)

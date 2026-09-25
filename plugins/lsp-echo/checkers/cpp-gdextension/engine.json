@@ -6,5 +6,6 @@
   "evidence": ["SConstruct", "*.gdextension"],
   "syntheticKeys": ["<link>"],
   "budgetMs": 40000,
-  "noWait": true
+  "noWait": true,
+  "preStepStage": "auto"
 }

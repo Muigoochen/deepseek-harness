@@ -67,6 +67,12 @@ function descriptor(dir) {
     // `noWait` marks an engine whose pre-step check must report a busy build
     // directory at once instead of waiting for it (same reason as budgetMs).
     noWait: raw.noWait === true,
+    // `preStepStage` is the stage this engine's pre-step check asks for, in the
+    // engine's own vocabulary (the cpp bridge's `auto` prefers its fast
+    // compiler-only stage and falls back to the build when it cannot run here).
+    // Declared by the engine because the name means nothing to this package: a
+    // build-backed engine that declares none keeps its bridge's default stage.
+    preStepStage: typeof raw.preStepStage === 'string' && raw.preStepStage ? raw.preStepStage : undefined,
   }
 }
 
@@ -76,7 +82,7 @@ function descriptor(dir) {
  * resolved to the declared file inside that directory, falling back to
  * bridge.mjs. Directories without a usable descriptor are skipped.
  * @param {string} pluginRoot absolute plugin package root.
- * @returns {Record<string, { id: string; name: string; bridge: string; marker: string; extensions: string[]; evidence?: string[]; fallback?: boolean; syntheticKeys?: string[]; budgetMs?: number; noWait?: boolean }>}
+ * @returns {Record<string, { id: string; name: string; bridge: string; marker: string; extensions: string[]; evidence?: string[]; fallback?: boolean; syntheticKeys?: string[]; budgetMs?: number; noWait?: boolean; preStepStage?: string }>}
  */
 export function engines(pluginRoot) {
   const base = path.join(pluginRoot, 'checkers')
@@ -108,6 +114,7 @@ export function engines(pluginRoot) {
       syntheticKeys: desc.syntheticKeys,
       budgetMs: desc.budgetMs,
       noWait: desc.noWait,
+      preStepStage: desc.preStepStage,
     }
   }
   return list

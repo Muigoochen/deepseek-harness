@@ -1539,10 +1539,18 @@ function cmdClientd(project, flags) {
           entry.budgetMs > 0 ? entry.budgetMs : 0)
         if (r.ok) reply(entry.id, { ok: true, payload: r.payload })
         else if (r.unavailable) {
-          // No compiler this stage can drive: answer with the build, which is the
-          // only stage left, rather than failing the check.
-          queue.push({ ...entry, stage: 'build' })
-          void drain()
+          // No compiler this stage can drive: answer with the build, the only stage
+          // left — but a request that refuses to wait must be refused here too, or it
+          // would queue behind a running build and time the whole channel out. That
+          // is the same rule the build path applies before it queues anything, and
+          // the reason the host's short pre-step timeout does not retire this clientd
+          // together with the build it is running.
+          if (entry.noWait === true && (busy || queue.length)) {
+            reply(entry.id, { ok: false, error: `another check is already building ${project}; this check does not wait for it (wait for the running check, or run one manually)` })
+          } else {
+            queue.push({ ...entry, stage: 'build' })
+            void drain()
+          }
         } else reply(entry.id, { ok: false, error: r.error })
       } catch (error) {
         reply(entry.id, { ok: false, error: (error && error.message) || String(error) })

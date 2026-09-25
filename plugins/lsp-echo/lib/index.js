@@ -816,14 +816,15 @@ export function apply(ctx, config) {
    * @param {string[]|undefined} keepExts extensions the snapshot must keep
    * @param {string[]} [reloadFiles] scripts whose disk content changed, for the
    *   engine to reload through the language server before it answers
-   * @param {{budgetMs?: number, noWait?: boolean}} [limits] build-backed engines:
-   *   cap the build and refuse to wait for a busy build directory
+   * @param {{budgetMs?: number, noWait?: boolean, stage?: string}} [limits] build-backed engines:
+   *   cap the check, refuse to wait for a busy build directory, and pick the stage
+   *   that answers (declared by the engine, see engine.json `preStepStage`)
    * @returns {Promise<object>} diagnostics payload
    */
   const checkWithHeal = async (eng, project, files, timeoutMs, role, ownExts, keepExts, reloadFiles, limits) => {
     const port = enginePortOf(eng.id, project)
     const payload = await checkFiles(eng.bridge, project, files, timeoutMs, role, ownExts, keepExts, port, reloadFiles,
-      limits && limits.budgetMs, limits && limits.noWait)
+      limits && limits.budgetMs, limits && limits.noWait, limits && limits.stage)
     if (!eng.rescan) return payload
     const missing = missingTypeNames(payload, project, files)
     if (!missing.length) return payload
@@ -841,7 +842,7 @@ export function apply(ctx, config) {
       // The smaller budget keeps the doubled cost off the pre-step path.
       const retryBudgetMs = Math.min(timeoutMs, 45_000)
       const healed = await checkFiles(eng.bridge, project, files, retryBudgetMs, role, ownExts, keepExts, port, reloadFiles,
-        limits && limits.budgetMs, limits && limits.noWait)
+        limits && limits.budgetMs, limits && limits.noWait, limits && limits.stage)
       if (missingTypeNames(healed, project, files).length) {
         trace('rescan', eng.id, 're-check still reports unknown types; the engine may not have re-published diagnostics yet')
       }
@@ -1949,10 +1950,19 @@ export function apply(ctx, config) {
     for (const eng of boundEngines) {
       const files = byEngine.get(eng.id) || []
       if (!files.length) continue
-      // A build-backed engine declares a small build budget and refuses to wait
+      // A build-backed engine declares a small check budget and refuses to wait
       // for a busy build directory: a step never blocks behind a cold rebuild,
       // and the files stay pending for the next step instead (see the catch).
-      const limits = (eng.budgetMs || eng.noWait) ? { budgetMs: eng.budgetMs, noWait: eng.noWait } : undefined
+      // It also declares which stage answers a pre-step check — for the cpp engine
+      // `auto` prefers its one-second compiler-only check and falls back to the
+      // build when that cannot run here. The stage name lives in engine.json
+      // because only that engine's bridge knows what its stages are called; a
+      // build-backed engine that declares none keeps its bridge's default, and the
+      // self-heal re-check below inherits this same stage on purpose (it re-asks
+      // the same question after a rescan).
+      const limits = (eng.budgetMs || eng.noWait)
+        ? { budgetMs: eng.budgetMs, noWait: eng.noWait, stage: eng.preStepStage }
+        : undefined
       const hostTimeoutMs = eng.budgetMs ? eng.budgetMs + 20_000 : 120_000
       tasks.push(
         checkWithHeal(eng, rec.path, files, hostTimeoutMs, 'main', eng.extensions, keepExts,
