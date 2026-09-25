@@ -799,7 +799,7 @@ exit 0
       const busy = replies.find((x) => x.body.id === 2)
       const first = replies.find((x) => x.body.id === 1)
       if (!busy || !first) return
-      ok(busy.body.ok === false && /does not wait|already building/.test(busy.body.error || ''),
+      ok(busy.body.ok === false && /cannot run here/.test(busy.body.error || ''),
         'a stage request that must fall back to the build is refused while one runs',
         JSON.stringify(busy.body).slice(0, 240))
       ok(busy.at < 5_000 && busy.at < first.at, 'and the refusal is immediate, before that build finishes',
@@ -807,6 +807,44 @@ exit 0
       finish()
     })
     child.stdin.write(`${JSON.stringify({ id: 1, files: [queueFile], budgetMs: 6000 })}\n`)
+  })
+  // An explicit `syntax` request is not silently answered by the build on the clientd
+  // channel either: it fails with the stage's own reason, exactly like the one-shot
+  // channel, so a caller that asked for this stage never gets another one's verdict.
+  console.log('\n[14d] an explicit syntax request is refused, not answered by the build')
+  await new Promise((resolve) => {
+    const child = spawn(process.execPath, [BRIDGE, 'clientd', '--project', plain.project],
+      { cwd: ROOT, windowsHide: true, env: { ...process.env, ...noCompiler } })
+    let buf = ''
+    let done = false
+    // A silent timeout would skip this assertion and still print PASSED.
+    const finish = (giveUp) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      try { child.kill() } catch { /* gone */ }
+      if (giveUp) ok(false, giveUp, 'no reply')
+      resolve()
+    }
+    const timer = setTimeout(() => finish('the explicit-syntax refusal answered within 60s'), 60_000)
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (d) => {
+      if (done) return
+      buf += d
+      const lines = buf.split('\n')
+      buf = lines.pop() || ''
+      for (const line of lines) {
+        if (!line.trim().startsWith('{')) continue
+        let body
+        try { body = JSON.parse(line) } catch { continue }
+        if (body.id !== 1) continue
+        ok(body.ok === false && !body.payload,
+          'a clientd request for the syntax stage fails instead of building',
+          JSON.stringify(body).slice(0, 240))
+        finish()
+      }
+    })
+    child.stdin.write(`${JSON.stringify({ id: 1, files: [path.join(plain.native, 'src', 'plain.cpp')], budgetMs: 6000, stage: 'syntax' })}\n`)
   })
   // A successful build teaches the stage: the flags SCons printed are the ones
   // the project really compiles with, including defines no heuristic can guess.
@@ -912,7 +950,7 @@ exit 0
   // Every assertion runs exactly once, so the number that ran is knowable: a
   // skipped assertion (a promise that timed out, a section that never ran) lowers
   // the count and fails here instead of printing PASSED.
-  const EXPECTED_CHECKS = 97 + (REAL_MSVC ? 7 : 0)
+  const EXPECTED_CHECKS = 98 + (REAL_MSVC ? 7 : 0)
   if (checks !== EXPECTED_CHECKS) {
     failures += 1
     console.log(`  FAIL every check ran: ${checks}/${EXPECTED_CHECKS} executed`)

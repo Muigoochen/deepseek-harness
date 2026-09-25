@@ -1539,14 +1539,17 @@ function cmdClientd(project, flags) {
           entry.budgetMs > 0 ? entry.budgetMs : 0)
         if (r.ok) reply(entry.id, { ok: true, payload: r.payload })
         else if (r.unavailable) {
-          // No compiler this stage can drive: answer with the build, the only stage
-          // left — but a request that refuses to wait must be refused here too, or it
-          // would queue behind a running build and time the whole channel out. That
-          // is the same rule the build path applies before it queues anything, and
-          // the reason the host's short pre-step timeout does not retire this clientd
-          // together with the build it is running.
-          if (entry.noWait === true && (busy || queue.length)) {
-            reply(entry.id, { ok: false, error: `another check is already building ${project}; this check does not wait for it (wait for the running check, or run one manually)` })
+          // No compiler this stage can drive. An explicit `syntax` request is never
+          // answered by the build: the one-shot channel refuses it the same way, so a
+          // caller that named this stage learns it cannot run here instead of getting
+          // a verdict from a stage it did not ask for.
+          if (entry.stage === 'syntax') {
+            reply(entry.id, { ok: false, error: r.error })
+          } else if (entry.noWait === true && (busy || queue.length)) {
+            // Falling back to the build obeys the waiting policy the build path
+            // enforces: queueing behind a running build would time the whole channel
+            // out and retire this clientd together with that build.
+            reply(entry.id, { ok: false, error: `the syntax stage cannot run here (${r.error}) and another check is already building ${project}; this check does not wait for it` })
           } else {
             queue.push({ ...entry, stage: 'build' })
             void drain()
@@ -1600,10 +1603,18 @@ function cmdClientd(project, flags) {
       try { req = JSON.parse(line) } catch { continue }
       const entry = {
         id: req && req.id, files: req.files, sweep: req.sweep, budgetMs: req && req.budgetMs,
-        noWait: req && req.noWait, killOnTimeout: req && req.killOnTimeout, stage: req && req.stage, flags: req && req.flags,
+        noWait: req && req.noWait, killOnTimeout: req && req.killOnTimeout,
+        stage: req && req.stage ? String(req.stage).toLowerCase() : undefined, flags: req && req.flags,
       }
       const want = String((req && req.stage) || 'build').toLowerCase()
       if (want === 'syntax' || want === 'auto') {
+        // A request that refuses to wait must not sit behind a syntax check either:
+        // that check carries a budget of its own, so the wait can outlast the host's
+        // timeout and retire this clientd with the request already running.
+        if (entry.noWait === true && syntaxBusy) {
+          reply(entry.id, { ok: false, error: `the syntax stage is already checking files for ${project}; this check does not wait for it` })
+          continue
+        }
         syntaxQueue.push(entry)
         void drainSyntax()
         continue

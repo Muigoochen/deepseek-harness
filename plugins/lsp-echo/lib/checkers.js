@@ -121,6 +121,20 @@ export function engines(pluginRoot) {
 }
 
 /**
+ * The limits a pre-step check hands to a build-backed engine, or undefined for an
+ * engine that is not one. Such an engine declares a small budget, refuses to wait
+ * for a build directory that is busy, and names the stage its cheap check uses (the
+ * cpp bridge's `auto` prefers its compiler-only stage and falls back to the build);
+ * an engine that declares none of this keeps its bridge's default stage.
+ * @param {{ budgetMs?: number; noWait?: boolean; preStepStage?: string }} eng engine record from engines()
+ * @returns {{ budgetMs?: number; noWait?: boolean; stage?: string }|undefined}
+ */
+export function preStepLimits(eng) {
+  if (!eng || !(eng.budgetMs || eng.noWait)) return undefined
+  return { budgetMs: eng.budgetMs, noWait: eng.noWait, stage: eng.preStepStage }
+}
+
+/**
  * All engine marker file names (deduped), for project-root probing.
  * @param {Record<string, { marker: string }>} table engine table from engines()
  * @returns {string[]}

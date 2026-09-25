@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url'
 import fs from 'node:fs'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { engines, markers, matchExtension } from './checkers.js'
+import { engines, markers, matchExtension, preStepLimits } from './checkers.js'
 import { ensureHost, stopHost, status, checkFiles, runtimeRoot, stopClientd, diagnosticsPath, pruneSnapshot, rescanEngine, setReservedPorts } from './manager.js'
 import { ADDON_ID, addonResPath, discoverBridgePortAsync, installAddonInto, isAddonCurrent, isEditorPluginEnabled, probeEngineBridge, probePortOpen, readBridgeInstances, rescanPortOf } from './addon.js'
 import { dependentsOf } from './dependents.js'
@@ -1953,16 +1953,10 @@ export function apply(ctx, config) {
       // A build-backed engine declares a small check budget and refuses to wait
       // for a busy build directory: a step never blocks behind a cold rebuild,
       // and the files stay pending for the next step instead (see the catch).
-      // It also declares which stage answers a pre-step check — for the cpp engine
-      // `auto` prefers its one-second compiler-only check and falls back to the
-      // build when that cannot run here. The stage name lives in engine.json
-      // because only that engine's bridge knows what its stages are called; a
-      // build-backed engine that declares none keeps its bridge's default, and the
-      // self-heal re-check below inherits this same stage on purpose (it re-asks
-      // the same question after a rescan).
-      const limits = (eng.budgetMs || eng.noWait)
-        ? { budgetMs: eng.budgetMs, noWait: eng.noWait, stage: eng.preStepStage }
-        : undefined
+      // It also declares which stage answers a pre-step check (see preStepLimits);
+      // the self-heal re-check below inherits that stage on purpose, because it
+      // re-asks the same question after a rescan.
+      const limits = preStepLimits(eng)
       const hostTimeoutMs = eng.budgetMs ? eng.budgetMs + 20_000 : 120_000
       tasks.push(
         checkWithHeal(eng, rec.path, files, hostTimeoutMs, 'main', eng.extensions, keepExts,

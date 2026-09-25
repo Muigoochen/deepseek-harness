@@ -8,6 +8,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-request-probe-'))
 process.env.DSH_HOME = HOME
@@ -52,6 +53,7 @@ if (argv[0] === 'clientd') {
 `, 'utf8')
 
 const { checkFiles, stopClientd } = await import(new URL('../lib/manager.js', import.meta.url))
+const { engines, preStepLimits } = await import(new URL('../lib/checkers.js', import.meta.url))
 const requests = () => fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
 const exts = ['.cpp']
 
@@ -90,16 +92,19 @@ try {
   ok(!!fallback && fallback.tool === 'fake',
     'and the fallback result is the one this probe persisted', JSON.stringify(fallback && fallback.summary))
 
-  // 4. the wiring the manager cannot show: the pre-step asks for the stage its
-  // engine declares, and that declaration lives in engine.json (a source-shape
-  // check: driving this plugin's pre-step needs a whole agent loop).
-  const cppEngine = JSON.parse(fs.readFileSync(new URL('../checkers/cpp-gdextension/engine.json', import.meta.url), 'utf8'))
-  const indexSrc = fs.readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
-  ok(typeof cppEngine.preStepStage === 'string' && cppEngine.preStepStage.length > 0,
-    'the cpp engine declares the stage its pre-step check asks for', JSON.stringify(cppEngine.preStepStage))
-  ok(/stage:\s*eng\.preStepStage/.test(indexSrc) && /eng\.budgetMs \|\| eng\.noWait/.test(indexSrc),
-    'and the pre-step limits carry that declaration, not a hardcoded name',
-    `stage: eng.preStepStage → ${/stage:\s*eng\.preStepStage/.test(indexSrc)}`)
+  // 4. the wiring the manager cannot show: the pre-step's limits must come from the
+  // engine's own declaration, so a dropped engine.json field, a dropped checkers.js
+  // field and a hardcoded stage name each go red here. The call site is asserted as
+  // source, because driving the real pre-step needs a whole agent loop.
+  const table = engines(fileURLToPath(new URL('..', import.meta.url)))
+  const cppLimits = preStepLimits(table['cpp-gdextension'])
+  ok(!!cppLimits && cppLimits.stage === 'auto' && cppLimits.budgetMs === 40_000 && cppLimits.noWait === true,
+    'the cpp engine declares the pre-step limits the plugin hands it', JSON.stringify(cppLimits))
+  ok(preStepLimits(table['godot-lsp']) === undefined,
+    'and an engine that declares none is handed no stage its bridge does not know',
+    JSON.stringify(table['godot-lsp'] && { budgetMs: table['godot-lsp'].budgetMs, noWait: table['godot-lsp'].noWait }))
+  ok(/preStepLimits\(eng\)/.test(fs.readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')),
+    'and the pre-step is the caller that hands them over', 'index.js calls preStepLimits(eng)')
 } finally {
   fs.rmSync(HOME, { recursive: true, force: true })
 }
