@@ -54,15 +54,23 @@ const MAX_BUILD_DIR_DEPTH = 6
 // ours ("build did not finish") instead of a bare clientd timeout.
 const MAIN_TIMEOUT_MS = 110_000
 const SWEEP_TIMEOUT_MS = 190_000
+// One file, one compiler run, no build: a minute is already far past the point
+// where the stage is useful, and the plugin's step budget is shorter than this.
+const SYNTAX_TIMEOUT_MS = 60_000
+// Which stage answers a check. `auto` prefers the syntax stage and falls back to
+// the build when this project's toolchain cannot be driven without its
+// environment (MSVC without vcvars64.bat), because a stage that cannot run must
+// not turn into a clean answer.
+const STAGES = new Set(['auto', 'syntax', 'build'])
 
 // Flags that take no value. Without this list a valueless flag swallows the next
 // argument, so `check --no-wait src/a.cpp` would both lose that file and stop
 // being a boolean (`flags['no-wait']` would be the path, never `true`).
-const BOOLEAN_FLAGS = new Set(['sweep', 'both', 'no-wait', 'kill-on-timeout'])
+const BOOLEAN_FLAGS = new Set(['sweep', 'both', 'no-wait', 'kill-on-timeout', 'print-flags'])
 // Flags that require a value. A valueless `--project` would otherwise become the
 // literal `true`, and `--build-timeout-ms` would become `Number(true) === 1`, a
 // one-millisecond budget that reports a timeout without ever building.
-const VALUE_FLAGS = new Set(['project', 'out', 'dir', 'toolchain', 'build-timeout-ms'])
+const VALUE_FLAGS = new Set(['project', 'out', 'dir', 'toolchain', 'build-timeout-ms', 'stage', 'flags'])
 
 function parseArgs(argv) {
   const flags = {}
@@ -781,6 +789,580 @@ function payloadFor(project, requestedAbs, byKey, hit) {
   }
 }
 
+// ---------- syntax stage: the project's own compiler, no build ----------
+// The build is the only authority on link errors, but paying SCons's floor (and
+// occasionally a full godot-cpp recompile) to answer "does this file still
+// compile?" is what made a one-line edit cost minutes. `-fsyntax-only` with the
+// project's own compiler, flags and working directory answers that question in
+// about a second and cannot disagree with the build the way a second compiler
+// can. It writes nothing into the build directory and takes no lock.
+
+/** Stable key for runtime files that belong to a project but not to its tree. */
+function projectKey(project) {
+  return crypto.createHash('sha1').update(path.resolve(project).toLowerCase()).digest('hex').slice(0, 12)
+}
+
+/**
+ * godot-cpp checkout this project builds against: `GODOT_CPP_DIR` when the
+ * project uses it, otherwise a `godot-cpp` directory holding an `SConstruct` at
+ * or above the build directory (never above the project root).
+ * @returns {string|undefined}
+ */
+function godotCppRoot(project, hit) {
+  if (process.env.GODOT_CPP_DIR) {
+    const dir = path.resolve(process.env.GODOT_CPP_DIR)
+    if (fs.existsSync(path.join(dir, 'SConstruct'))) return dir
+  }
+  const root = path.resolve(project)
+  let dir = path.resolve(hit.dir)
+  for (;;) {
+    const candidate = path.join(dir, 'godot-cpp')
+    if (fs.existsSync(path.join(candidate, 'SConstruct'))) return candidate
+    if (dir === root || !isUnder(root, dir)) break
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return undefined
+}
+
+/**
+ * Directory literals a project's build script pins (a MinGW root, a Visual Studio
+ * tools directory). The script is the project's own statement of where its
+ * toolchain lives, which is what a syntax check has to use: a project whose
+ * compiler exists only on the script's own PATH cannot be driven by whatever
+ * `g++` the harness environment happens to carry.
+ * @param {{dir: string, file: string}} hit build directory
+ * @returns {string[]}
+ */
+function binsFromBuildScript(hit) {
+  const out = []
+  const files = [hit.file, path.join(hit.dir, 'build.ps1'), path.join(hit.dir, 'build.sh'), path.join(hit.dir, 'CMakeLists.txt')]
+  for (const file of files) {
+    let text
+    try { text = fs.readFileSync(file, 'utf8') } catch { continue }
+    for (const m of text.matchAll(/["']([A-Za-z]:[\\/][^"'\r\n]{2,})["']/g)) {
+      const raw = m[1].replace(/\\\\/g, '\\')
+      const dir = /\.(exe|bat|cmd)$/i.test(raw) ? path.dirname(raw) : raw
+      if (/bin$/i.test(dir) || /(mingw|llvm|msvc|visual studio|tools)/i.test(dir)) out.push(dir)
+    }
+  }
+  return [...new Set(out)]
+}
+
+/**
+ * The C++ compiler this project builds with, or undefined. Order: an explicit
+ * choice (`CXX`, then `MINGW_BIN`), what the project's own build script names,
+ * then PATH — a compiler named by the build script wins over PATH because that is
+ * the one the build will use.
+ * @returns {string|undefined} absolute path
+ */
+function findCompiler(hit, toolchain) {
+  const exe = toolchain === 'msvc' ? 'cl.exe' : (process.platform === 'win32' ? 'g++.exe' : 'g++')
+  const candidates = []
+  // `CXX` and `MINGW_BIN` are explicit choices for the Visual-Studio-less
+  // toolchain. They must not satisfy an MSVC lookup: the flags would then be
+  // MSVC's while the compiler is MinGW's, and every report built from that pair
+  // is junk.
+  if (process.env.CXX && compilerFamily(process.env.CXX) === toolchain) {
+    candidates.push(process.env.CXX)
+  }
+  if (process.env.MINGW_BIN && toolchain !== 'msvc') candidates.push(path.join(process.env.MINGW_BIN, exe))
+  for (const dir of binsFromBuildScript(hit)) candidates.push(path.join(dir, exe))
+  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+    if (dir) candidates.push(path.join(dir, exe))
+  }
+  for (const file of candidates) {
+    try { if (file && fs.statSync(file).isFile()) return path.resolve(file) } catch { /* keep looking */ }
+  }
+  return undefined
+}
+
+/**
+ * The compiler the syntax stage would run, and the toolchain whose flags it must
+ * use. The project's own toolchain wins: `cl` through vcvars before a MinGW
+ * compiler the project does not build with, and only when neither can run here does
+ * the machine's other compiler beat no check at all. Compiler and flags always come
+ * from one toolchain, or every report built from them is junk.
+ * @returns {{compiler: string|undefined, effective: string}} compiler path (or the
+ *          bare `cl.exe` vcvars is expected to provide) and the flag toolchain
+ */
+function syntaxCompiler(hit, toolchain) {
+  const compiler = findCompiler(hit, toolchain)
+  if (compiler || toolchain !== 'msvc') return { compiler, effective: toolchain }
+  // No `cl` path was found, but the project's own build environment may still
+  // provide one: that beats a MinGW compiler this project does not build with, and
+  // only when neither exists is another compiler a better answer than no check.
+  if (vcvarsPath()) return { compiler: 'cl.exe', effective: 'msvc' }
+  const gcc = findCompiler(hit, 'mingw')
+  if (gcc) {
+    log(`no cl and no vcvars64.bat: the syntax stage uses ${gcc} with MinGW flags`)
+    return { compiler: gcc, effective: 'mingw' }
+  }
+  return { compiler: undefined, effective: toolchain }
+}
+
+/**
+ * `vcvars64.bat` for this machine, or undefined. MSVC cannot compile anything
+ * without the environment it sets, and that environment cannot be guessed from
+ * the outside.
+ * @returns {string|undefined}
+ */
+function vcvarsPath() {
+  const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
+  const pf = process.env.ProgramFiles || 'C:\\Program Files'
+  const roots = [
+    process.env.VCINSTALLDIR,
+    process.env.VSINSTALLDIR,
+    path.join(pf86, 'Microsoft Visual Studio', '2022', 'BuildTools'),
+    path.join(pf86, 'Microsoft Visual Studio', '2022', 'Community'),
+    path.join(pf, 'Microsoft Visual Studio', '2022', 'Community'),
+    path.join(pf86, 'Microsoft Visual Studio', '2019', 'BuildTools'),
+  ]
+  for (const root of roots) {
+    if (!root) continue
+    const file = path.join(root, 'VC', 'Auxiliary', 'Build', 'vcvars64.bat')
+    try { if (fs.statSync(file).isFile()) return file } catch { /* next root */ }
+  }
+  return undefined
+}
+
+/** Split a compile command line into argv, honouring quotes (paths have spaces). */
+function splitCommandLine(text) {
+  const out = []
+  let cur = ''
+  let quote = ''
+  for (const c of String(text)) {
+    if (quote) {
+      if (c === quote) quote = ''
+      else cur += c
+    } else if (c === '"' || c === "'") quote = c
+    else if (/\s/.test(c)) { if (cur) { out.push(cur); cur = '' } }
+    else cur += c
+  }
+  if (cur) out.push(cur)
+  return out
+}
+
+/**
+ * Which flag dialect a compiler speaks, from its own name. What a command line
+ * means depends on this, and the compiler that will run is the fact — the
+ * toolchain label inferred from build artifacts is a guess that a project which
+ * has never been built cannot confirm.
+ * @param {string} compiler compiler path or bare name
+ * @returns {'msvc'|'mingw'}
+ */
+function compilerFamily(compiler) {
+  return /(^|[\\/])cl(\.exe)?$/i.test(String(compiler || '')) ? 'msvc' : 'mingw'
+}
+
+/**
+ * Flags of one command line that describe the translation unit (dialect,
+ * includes, defines, warnings), with outputs, dependency files and link inputs
+ * removed: they belong to one build invocation, not to the file. `-o x.o` in a
+ * syntax-only run would make the compiler write into the build directory, which
+ * this stage must never do.
+ * @returns {string[]|undefined} undefined when the line compiles no such source
+ */
+function compileArgsOf(argv, sourceAbs, family) {
+  const source = path.basename(sourceAbs).toLowerCase()
+  const out = []
+  let sawSource = false
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (path.basename(a).toLowerCase() === source) { sawSource = true; continue }
+    if (family === 'msvc') {
+      if (/^\/c$/i.test(a)) continue
+      const outFlag = /^\/(Fo|Fd|Fp|Fa|Fe)(.*)$/i.exec(a)
+      if (outFlag) {
+        // `/Fo:path`, `/Fopath` and `/Fo path` all exist. Only the spaced form takes
+        // the next argument, and never a source file: that is the file being
+        // compiled, not an output path, and eating it would silently drop the entry.
+        if (!outFlag[2] && !/\.(cpp|cc|cxx)$/i.test(argv[i + 1] || '')) i += 1
+        continue
+      }
+      if (/^\/link$/i.test(a)) break // everything after /link is the linker's
+      out.push(a) // /I, /D, /std:, /utf-8, /EHsc, /W4 … all mean the same to /Zs
+      continue
+    }
+    if (a === '-c') continue
+    if (a === '-o' || a === '-MF' || a === '-MT' || a === '-MQ' || a === '-x') { i += 1; continue }
+    if (/^-(MD|MMD|MP|MM|M)$/.test(a)) continue
+    if (/^-Wl,/.test(a) || /^-l/.test(a) || /^-L/.test(a) || a === '-shared' || /^-static/.test(a)) continue
+    out.push(a)
+  }
+  return sawSource ? out : undefined
+}
+
+/**
+ * Compiler arguments for one file from a `compile_commands.json` entry — the
+ * authoritative source when a project (or SCons's `compilation_db` tool)
+ * publishes one.
+ * @returns {{args: string[], toolchain: 'msvc'|'mingw'}|undefined}
+ */
+function flagsFromCompileCommands(file, sourceAbs) {
+  let db
+  try { db = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return undefined }
+  if (!Array.isArray(db)) return undefined
+  const want = path.resolve(sourceAbs).toLowerCase()
+  const base = path.basename(sourceAbs).toLowerCase()
+  // A shared database may name the same basename from another directory: that entry
+  // describes a different file, so only the same directory qualifies as a match.
+  const entry = db.find((e) => e && typeof e.file === 'string' && path.resolve(e.file).toLowerCase() === want)
+    || db.find((e) => e && typeof e.file === 'string'
+      && path.basename(e.file).toLowerCase() === base
+      && path.dirname(path.resolve(e.file)).toLowerCase() === path.dirname(want))
+  if (!entry) return undefined
+  const argv = Array.isArray(entry.arguments) && entry.arguments.length
+    ? entry.arguments.slice()
+    : splitCommandLine(entry.command || '')
+  if (!argv.length) return undefined
+  const toolchain = /(^|[\\/])cl(\.exe)?$/i.test(argv[0]) ? 'msvc' : 'mingw'
+  const args = compileArgsOf(argv.slice(1), sourceAbs, toolchain)
+  return args && args.length ? { args, toolchain } : undefined
+}
+
+/** Arguments from a clangd-style `compile_flags.txt` (one flag per line). */
+function flagsFromCompileFlagsTxt(file) {
+  let text
+  try { text = fs.readFileSync(file, 'utf8') } catch { return undefined }
+  const args = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'))
+  return args.length ? args : undefined
+}
+
+function flagsCachePath(project) {
+  return path.join(LOCK_DIR(), `cpp-flags-${projectKey(project)}.json`)
+}
+
+/**
+ * Signature of the inputs that decide a project's compile flags. A record whose
+ * signature no longer matches is ignored: the build entry, the flag family or
+ * godot-cpp changed, so what the last build used is no longer known.
+ */
+function flagsSignature(project, hit, family) {
+  const part = (file) => {
+    try { const s = fs.statSync(file); return `${path.resolve(file)}:${s.size}:${Math.round(s.mtimeMs)}` } catch { return `${file}:missing` }
+  }
+  const gcp = godotCppRoot(project, hit)
+  return [part(hit.file), family, part(path.join(gcp || '', 'SConstruct')), part(path.join(gcp || '', 'tools', 'godotcpp.py'))].join('|')
+}
+
+/** What the last successful build of this project compiled with, when still valid. */
+function readLearnedFlags(project, hit, family) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(flagsCachePath(project), 'utf8'))
+    if (!rec || !Array.isArray(rec.args) || !rec.args.length) return undefined
+    if (rec.family !== family) return undefined
+    if (rec.signature !== flagsSignature(project, hit, family)) return undefined
+    return { args: rec.args, compiler: rec.compiler }
+  } catch { return undefined }
+}
+
+function writeLearnedFlags(project, hit, family, args, compiler) {
+  try {
+    fs.mkdirSync(LOCK_DIR(), { recursive: true })
+    atomicWriteJson(flagsCachePath(project), {
+      // The project path is what lets a reader tell whose cache this is (the file
+      // name is a hash) — a probe sweeping its throwaway fixtures needs it.
+      project: path.resolve(project),
+      signature: flagsSignature(project, hit, family),
+      family, compiler, args, learned_at: NOW(),
+    })
+  } catch { /* an unwritable cache only costs speed */ }
+}
+
+/**
+ * Teach the syntax stage from a build that succeeded: the build echoes its own
+ * compile lines, and they carry exactly the flags the project builds with —
+ * including the target's defines and the API version, which no heuristic can
+ * infer. Only a successful round may teach; a failed one knows nothing. Each line
+ * teaches under the family of the compiler it names, so what is learned is
+ * usable by the compiler the syntax stage will actually run.
+ */
+function learnFromBuild(out, project, hit) {
+  const found = []
+  for (const line of String(out).split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!/(\s-c\s|\/c\s)/.test(trimmed)) continue
+    const argv = splitCommandLine(trimmed)
+    if (argv.length < 3) continue
+    const sources = argv.filter((a) => /\.(cpp|cc|cxx)$/i.test(a))
+    if (!sources.length) continue
+    const family = compilerFamily(argv[0])
+    const args = compileArgsOf(argv.slice(1), sources[0], family)
+    if (args && args.length) found.push({ family, args, compiler: argv[0] })
+  }
+  if (!found.length) return
+  // The richest line is the project's own source with its full flag set; short
+  // lines belong to generated or dependency objects.
+  found.sort((a, b) => b.args.length - a.args.length)
+  writeLearnedFlags(project, hit, found[0].family, found[0].args, found[0].compiler)
+}
+
+/**
+ * An explicit `--flags` path that does not exist is a misconfiguration: silently
+ * falling back to the layout would answer with flags the caller did not ask for.
+ * @returns {string|undefined} the failure to report, when there is one
+ */
+function flagsArgError(flags) {
+  if (!flags.flags) return undefined
+  const target = path.resolve(String(flags.flags))
+  return fs.existsSync(target) ? undefined : `--flags ${flags.flags} does not exist`
+}
+
+/**
+ * Flags for the syntax stage, from the most trustworthy source available: an
+ * explicit database or flags file, then what the last successful build used, then
+ * the GDExtension layout itself. The chosen source travels in the payload,
+ * because how much a syntax-only answer can be trusted depends on it.
+ * @param {string} compiler the compiler that will run: its family decides which
+ *        flags mean what, and a database written for another family is ignored
+ *        rather than fed to it
+ * @returns {{args: string[], from: string}}
+ */
+function syntaxFlagsFor(project, hit, compiler, flags, sourceAbs) {
+  const family = compilerFamily(compiler)
+  const cdbFiles = []
+  const flagFiles = []
+  const consider = (target) => {
+    if (!target) return
+    try {
+      if (fs.statSync(target).isDirectory()) {
+        cdbFiles.push(path.join(target, 'compile_commands.json'))
+        flagFiles.push(path.join(target, 'compile_flags.txt'))
+      }
+    } catch { /* missing: fall through to the next source */ }
+  }
+  const explicit = flags.flags ? path.resolve(String(flags.flags)) : undefined
+  if (explicit) {
+    if (/\.json$/i.test(explicit)) cdbFiles.push(explicit)
+    else if (/\.txt$/i.test(explicit)) flagFiles.push(explicit)
+    else consider(explicit)
+  }
+  consider(hit.dir)
+  consider(path.resolve(project))
+  for (const file of cdbFiles) {
+    const got = flagsFromCompileCommands(file, sourceAbs)
+    if (!got) continue
+    if (got.toolchain !== family) {
+      log(`ignoring ${file}: its entries are ${got.toolchain} flags, the compiler is ${family}`)
+      continue
+    }
+    return { args: got.args, from: `compile_commands.json (${path.dirname(file)})` }
+  }
+  for (const file of flagFiles) {
+    const args = flagsFromCompileFlagsTxt(file)
+    if (args) return { args, from: `compile_flags.txt (${path.dirname(file)})` }
+  }
+  const learned = readLearnedFlags(project, hit, family)
+  if (learned) return { args: learned.args, from: '上一次成功构建的编译命令行' }
+  return { args: layoutArgs(project, hit, family), from: 'GDExtension 目录布局推断' }
+}
+
+/**
+ * Flags for a project that has never been built and ships no compilation
+ * database: the GDExtension layout (godot-cpp's include roots plus the build
+ * directory). Deliberately minimal — an invented `-D` is a false error, while a
+ * missing one only costs precision — and the conflict direction is stated in the
+ * payload instead of guessed at.
+ */
+function layoutArgs(project, hit, toolchain) {
+  const gcp = godotCppRoot(project, hit)
+  const dirs = []
+  if (gcp) dirs.push(path.join(gcp, 'include'), path.join(gcp, 'gen', 'include'), path.join(gcp, 'gdextension'))
+  dirs.push(path.join(hit.dir, 'src'), hit.dir, path.resolve(project))
+  const args = toolchain === 'msvc'
+    ? ['/std:c++17', '/EHsc', '/utf-8', '/nologo']
+    : ['-std=c++17']
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue
+    if (toolchain === 'msvc') args.push(`/I${dir}`)
+    else args.push('-I', dir)
+  }
+  return args
+}
+
+/** The compiler invocation for one file: same compiler, flags and cwd as the build. */
+function syntaxCommandFor(toolchain, compiler, sourceAbs, args) {
+  if (toolchain === 'msvc') {
+    const vcvars = vcvarsPath()
+    if (!vcvars) return undefined
+    // vcvars' own chatter is silenced, its errors are not: a failure to set up the
+    // environment must reach the parser, or it reads as "the compiler said nothing".
+    const inner = `call "${vcvars}" >nul && cl /nologo /Zs ${args.join(' ')} "${sourceAbs}"`
+    // `verbatim` hands cmd.exe the line as written: Node's normal argument quoting
+    // escapes the inner quotes with backslashes, which cmd.exe does not understand
+    // (the call then fails with an empty output and a non-zero status).
+    return { exe: process.env.ComSpec || 'cmd.exe', args: ['/d', '/s', '/c', inner], env: buildEnv(), verbatim: true }
+  }
+  return {
+    exe: compiler,
+    args: ['-fsyntax-only', ...args, sourceAbs],
+    // The compiler's own directory must lead PATH: MinGW's g++ exits 1 with no
+    // output when it cannot find its own subprocesses, which would read as a
+    // clean file. Its DLLs live there too.
+    env: buildEnv({ PATH: `${path.dirname(compiler)}${path.delimiter}${process.env.PATH || ''}` }),
+  }
+}
+
+/** Run the compiler on one file, capturing stdout and stderr together. */
+function runSyntaxOne(hit, toolchain, compiler, sourceAbs, args, timeoutMs = SYNTAX_TIMEOUT_MS) {
+  const cmd = syntaxCommandFor(toolchain, compiler, sourceAbs, args)
+  if (!cmd) return Promise.resolve({ code: undefined, out: 'no vcvars64.bat: MSVC needs the environment it sets', text: 'cl /Zs (unavailable)' })
+  const text = `${path.basename(cmd.exe)} ${cmd.args.join(' ')}`
+  return new Promise((resolve) => {
+    let child
+    try {
+      // A process group of its own on POSIX, so a timeout takes the compiler with
+      // it (killTree); Windows keeps taskkill /T for that.
+      child = spawn(cmd.exe, cmd.args, {
+        cwd: hit.dir, windowsHide: true, env: cmd.env,
+        windowsVerbatimArguments: cmd.verbatim === true,
+        detached: process.platform !== 'win32',
+      })
+    } catch (error) {
+      resolve({ code: undefined, out: `spawn failed: ${(error && error.message) || error}`, text })
+      return
+    }
+    let out = ''
+    let grace
+    const settle = (code) => {
+      clearTimeout(timer)
+      if (grace) clearTimeout(grace)
+      resolve({ code, out, text })
+    }
+    const timer = setTimeout(() => {
+      try { killTree(child) } catch { /* gone */ }
+      // A grandchild that keeps the pipe open would stall `close` forever, and the
+      // verdict matters more than the last log line (the same grace a killed build
+      // gets). Never leave the promise pending: the caller serializes on it.
+      grace = setTimeout(() => settle(undefined), 5_000)
+      if (typeof grace.unref === 'function') grace.unref()
+    }, timeoutMs)
+    child.stdout.on('data', (d) => { out += d })
+    child.stderr.on('data', (d) => { out += d })
+    child.on('error', (error) => {
+      out += `${out ? '\n' : ''}spawn error: ${(error && error.message) || error}\n`
+      settle(undefined)
+    })
+    child.on('close', (code) => settle(code))
+  })
+}
+
+/**
+ * Syntax stage: one compiler run per requested file, no build and no lock.
+ * A run that could not answer (compiler missing, spawn failure, abnormal exit)
+ * is reported as a failure to check, never as a clean file.
+ * @returns {Promise<{ok: true, payload: object} | {ok: false, error: string, unavailable?: boolean}>}
+ */
+async function checkOnceSyntax(project, requestedAbs, flags, budgetMs = 0) {
+  const badFlags = flagsArgError(flags)
+  if (badFlags) return { ok: false, error: badFlags }
+  let hit
+  let toolchain
+  try {
+    hit = findBuildDir(project, flags, requestedAbs)
+    toolchain = resolveToolchain(hit, project, flags)
+  } catch (error) {
+    return { ok: false, error: (error && error.message) || String(error) }
+  }
+  // The compiler that will run decides the flags (see syntaxCompiler).
+  const { compiler, effective } = syntaxCompiler(hit, toolchain)
+  // A bare `cl.exe` is a guess that vcvars64.bat will provide it; a found path is
+  // a fact. A guess that does not hold means this stage is unavailable, which is
+  // what lets `--stage auto` answer with the build instead of failing.
+  const guessedCl = toolchain === 'msvc' && compiler === 'cl.exe'
+  if (!compiler) {
+    const need = toolchain === 'msvc' ? 'cl (with vcvars64.bat)' : 'g++'
+    return {
+      ok: false, unavailable: true,
+      error: `syntax stage cannot run here: no ${need} found (set CXX or MINGW_BIN, or run one full build so the stage learns this project's compiler)`,
+    }
+  }
+  // Only files this build directory actually owns may be stamped as checked: a
+  // file that resolves to another GDExtension's build was not compiled with these
+  // flags either (the build stage applies the same rule).
+  const covered = requestedAbs.filter((abs) => {
+    if (!fs.existsSync(abs) || !isUnder(hit.dir, abs)) return false
+    let own
+    try { own = findBuildDir(project, flags, [abs]) } catch { own = undefined }
+    return !own || path.resolve(own.dir) === path.resolve(hit.dir)
+  })
+  if (!covered.length) {
+    return { ok: false, error: `no requested file lives under the build directory ${hit.dir}` }
+  }
+  const byKey = new Map()
+  const commands = []
+  const sources = []
+  let failure
+  // The caller's budget covers the whole stage, not each file: a round of slow
+  // files must fail inside it instead of running past it and being retired.
+  const deadline = budgetMs > 0 ? Date.now() + budgetMs : undefined
+  for (const abs of covered) {
+    const left = deadline === undefined ? SYNTAX_TIMEOUT_MS : deadline - Date.now()
+    if (left <= 0) {
+      failure = `the syntax check ran out of its ${Math.round(budgetMs / 1000)}s budget before checking ${relOf(project, abs)}`
+      break
+    }
+    const resolved = syntaxFlagsFor(project, hit, compiler, flags, abs)
+    sources.push(resolved.from)
+    const run = await runSyntaxOne(hit, effective, compiler, abs, resolved.args, Math.min(SYNTAX_TIMEOUT_MS, left))
+    commands.push(`${run.text} -> exit ${run.code}`)
+    const tail = run.out.trim().split(/\r?\n/).slice(-8).join('\n')
+    // No exit code at all means the compiler never finished (spawn failure, a
+    // timeout kill, a signal): nothing was checked.
+    if (run.code === undefined || run.code < 0) {
+      failure = `${run.text}\nthe compiler did not run to completion\n${tail}`
+      break
+    }
+    const parsed = parseDiagnostics(run.out, project, hit.dir)
+    // A syntax-only run cannot have produced a link error, so a parsed `<link>`
+    // would be a false record replacing the build's real one.
+    parsed.delete(LINK_KEY)
+    const runErrors = [...parsed.values()].reduce((n, list) => n + list.filter((d) => d.severity === 1).length, 0)
+    // The compiler refused the file but said nothing this parser can attribute to
+    // it (a broken toolchain, an environment failure): that is a failure to check,
+    // never a clean file. cl exits 2 on errors, gcc 1 — any non-zero code is only
+    // trustworthy once a diagnostic explains it.
+    if (run.code !== 0 && !runErrors) {
+      failure = `${run.text}\nexit ${run.code} without a source diagnostic\n${tail}`
+      break
+    }
+    for (const [key, list] of parsed) {
+      if (!byKey.has(key)) byKey.set(key, [])
+      byKey.get(key).push(...list)
+    }
+  }
+  if (failure) {
+    if (guessedCl) {
+      return {
+        ok: false, unavailable: true,
+        error: `syntax stage cannot run here: vcvars64.bat did not provide a working cl\n${failure}`,
+      }
+    }
+    return { ok: false, out: failure, error: `syntax check could not run:\n${failure}` }
+  }
+  const payload = payloadFor(project, covered, byKey, hit)
+  payload.stage = 'syntax'
+  payload.server = 'syntax'
+  // Link failures are the build stage's evidence: a syntax round has none, and
+  // an empty declaration here is what keeps `<link>` from being replaced.
+  payload.syntheticKeys = []
+  // A round may take its flags from several places (one file has a compile_commands
+  // entry, the next falls back to the layout): name them instead of pretending the
+  // whole round used the last one.
+  const distinct = [...new Set(sources)]
+  const flagsFrom = distinct.length <= 1 ? (distinct[0] || '未知来源') : `${distinct[0]} 等 ${distinct.length} 种来源`
+  payload.build = { dir: hit.dir, toolchain: effective, compiler, flagsFrom, commands }
+  const skipped = requestedAbs.length - covered.length
+  const notes = [`语法检查（未构建）：用项目自己的 ${effective === 'msvc' ? 'cl /Zs' : 'g++ -fsyntax-only'}，flags 来自 ${flagsFrom}。`]
+  if (effective !== toolchain) notes.push(`本机既没有 cl 也没有 vcvars64.bat，已改用 MinGW 的编译器与 flags（项目产物判定为 ${toolchain}）。`)
+  if (skipped) notes.push(`${skipped} 个请求的文件不属于这个构建目录（不在它之下，或属于另一个 GDExtension 的构建），本次没有检查。`)
+  notes.push('链接错误与构建脚本/依赖库的问题不在本次范围内，需要构建（--stage build 或 lsp_echo check）。')
+  payload.engine_note = notes.join('')
+  return { ok: true, payload }
+}
+
 /**
  * One check: build the project, parse what the toolchain said.
  * A failure to check is reported as such (`ok: false`) and never as a clean
@@ -837,7 +1419,13 @@ async function checkOnce(project, requestedAbs, sweep, flags) {
     return !own || path.resolve(own.dir) === path.resolve(hit.dir)
   })
   const payload = payloadFor(project, covered, byKey, hit)
+  payload.stage = 'build'
   payload.build = { dir: hit.dir, entry: path.basename(hit.file), toolchain, commands: built.commands }
+  // A round that ran every target to completion is the one source that knows the
+  // project's real flags; the syntax stage reads them back from here.
+  if (!built.commands.some((c) => /-> exit (?!0\b)/.test(c))) {
+    learnFromBuild(built.out, project, hit)
+  }
   const skipped = requestedAbs.length - covered.length
   if (skipped) {
     payload.engine_note = `${skipped} requested file(s) were not compiled by this check (outside ${hit.dir}, or owned by another GDExtension's build)`
@@ -846,9 +1434,63 @@ async function checkOnce(project, requestedAbs, sweep, flags) {
 }
 
 // ---------- commands ----------
+/**
+ * Answer one check with the stage that can answer it: the syntax stage when the
+ * project's toolchain can be driven, the build otherwise. A stage that cannot run
+ * falls back instead of turning the check into a clean answer.
+ * @param {string} project project root
+ * @param {string[]} requestedAbs absolute files this check was asked about
+ * @param {boolean} sweep build stage only: also build the release target
+ * @param {object} flags parsed CLI flags
+ * @param {'auto'|'syntax'|'build'} [want] requested stage
+ */
+async function checkRequested(project, requestedAbs, sweep, flags, want, budgetMs) {
+  const stage = want === undefined ? 'build' : String(want).toLowerCase()
+  if (!STAGES.has(stage)) throw new Error(`--stage must be auto, syntax or build (got ${want})`)
+  if (stage === 'build') return { stage: 'build', result: await checkOnce(project, requestedAbs, sweep, flags) }
+  const syntax = await checkOnceSyntax(project, requestedAbs, flags, budgetMs)
+  if (stage === 'syntax' || syntax.ok || !syntax.unavailable) return { stage: 'syntax', result: syntax }
+  return { stage: 'build', result: await checkOnce(project, requestedAbs, sweep, flags) }
+}
+
+/** Show the flags the syntax stage would use, without compiling anything. */
+async function cmdPrintFlags(project, files, flags) {
+  const badFlags = flagsArgError(flags)
+  if (badFlags) {
+    errl(badFlags)
+    return 2
+  }
+  let hit
+  let toolchain
+  try {
+    hit = findBuildDir(project, flags, files.map((f) => path.resolve(project, f)))
+    toolchain = resolveToolchain(hit, project, flags)
+  } catch (error) {
+    errl((error && error.message) || String(error))
+    return 2
+  }
+  // Same resolver the check itself uses: this command reports what would run, so
+  // it must not name a different compiler or flag toolchain than the stage will.
+  const { compiler, effective } = syntaxCompiler(hit, toolchain)
+  console.log(`build dir: ${hit.dir}`)
+  console.log(`toolchain: ${toolchain}${effective === toolchain ? '' : ` (no cl available; using ${effective} flags)`}`)
+  console.log(`compiler: ${compiler || '(not found)'}`)
+  for (const f of files) {
+    const abs = path.resolve(project, f)
+    const resolved = syntaxFlagsFor(project, hit, compiler, flags, abs)
+    console.log(`${relOf(project, abs)}: ${resolved.from}`)
+    console.log(`  ${resolved.args.join(' ')}`)
+  }
+  // This command exists to say what would run: reporting a compiler that is not
+  // there as success would make the self-check the one place that lies.
+  return compiler ? 0 : 2
+}
+
 async function cmdCheck(project, files, outPath, sweep, flags) {
   const absFiles = files.map((f) => path.resolve(project, f))
-  const r = await checkOnce(project, absFiles, sweep, flags)
+  if (flags['print-flags'] === true) return cmdPrintFlags(project, files, flags)
+  const { result: r } = await checkRequested(project, absFiles, sweep, flags, flags.stage,
+    Number(flags['build-timeout-ms']) > 0 ? Number(flags['build-timeout-ms']) : 0)
   if (!r.ok) {
     errl(r.error)
     if (outPath) { try { fs.unlinkSync(path.resolve(outPath)) } catch { /* never written */ } }
@@ -856,10 +1498,10 @@ async function cmdCheck(project, files, outPath, sweep, flags) {
   }
   if (outPath) atomicWriteJson(path.resolve(outPath), r.payload)
   const s = r.payload.summary
-  // The build commands belong in the log: the trace is where a user finds out
-  // which target and which entry the check actually used.
+  // The commands belong in the log: the trace is where a user finds out which
+  // stage, target and entry the check actually used.
   for (const c of (r.payload.build && r.payload.build.commands) || []) log(c)
-  log(`checked ${s.files_checked} file(s): ${s.errors} error(s), ${s.warnings} warning(s)`)
+  log(`[${r.payload.stage || 'build'}] checked ${s.files_checked} file(s): ${s.errors} error(s), ${s.warnings} warning(s)`)
   if (r.payload.engine_note) log(r.payload.engine_note)
   for (const rel of Object.keys(r.payload.files)) {
     for (const d of r.payload.files[rel].diagnostics) {
@@ -878,12 +1520,42 @@ function cmdClientd(project, flags) {
   // directory fight over the same object files and DLLs.
   const queue = []
   let draining = false
-  let busy = false // a check is executing right now
+  let busy = false // a build is executing right now
+  // A syntax check takes no lock and writes nothing into the build directory, so
+  // it must not queue behind a build that can run for minutes — a step's fast
+  // check would otherwise wait for a background build. Syntax checks serialize
+  // among themselves instead.
+  const syntaxQueue = []
+  let syntaxBusy = false
+
+  const drainSyntax = async () => {
+    if (syntaxBusy) return
+    syntaxBusy = true
+    while (syntaxQueue.length) {
+      const entry = syntaxQueue.shift()
+      try {
+        const perRequest = { ...flags, ...(entry.flags || {}), stage: 'syntax' }
+        const r = await checkOnceSyntax(project, (entry.files || []).map((f) => path.resolve(project, f)), perRequest,
+          entry.budgetMs > 0 ? entry.budgetMs : 0)
+        if (r.ok) reply(entry.id, { ok: true, payload: r.payload })
+        else if (r.unavailable) {
+          // No compiler this stage can drive: answer with the build, which is the
+          // only stage left, rather than failing the check.
+          queue.push({ ...entry, stage: 'build' })
+          void drain()
+        } else reply(entry.id, { ok: false, error: r.error })
+      } catch (error) {
+        reply(entry.id, { ok: false, error: (error && error.message) || String(error) })
+      }
+    }
+    syntaxBusy = false
+  }
+
   const drain = async () => {
     if (draining) return
     draining = true
     while (queue.length) {
-      const { id, files, sweep, budgetMs, noWait, killOnTimeout } = queue.shift()
+      const entry = queue.shift()
       busy = true
       try {
         // A request may carry its own build budget and waiting policy: the plugin
@@ -891,15 +1563,17 @@ function cmdClientd(project, flags) {
         // when a model explicitly asks for a check.
         const perRequest = {
           ...flags,
-          'build-timeout-ms': budgetMs > 0 ? budgetMs : flags['build-timeout-ms'],
-          'no-wait': noWait === true || flags['no-wait'] === true,
-          'kill-on-timeout': killOnTimeout === true,
+          ...(entry.flags || {}),
+          'build-timeout-ms': entry.budgetMs > 0 ? entry.budgetMs : flags['build-timeout-ms'],
+          'no-wait': entry.noWait === true || flags['no-wait'] === true,
+          'kill-on-timeout': entry.killOnTimeout === true,
         }
-        const r = await checkOnce(project, (files || []).map((f) => path.resolve(project, f)), !!sweep, perRequest)
-        if (r.ok) reply(id, { ok: true, payload: r.payload })
-        else reply(id, { ok: false, error: r.error })
+        const { result: r } = await checkRequested(project, (entry.files || []).map((f) => path.resolve(project, f)),
+          entry.sweep === true || entry.sweep === '1', perRequest, entry.stage === undefined ? 'build' : entry.stage)
+        if (r.ok) reply(entry.id, { ok: true, payload: r.payload })
+        else reply(entry.id, { ok: false, error: r.error })
       } catch (error) {
-        reply(id, { ok: false, error: (error && error.message) || String(error) })
+        reply(entry.id, { ok: false, error: (error && error.message) || String(error) })
       } finally {
         busy = false
       }
@@ -916,7 +1590,16 @@ function cmdClientd(project, flags) {
       if (!line.trim()) continue
       let req
       try { req = JSON.parse(line) } catch { continue }
-      const entry = { id: req && req.id, files: req.files, sweep: req.sweep, budgetMs: req && req.budgetMs, noWait: req && req.noWait, killOnTimeout: req && req.killOnTimeout }
+      const entry = {
+        id: req && req.id, files: req.files, sweep: req.sweep, budgetMs: req && req.budgetMs,
+        noWait: req && req.noWait, killOnTimeout: req && req.killOnTimeout, stage: req && req.stage, flags: req && req.flags,
+      }
+      const want = String((req && req.stage) || 'build').toLowerCase()
+      if (want === 'syntax' || want === 'auto') {
+        syntaxQueue.push(entry)
+        void drainSyntax()
+        continue
+      }
       // A request that refuses to wait must not queue behind the check already
       // running: the host would time the whole channel out, retire this clientd
       // and reject the running request as well.
@@ -950,12 +1633,27 @@ function describe(project, flags) {
 
 const USAGE = `cpp-gdextension.mjs — C++ compile diagnostics for a Godot GDExtension
 
-  node cpp-gdextension.mjs check <file...> --project <dir> [--sweep] [--out <json>]
+  node cpp-gdextension.mjs check <file...> --project <dir> [--stage auto|syntax|build] [--sweep] [--out <json>]
   node cpp-gdextension.mjs clientd --project <dir>   (persistent JSON-lines client)
   node cpp-gdextension.mjs host|status|stop [--project <dir>]
 
-The project's own build is the checker: <build dir>/build.ps1 when present,
-otherwise \`py -m SCons platform=<os> target=template_<debug|release>\`.
+Two stages answer a check:
+  syntax  the project's own compiler with the project's own flags, -fsyntax-only
+          (cl /Zs) per file: about a second, no writes into the build directory,
+          no lock, and no <link> record — link errors are the build's evidence.
+  build   the project's own build is the checker: <build dir>/build.ps1 when
+          present, otherwise \`py -m SCons platform=<os> target=template_<debug|release>\`.
+          This is the only stage that sees link and build-script failures.
+--stage defaults to build; \`auto\` prefers syntax and falls back to build when
+the syntax stage cannot run here (an MSVC project with no vcvars64.bat and no
+other compiler this machine can use).
+An MSVC project whose \`cl\` is missing falls back to a g++ found on this machine,
+with MinGW flags; a compile_commands.json written for the other family, and a
+CXX that belongs to it, are ignored rather than mixed with these flags.
+--flags <file|dir> points the syntax stage at a compile_commands.json or a
+compile_flags.txt. Without it the build directory and the project root are
+searched, then the flags of the last successful build, then the layout.
+--print-flags prints what the syntax stage would use, without compiling.
 --sweep builds the release target too; a plain check builds debug only.
 --dir <dir> pins the build directory (default: the changed files decide, else a
 walk); --toolchain auto|msvc|mingw overrides the toolchain detected from the

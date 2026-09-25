@@ -1,23 +1,101 @@
-# C++(GDExtension)编译检查 —— 拿项目自己的构建当引擎
+# C++(GDExtension)编译检查 —— 两级:先语法,再构建
 
-## 为什么不用 LSP
+**两个阶段,回答两个不同的问题**:
 
-`clangd` 那条路要先装第二套工具链、再生成 `compile_commands.json`,而且**只看单文件语法**,
-链接错误(未定义符号、DLL 被占用、漏了库)一律看不见。这里反过来:**检查就是让项目编一次**——
-SCons 增量构建只重编改动的 TU,报出来的错就是真构建会遇到的错,连链接阶段一起覆盖。
+| 阶段 | 问题 | 手段 | 实测耗时(本项目 `dsh_proc.cpp`) |
+|---|---|---|---|
+| `syntax` | "我刚改的这个文件还编得过吗?" | 项目**自己的编译器** + 项目自己的 flags,`-fsyntax-only` / `cl /Zs`,不构建 | **1.14 s** |
+| `build` | "真的能编出 DLL 吗?"(链接、构建脚本、依赖库) | 让项目**真编一次**(`build.ps1` / SCons),报出来的错就是真构建的错 | 4.3–4.6 s(增量);godot-cpp 需要重编时 110 s+ |
+
+自动检查(pre-step)正是为 `syntax` 准备的:一轮对话不再为一个语法错付一次构建(更不会付一次 godot-cpp 重编)。
+`build` 保留给按需检查与后台构建,因为**链接错误只有构建看得见** —— syntax 阶段因此从不产生
+`<link>` 记录,也从不覆盖构建留下的那条。
+
+## 为什么语法阶段用项目自己的编译器,而不是 clangd
+
+2026-09-25 实测(同一个真实文件、同一套 godot-cpp 头文件):
+
+| | 项目自己的编译器 | clangd 22.1.6 |
+|---|---|---|
+| 额外安装 | **0**(构建本来就要它) | 92.5 MB(解压后) |
+| 单文件耗时 | 1.14 s | ~1.4 s(冷启,含标准库索引;`--check` 模式墙钟 2.94 s) |
+| 内存 | 即用即走 | 峰值 104 MB |
+| 结论可信度 | **与构建同一个编译器**:报的错就是构建会报的错 | **第二个编译器**:可以接受 g++ 拒绝的代码,也可能拒绝 g++ 接受的(它连标准库索引都会"incomplete due to errors") |
+| 配错时 | 没有额外配置可配错 | **满屏假错误**:实测一次配错报出 24 条(找不到 `windows.h` → `HANDLE`/`DWORD`/模板全是"错误")。要同时满足三件事:CDB 里编译器写成**绝对路径**、`--query-driver` 指到它、它的 bin 在子进程 PATH 上(MinGW 的 g++ 不在 PATH 上会**静默 exit 1**) |
+| 当检查器用 | 退出码就是结论 | `--check` 的退出码**不可用**:干净文件也报 `All checks completed, 5 errors` + `exit 3`(那 5 条是 clangd 自己的代码动作自测失败,不是诊断) |
+
+想用 clangd 的补全/跳转/重构这类 IDE 能力,和本插件不冲突:profile 里已装的 `dsh-lsp-actions` 提供
+`lsp_diagnostics` 等工具,给它配一个 clangd server 就行 —— 但那是"模型按需问语言服务器",不是
+"改完自动告诉你",也不是"能编出 DLL 吗"。
 
 ## 桥 CLI
 
 ```
-node cpp-gdextension.mjs check <file...> --project <dir> [--sweep] [--out <json>] [--dir <dir>] [--toolchain auto|msvc|mingw] [--build-timeout-ms N] [--no-wait] [--kill-on-timeout]
+node cpp-gdextension.mjs check <file...> --project <dir> [--stage auto|syntax|build] [--sweep] [--out <json>] [--dir <dir>] [--toolchain auto|msvc|mingw] [--build-timeout-ms N] [--no-wait] [--kill-on-timeout] [--flags <file|dir>] [--print-flags]
 node cpp-gdextension.mjs clientd --project <dir>      # 常驻 JSON-lines,与其它引擎同一协议
 node cpp-gdextension.mjs host|status|stop [--project <dir>]
 ```
 
-`clientd` 的每条请求可以带 `budgetMs`(这次构建的预算)与 `noWait`(构架目录正忙时立刻回答、不排队等);
-插件的 pre-step 通道就是用它把"自动检查"限在 40 秒内,而模型显式要求检查时走 110s/190s。
+`--stage` 默认 `build`(与历史行为一致);`syntax` 明确要语法阶段;`auto` 优先 syntax,项目工具链
+没法驱动时(MSVC 没有 `vcvars64.bat`)退回 build —— **不把"跑不了的阶段"变成"没问题的结论"**。
+
+`clientd` 的每条请求可以带 `budgetMs`(这次构建的预算)、`noWait`(构建目录正忙时立刻回答、不排队等)
+与 `stage`;插件把它用来把"自动检查"限在 40 秒内,而模型显式要求检查时走 110s/190s。`stage: syntax`
+的请求走**独立的通道**:它不取锁、不写构建目录,所以不必排在正在跑的构建后面(否则一步的快速检查
+要等一个可能跑几分钟的后台构建)。
 
 退出码:`0` 无错误 / `1` 有错误 / `2` **没能检查**(工具链缺失、超时、构建脚本自身失败)。
+
+## 语法阶段(syntax):flags 从哪来,以及它保证什么
+
+**flags 来源,按可信度从高到低**(用了哪个会写进 payload 的 `build.flagsFrom`,并作为中文
+`engine_note` 的一部分进到注入给模型的那句话里;`flagsFrom` 字段本身在 `--out` 的 JSON 里。
+一轮里多个文件来源不同时写成「X 等 N 种来源」,不假装整轮都用了最后一个):
+
+1. **显式**:`--flags <file|dir>` 指到的 `compile_commands.json`(取该文件那条 —— 精确路径优先,退而
+   求其次要求**同目录**同名,别人的同名文件不算;`-o/-c/-MD/-MF…` 一律剥掉)或 `compile_flags.txt`
+   (每行一个参数)。CDB 里那个编译器与**将要运行的编译器**家族不同时(MSVC 的 `/I` 喂给 g++)会被
+   忽略并记录原因 —— 那不是"没找到 flags",那是会把假错误灌进来的输入;
+2. **构建目录 / 项目根**里的同名文件(项目自己发布过 CDB 时自动用上);
+3. **上一次成功构建学到的**:桥从构建输出里读出项目自己的编译命令行(SCons 会打印),
+   把 flags 记在 `$DSH_HOME/lsp-echo-runtime/cpp-flags-<项目哈希>.json` —— **绝不写进项目树**。
+   只有**整轮构建全部 exit 0** 才学;记录按**编译器家族**记账(`cl` = MSVC,其余 = MinGW,由那行命令里的
+   编译器自己决定,而不是由产物推断出的标签决定),并带签名(构建入口的路径+大小+mtime + 家族 +
+   godot-cpp 的 `SConstruct`/`tools/godotcpp.py`),任一项变了就作废、回到布局推断。语法阶段按**它将要
+   运行的那个编译器**的家族去读,所以"产物判定为 MSVC、实际退回 MinGW"的机器也照样用得上。
+   **注意**:一次**没有实际编译任何文件**的构建(工程已是最新)什么都不教 —— 这时语法阶段用布局推断,
+   等下一次真的有文件要编时自然就学到了(记录按签名存活,之后一直有效)。想让它一开始就精确,项目可以
+   自己发布 `compile_commands.json`(SCons 的 `compilation_db` 工具)或 `compile_flags.txt`;
+4. **GDExtension 布局推断**:`godot-cpp` 的 `include`/`gen/include`/`gdextension` + 构建目录 +
+   项目根 + `-std=c++17`。故意**不发明 `-D`** —— 编出来的宏会变假错误,缺宏只是精度差一点。
+
+**编译器从哪来**:`CXX` → `MINGW_BIN` → **项目自己的构建脚本里写死的路径**(实测本项目
+`build.ps1` 里的 `E:\Programs\mingw64-gcc14\mingw64\bin` 就是这样找到的 —— 项目脚本比 harness 的
+PATH 更懂它自己) → PATH。`CXX`/`MINGW_BIN` 只在**家族与项目一致**时被采纳(否则会出现"MSVC 的 flags
+配 MinGW 的编译器"这种两边都不可信的配对)。MSVC 项目按 `cl` → **vcvars64.bat 带来的 cl**(项目自己的
+环境优先)→ 机器上有的 g++(前两者都不行时才连 flags 一起切到 MinGW,并在 `engine_note` 里说明)挑选;
+都找不到就 **exit 2 报"语法阶段跑不了"**,并提示设 `CXX`/`MINGW_BIN`,或先跑一次构建让它学到。
+MSVC 那条路要经过 `cmd.exe`:Node 默认给参数加的反斜杠转义 cmd 不认,所以桥用
+`windowsVerbatimArguments` 把命令行原样递过去 —— 少了这一步,`cl /Zs` 会"跑了但什么都没说"(实测)。
+
+**保证**(都有探针用例):
+
+- **不写构建目录、不取锁**:`-fsyntax-only` 不产出文件,`-o` 之类参数已剥掉;探针在跑检查前后对
+  整个构建目录做指纹(文件名+大小+mtime)并要求逐字相同,也不会出现 `cpp-build-*.lock`;
+- **不产生、不覆盖 `<link>`**:payload 的 `syntheticKeys` 是空数组,插件的快照合并因此保留构建阶段
+  写下的那条链接错误记录(这是"没检查"与"没有链接错误"的区别);反过来,一次**干净**的构建
+  (payload 声明拥有 `<link>` 却没产出它)会把它清掉 —— 否则修好的链接错误会永远赖在快照里;
+- **跑不了就说跑不了**:编译器缺失、起不来、超时、或**退出码非 0 却解析不出一条能归到源文件的诊断**
+  (不认的 flag、坏掉的工具链、`cl` 没被 vcvars 备好),一律 exit 2 且**不写 payload**,绝不回一个
+  0 错误的结果。退出码按各家的约定收:`cl` 出错退 2、gcc 退 1,两者都算"编译器跑过了",由诊断决定结论;
+- **带调用方的预算**:`budgetMs`(clientd 请求)或 `--build-timeout-ms` 会变成整个阶段的截止时间,
+  超了就以 exit 2 如实报告跑到第几个文件,不会拖过宿主的超时;
+- **只认这个构建目录的文件**:和构建阶段一样,解析到另一个 GDExtension 构建目录的文件不会被
+  打个"0 错误"了事,而是计进 `engine_note` 的"本次没有检查";
+- **明确写出覆盖范围**:`engine_note` 每次都声明"语法检查(未构建)…链接错误与构建脚本/依赖库的问题
+  不在本次范围内";
+- `--print-flags` 打印这次会用的构建目录/工具链/编译器/flags 与来源,不编译任何东西(自检用);
+  它用**和真正运行同一个**解析器,连不上编译器时以 exit 2 收场,不会把"跑不了"报成"能用"。
 
 ## 构建目录与入口(自动发现)
 
@@ -75,6 +153,9 @@ UTF-8(Windows PowerShell 5.1 默认按 ANSI 解码子进程输出,会把非 ASCI
 一句"请求超时"。**自动检查(pre-step 通道)另有一份 40 秒的预算**(`engine.json` 的 `budgetMs`),
 因为一次冷启动重编可能好几分钟,不该把用户的一轮对话卡在那里;模型显式调用 `lsp_echo check` 时
 才用 110s/190s。
+
+**语法阶段就是为了取消这条 40 秒的账**:改动文件走 syntax(实测 1.14 s),pre-step 的自动检查将改为它,
+构建只在按需检查或需要链接结论时跑。`--stage build` 与 `--sweep` 的预算仍然按上面这张表。
 
 **超时不再杀构建**(默认):杀掉 SCons 会扔掉它已做完的工作、并把 `.sconsign.dblite` 留在半写状态,
 于是**下一次检查要重编更多** —— 实测过一个 21MB 签名库被打断后,下一次要重编 1119 个 godot-cpp

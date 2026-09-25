@@ -56,7 +56,9 @@ function write(rel, content) {
 }
 function run(args, opts = {}) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [BRIDGE, ...args], { cwd: opts.cwd || ROOT, windowsHide: true })
+    const child = spawn(process.execPath, [BRIDGE, ...args], {
+      cwd: opts.cwd || ROOT, windowsHide: true, env: { ...process.env, ...(opts.env || {}) },
+    })
     let out = ''
     let err = ''
     child.stdout.on('data', (d) => { out += d })
@@ -66,6 +68,58 @@ function run(args, opts = {}) {
 }
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return undefined }
+}
+
+/**
+ * A C++ compiler for the syntax-stage cases: an explicit choice first, then the
+ * roots this project's own build script names, then PATH.
+ */
+function probeCompiler() {
+  const exe = process.platform === 'win32' ? 'g++.exe' : 'g++'
+  const candidates = []
+  if (process.env.CXX) candidates.push(process.env.CXX)
+  if (process.env.MINGW_BIN) candidates.push(path.join(process.env.MINGW_BIN, exe))
+  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+    if (dir) candidates.push(path.join(dir, exe))
+  }
+  for (const dir of ['E:\\Programs\\mingw64-gcc14\\mingw64\\bin', 'E:\\Programs\\mingw64\\mingw64\\bin', 'C:\\mingw64\\bin', 'C:\\msys64\\mingw64\\bin', '/usr/bin']) {
+    candidates.push(path.join(dir, exe))
+  }
+  for (const file of candidates) {
+    try { if (file && fs.statSync(file).isFile()) return file } catch { /* next */ }
+  }
+  return undefined
+}
+
+/**
+ * A fixture the engine can only read as MinGW: the toolchain comes from the
+ * project's own artifacts, so a `.a` in `bin/` decides it. Without one every
+ * fixture would be MSVC by default on a machine that has vcvars, and the
+ * syntax-stage cases would test the other path than the one they name.
+ */
+function mingwProject(name, buildScript, sources = {}) {
+  const made = project(name, buildScript, sources)
+  fs.mkdirSync(path.join(made.native, 'bin'), { recursive: true })
+  fs.writeFileSync(path.join(made.native, 'bin', 'libprobe.a'), '!<arch>\n', 'utf8')
+  return made
+}
+
+/** Name, size and mtime of every file under a directory: what a write would change. */
+function dirFingerprint(dir) {
+  const parts = []
+  const walk = (d) => {
+    let entries
+    try { entries = fs.readdirSync(d, { withFileTypes: true }) } catch { return }
+    for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const p = path.join(d, e.name)
+      if (e.isDirectory()) walk(p)
+      else {
+        try { const s = fs.statSync(p); parts.push(`${path.relative(dir, p)}:${s.size}:${Math.round(s.mtimeMs)}`) } catch { /* gone */ }
+      }
+    }
+  }
+  walk(dir)
+  return parts.join('|')
 }
 
 /** A project whose native directory mimics the real layout (deep below addons/). */
@@ -596,6 +650,152 @@ exit 0
     '--out', path.join(ROOT, 'aged.json'), '--build-timeout-ms', '20000'])
   ok(agedRun.code === 0, 'an aged record with a live pid is cleared, not waited on', `${agedRun.code} ${agedRun.err.trim()}`)
 
+  // ---- 14. syntax stage: the project's own compiler, no build --------------
+  // The stage exists so a one-line edit does not cost a build; it must stay
+  // honest (a run that could not happen is a failure, never a clean file), keep
+  // the build's evidence intact (no <link> record), and use the flags the build
+  // actually uses.
+  console.log('\n[14] syntax stage (compiler only, no build)')
+  const gpp = probeCompiler()
+  ok(!!gpp, 'a C++ compiler is available for the syntax-stage cases', 'set CXX or MINGW_BIN to a g++')
+  const syn = mingwProject('syntax', CLEAN_OUT, { 'src/ok.cpp': 'int probe_ok() { return 0; }\n' })
+  const synFile = path.join(syn.native, 'src', 'ok.cpp')
+  const synKey = 'addons/probe_ext/platform/native/src/ok.cpp'
+  if (gpp) {
+    const withGpp = { CXX: gpp }
+    const r14a = await run(['check', synFile, '--project', syn.project, '--print-flags'], { env: withGpp })
+    ok(r14a.code === 0 && /compiler: .*g\+\+/.test(r14a.out) && /布局/.test(r14a.out),
+      '--print-flags names the compiler and the flag source without compiling', `${r14a.code} ${r14a.out.trim()}`)
+    const before14 = dirFingerprint(syn.native)
+    const out14b = path.join(ROOT, 'syntax-clean.json')
+    const t14b = Date.now()
+    const r14b = await run(['check', synFile, '--project', syn.project, '--stage', 'syntax', '--out', out14b], { env: withGpp })
+    const ms14b = Date.now() - t14b
+    const p14b = readJson(out14b)
+    ok(r14b.code === 0 && p14b && p14b.stage === 'syntax', 'a clean file passes in the syntax stage', `${r14b.code} ${r14b.err.trim()}`)
+    ok(!!(p14b && p14b.files[synKey] && p14b.files[synKey].errors === 0),
+      'the checked file is recorded with zero errors', JSON.stringify(p14b && p14b.files))
+    ok(!!(p14b && !p14b.files['<link>'] && (p14b.syntheticKeys || []).length === 0),
+      'the stage declares no <link> record it could not have produced', JSON.stringify(p14b && p14b.syntheticKeys))
+    ok(ms14b < 15_000, 'a syntax check stays far under the build budget', `${ms14b}ms`)
+    ok(dirFingerprint(syn.native) === before14 && !fs.existsSync(lockFor(syn.native)),
+      'and writes nothing into the build directory, nor takes a lock',
+      `${before14}\n       → ${dirFingerprint(syn.native)}`)
+    const bad = mingwProject('syntax-bad', CLEAN_OUT, { 'src/bad.cpp': 'int probe_bad() { return missing_symbol_xyz; }\n' })
+    const out14c = path.join(ROOT, 'syntax-bad.json')
+    const r14c = await run(['check', path.join(bad.native, 'src', 'bad.cpp'), '--project', bad.project, '--stage', 'syntax', '--out', out14c], { env: withGpp })
+    const rec14c = (readJson(out14c) || { files: {} }).files['addons/probe_ext/platform/native/src/bad.cpp']
+    ok(r14c.code === 1 && !!rec14c && rec14c.errors === 1 && /missing_symbol_xyz/.test((rec14c.diagnostics[0] || {}).message),
+      "a broken file is reported by the project's own compiler", `${r14c.code} ${JSON.stringify(rec14c)}`)
+    ok(!!rec14c && rec14c.diagnostics[0].line === 1 && rec14c.diagnostics[0].severityName === 'error',
+      'with the position and severity the build would give', JSON.stringify(rec14c && rec14c.diagnostics))
+  } else {
+    ok(false, 'a clean file passes in the syntax stage', 'no compiler found: set CXX or MINGW_BIN')
+    ok(false, 'the checked file is recorded with zero errors', 'no compiler found')
+    ok(false, 'the stage declares no <link> record it could not have produced', 'no compiler found')
+    ok(false, 'a syntax check stays far under the build budget', 'no compiler found')
+    ok(false, 'and writes nothing into the build directory, nor takes a lock', 'no compiler found')
+    ok(false, "a broken file is reported by the project's own compiler", 'no compiler found')
+    ok(false, 'with the position and severity the build would give', 'no compiler found')
+    ok(false, 'the build directory is left exactly as it was', 'no compiler found')
+  }
+  // A stage that cannot run must answer with the stage that can, never with a
+  // clean file: the minimal PATH holds no compiler (Windows keeps PowerShell in
+  // System32, so the build fallback still works).
+  const winRoot = process.env.SystemRoot || 'C:\\Windows'
+  const minimalPath = process.platform === 'win32'
+    ? [path.join(winRoot, 'System32', 'WindowsPowerShell', 'v1.0'), path.join(winRoot, 'System32')].join(path.delimiter)
+    : '/usr/bin:/bin'
+  const noCompiler = { CXX: path.join(ROOT, 'no-compiler', 'g++.exe'), MINGW_BIN: path.join(ROOT, 'no-compiler'), PATH: minimalPath }
+  const plain = mingwProject('syntax-none', CLEAN_OUT, { 'src/plain.cpp': 'int probe_plain() { return 0; }\n' })
+  const out14d = path.join(ROOT, 'syntax-none-syntax.json')
+  const plainRun = await run(['check', path.join(plain.native, 'src', 'plain.cpp'), '--project', plain.project, '--stage', 'syntax', '--out', out14d], { env: noCompiler })
+  const blocked = plainRun.code === 2
+  ok(blocked && !readJson(out14d),
+    'a syntax stage with no compiler fails loud instead of reporting a clean file',
+    `${plainRun.code} payload=${JSON.stringify(readJson(out14d))} ${plainRun.err.trim()}`)
+  const out14e = path.join(ROOT, 'syntax-none.json')
+  const autoRun = await run(['check', path.join(plain.native, 'src', 'plain.cpp'), '--project', plain.project, '--stage', 'auto', '--out', out14e], { env: noCompiler })
+  const p14e = readJson(out14e)
+  ok(autoRun.code === 0 && !!p14e && p14e.stage === (blocked ? 'build' : 'syntax'),
+    'and --stage auto answers with the stage that can run', `${autoRun.code} ${JSON.stringify(p14e && p14e.stage)} ${autoRun.err.trim()}`)
+  // Explicit flags win: an include that only a compile_flags.txt provides.
+  const incDir = path.join(ROOT, 'syntax-inc')
+  fs.mkdirSync(incDir, { recursive: true })
+  fs.writeFileSync(path.join(incDir, 'only_with_flag.h'), '#define PROBE_FLAG_OK 1\n', 'utf8')
+  const flagDir = path.join(ROOT, 'syntax-flagfile')
+  fs.mkdirSync(flagDir, { recursive: true })
+  fs.writeFileSync(path.join(flagDir, 'compile_flags.txt'), `-std=c++17\n-I\n${incDir}\n`, 'utf8')
+  const needs = mingwProject('syntax-flag', CLEAN_OUT, { 'src/needs.cpp': '#include "only_with_flag.h"\nint probe_needs() { return PROBE_FLAG_OK; }\n' })
+  const needsFile = path.join(needs.native, 'src', 'needs.cpp')
+  const r14f = await run(['check', needsFile, '--project', needs.project, '--stage', 'syntax'], { env: gpp ? { CXX: gpp } : {} })
+  ok(r14f.code === 1 && /only_with_flag\.h/.test(`${r14f.out}${r14f.err}`),
+    'without the flags file that include is not found', `${r14f.code} ${`${r14f.out}${r14f.err}`.trim().split('\n').slice(-1)[0]}`)
+  const r14g = await run(['check', needsFile, '--project', needs.project, '--stage', 'syntax', '--flags', flagDir], { env: gpp ? { CXX: gpp } : {} })
+  ok(r14g.code === 0, 'an explicit compile_flags.txt is used by the syntax stage', `${r14g.code} ${r14g.err.trim()}`)
+  // A compiler that refuses the file without a source diagnostic (here: a flag it
+  // does not have) is a failure to check, never a clean file. This is the failure
+  // mode that made the stage report 0 errors for a file the compiler rejected.
+  const badFlagDir = path.join(ROOT, 'syntax-badflags')
+  fs.mkdirSync(badFlagDir, { recursive: true })
+  fs.writeFileSync(path.join(badFlagDir, 'compile_flags.txt'), '-fbogus-flag-xyz\n', 'utf8')
+  const clean14 = mingwProject('syntax-clean2', CLEAN_OUT, { 'src/fine.cpp': 'int probe_fine() { return 0; }\n' })
+  const out14k = path.join(ROOT, 'syntax-badflag.json')
+  const r14k = await run(['check', path.join(clean14.native, 'src', 'fine.cpp'), '--project', clean14.project, '--stage', 'syntax', '--flags', badFlagDir, '--out', out14k], { env: gpp ? { CXX: gpp } : {} })
+  ok(r14k.code === 2 && !readJson(out14k) && /without a source diagnostic/.test(r14k.err),
+    'a compiler failure with no source diagnostic is reported as could-not-check, not as clean',
+    `${r14k.code} payload=${JSON.stringify(readJson(out14k))} ${r14k.err.trim().split('\n').slice(-2).join(' ')}`)
+  const out14m = path.join(ROOT, 'syntax-missingflags.json')
+  const r14m = await run(['check', path.join(clean14.native, 'src', 'fine.cpp'), '--project', clean14.project,
+    '--stage', 'syntax', '--flags', path.join(ROOT, 'no-such-flags-here'), '--out', out14m], { env: gpp ? { CXX: gpp } : {} })
+  ok(r14m.code === 2 && !readJson(out14m) && /does not exist/.test(r14m.err),
+    'an explicit --flags that does not exist is refused instead of replaced by the layout',
+    `${r14m.code} payload=${JSON.stringify(readJson(out14m))} ${r14m.err.trim()}`)
+  // A successful build teaches the stage: the flags SCons printed are the ones
+  // the project really compiles with, including defines no heuristic can guess.
+  const teachOut = String.raw`param([string]$Target = 'both')
+Write-Host "g++ -o bin/obj/src/hello.o -c -std=c++17 -DFROM_BUILD=1 -I src src/hello.cpp"
+Write-Host "scons: done building targets."
+exit 0
+`
+  const taught = mingwProject('syntax-learn', teachOut, { 'src/hello.cpp': 'int probe_learn() { return FROM_BUILD; }\n' })
+  const taughtFile = path.join(taught.native, 'src', 'hello.cpp')
+  const r14h = await run(['check', taughtFile, '--project', taught.project, '--stage', 'build', '--out', path.join(ROOT, 'learn-build.json')], { env: gpp ? { CXX: gpp } : {} })
+  ok(r14h.code === 0, 'a successful build is the teacher', `${r14h.code} ${r14h.err.trim()}`)
+  const r14i = await run(['check', taughtFile, '--project', taught.project, '--print-flags'], { env: gpp ? { CXX: gpp } : {} })
+  ok(r14i.code === 0 && /构建/.test(r14i.out) && /-DFROM_BUILD=1/.test(r14i.out),
+    'and the syntax stage reuses the flags that build used', `${r14i.code} ${r14i.out.trim()}`)
+  fs.appendFileSync(path.join(taught.native, 'build.ps1'), '# changed\n', 'utf8')
+  const r14j = await run(['check', taughtFile, '--project', taught.project, '--print-flags'], { env: gpp ? { CXX: gpp } : {} })
+  ok(r14j.code === 0 && /布局/.test(r14j.out) && !/-DFROM_BUILD=1/.test(r14j.out),
+    'editing the build entry invalidates what it taught', r14j.out.trim())
+  // The MSVC path runs through cmd.exe: Node's normal argument quoting escapes the
+  // inner quotes with backslashes, which cmd does not understand, so the whole stage
+  // failed with an empty output. Only --real-msvc has a machine to prove it on.
+  if (REAL_MSVC) {
+    const msvc = project('syntax-msvc', CLEAN_OUT, { 'src/plain.cpp': 'int probe_plain() { return 0; }\n' })
+    const out14n = path.join(ROOT, 'syntax-msvc.json')
+    const r14n = await run(['check', path.join(msvc.native, 'src', 'plain.cpp'), '--project', msvc.project,
+      '--toolchain', 'msvc', '--stage', 'syntax', '--out', out14n])
+    const p14n = readJson(out14n)
+    ok(r14n.code === 0 && !!p14n && p14n.stage === 'syntax' && /cl/i.test((p14n.build || {}).compiler || ''),
+      'a trivial file passes in the MSVC syntax stage (cl /Zs through vcvars)',
+      `${r14n.code} ${r14n.err.trim()} ${JSON.stringify(p14n && p14n.build)}`)
+    const msbad = project('syntax-msvc-bad', CLEAN_OUT, { 'src/bad.cpp': 'int probe_bad() { return missing_symbol_xyz; }\n' })
+    const out14o = path.join(ROOT, 'syntax-msvc-bad.json')
+    const r14o = await run(['check', path.join(msbad.native, 'src', 'bad.cpp'), '--project', msbad.project,
+      '--toolchain', 'msvc', '--stage', 'syntax', '--out', out14o])
+    const rec14o = ((readJson(out14o) || { files: {} }).files)['addons/probe_ext/platform/native/src/bad.cpp']
+    // cl exits 2 on errors (not 1): the bridge must still report errors, not "could
+    // not check".
+    ok(r14o.code === 1 && !!rec14o && rec14o.errors >= 1 && /missing_symbol_xyz/.test(JSON.stringify(rec14o.diagnostics)),
+      'a broken file is still a diagnostic when cl exits 2', `${r14o.code} ${JSON.stringify(rec14o)} ${r14o.err.trim()}`)
+    ok(!!rec14o && rec14o.diagnostics.every((d) => d.line > 0),
+      'and its diagnostics carry positions', JSON.stringify(rec14o && rec14o.diagnostics))
+  } else {
+    console.log('  --   MSVC syntax stage skipped (pass --real-msvc)')
+  }
+
   // Locks these fixture builds left behind (they name builds that outran their
   // budget and were not killed): every record pointing into a throwaway fixture
   // is swept, including leftovers of an earlier run whose root is long gone, the
@@ -627,12 +827,35 @@ exit 0
         try { fs.unlinkSync(p) } catch { /* best effort */ }
       }
     }
+    // What the fixture builds taught the syntax stage: a cache record whose
+    // project is a throwaway fixture is swept by the same rule as its locks. A
+    // record of a real project is never touched.
+    for (const name of fs.readdirSync(lockDir)) {
+      if (!name.startsWith('cpp-flags-') || !name.endsWith('.json')) continue
+      const p = path.join(lockDir, name)
+      let rec
+      try { rec = JSON.parse(fs.readFileSync(p, 'utf8')) } catch { continue }
+      if (!rec) continue
+      if (typeof rec.project !== 'string') {
+        // A record written before the project field existed: its signature still
+        // names the build entry the flags were learned from, and every fixture
+        // root this probe ever used starts with this.
+        if (typeof rec.signature === 'string' && rec.signature.includes('dsh-cpp-probe-')) {
+          try { fs.unlinkSync(p) } catch { /* best effort */ }
+        }
+        continue
+      }
+      const proj = path.resolve(rec.project)
+      if (proj.toLowerCase().startsWith(tempLower) && proj.slice(tempLower.length).toLowerCase().includes('dsh-')) {
+        try { fs.unlinkSync(p) } catch { /* best effort */ }
+      }
+    }
   } catch { /* no runtime dir */ }
 
   // Every assertion runs exactly once, so the number that ran is knowable: a
   // skipped assertion (a promise that timed out, a section that never ran) lowers
   // the count and fails here instead of printing PASSED.
-  const EXPECTED_CHECKS = 77 + (REAL_MSVC ? 4 : 0)
+  const EXPECTED_CHECKS = 95 + (REAL_MSVC ? 7 : 0)
   if (checks !== EXPECTED_CHECKS) {
     failures += 1
     console.log(`  FAIL every check ran: ${checks}/${EXPECTED_CHECKS} executed`)

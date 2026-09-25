@@ -13,7 +13,7 @@
 | 能力 | 说明 |
 |---|---|
 | **自动反馈(#1 核心)** | AI(或人)编辑项目后,插件在下一轮模型请求前自动跑编译检查,**有错误就把 `文件:行:列` 清单注入上下文**(`agent/pre-step` 插件快照,同 time-context 范式,自动落会话日志)。**每一轮检查的是"这一步变过的文件"与"这一步新建的文件"** —— 新建文件此前被静默漏掉(只看 mtime 变化),现在同样交给对应引擎。**每次插件装载后、每个项目首次进入其会话时自动做一次全量诊断**:网页端点开对话即触发(`agent/created`,常见 `resume`/`startup`),在首条消息之前就已开始,引擎扫描与用户打字并行 |
-| **检查没跑完就说没跑完** | 引擎超时/失败时**不会**静默跳过:改动过的文件留在待检查列表(下一步自动重试),同时注入一句「这一轮没跑完,你改的文件没有被验证」+ 原因(同一原因 3 分钟内不重复)。构建型引擎(如 C++)在 pre-step 通道里只给 40 秒预算且不排队等别的构建 —— 一轮对话不会被冷启动重编卡住,而超时的构建**继续在后台跑**(杀掉反而让下一次重编更多) |
+| **检查没跑完就说没跑完** | 引擎超时/失败时**不会**静默跳过:改动过的文件留在待检查列表(下一步自动重试),同时注入一句「这一轮没跑完,你改的文件没有被验证」+ 原因(同一原因 3 分钟内不重复)。构建型引擎(如 C++)在 pre-step 通道里只给 40 秒预算且不排队等别的构建 —— 一轮对话不会被冷启动重编卡住,而超时的构建**继续在后台跑**(杀掉反而让下一次重编更多)。C++ 引擎新加的**语法阶段**(项目自己的编译器 + 项目自己的 flags,实测 1.14 s)正是为了把这条 40 秒的账取消:它把自动检查从一次构建换成一次语法检查,构建留给按需检查与需要链接结论的场合 |
 | **多 LSP(项目为主)** | 一个项目(目录)可绑**多个引擎**,各自认领自己的文件扩展名(如 GDScript `.gd` + 未来 C# `.cs`);编辑变化按扩展名路由到对应引擎检查,结果合并进一个按项目诊断快照 |
 | **显式管理工具** | 模型工具 `lsp_echo`:`host`/`stop`/`status`/`check`/`baseline`/`projects`/`scan` |
 | **引擎生命周期** | **智能连接**:你已打开该项目的 Godot 编辑器时,直接 attach 它的 LSP 端口(6005,零额外内存、秒级就绪);否则自起 headless 引擎常驻复用;启动决策带**跨进程文件锁**(杜绝并发双起);插件卸载时自动 detach/停止,`stop` 显式停 |
@@ -44,9 +44,9 @@ plugins/lsp-echo/
 │  ├─ scope.js             键空间作用域/扩展名判定(引擎作用域过滤 + 快照合并共用,含无扩展名合成键)
 │  └─ checkers.js          引擎注册表(engine.json: name/marker/extensions/bridge[/rescan/rescanPort/addon/evidence/fallback/syntheticKeys/budgetMs/noWait])
 ├─ checkers/               ← 引擎程序(每语言一目录,加目录即注册)
-│  ├─ cpp-gdextension/     第二个引擎:C++(GDExtension)编译检查 —— 项目自己的构建就是引擎
+│  ├─ cpp-gdextension/     第二个引擎:C++(GDExtension)编译检查 —— 两级:项目自己的编译器(语法,约 1 秒)+ 项目自己的构建(链接/构建脚本)
 │  │  ├─ engine.json       注册表描述(marker=*.gdextension, extensions=[.cpp/.cc/.cxx/.h/.hpp/.hxx], evidence=[SConstruct,*.gdextension], syntheticKeys=[<link>], budgetMs=40000, noWait=true)
-│  │  ├─ cpp-gdextension.mjs  桥 CLI: host/status/stop/check/clientd(无常驻 LSP 进程)
+│  │  ├─ cpp-gdextension.mjs  桥 CLI: host/status/stop/check/clientd(无常驻 LSP 进程);check 支持 --stage auto|syntax|build、--flags、--print-flags
 │  │  ├─ README.md         桥自身文档(构建入口发现/时间预算/诚实性规则)
 │  │  └─ reference/        probe.mjs(解析·协议·失败路径) + binding-probe.mjs(evidence 绑定)
 │  ├─ typescript/          第三个引擎(tsserver,含 clientd)
@@ -107,12 +107,18 @@ node "$env:DSH_HOME\profiles\web\node_modules\@dsh-user\lsp-echo\checkers\godot-
 # ② 在会话里让 AI 改坏一个 .gd → 下一轮应自动出现 [lsp-echo] 错误清单
 # ③ 手动:模型工具 lsp_echo: host / status / check files=[...]
 
-# ④ C++(GDExtension)检查:解析/协议/失败路径/每文件构建目录/依赖检出排除/并发构建锁 + 真实编译器端到端
+# ④ C++(GDExtension)检查:解析/协议/失败路径/每文件构建目录/依赖检出排除/并发构建锁/语法阶段 + 真实编译器端到端(语法用例需要一个 g++:走 CXX / MINGW_BIN,或项目 build.ps1 里写死的路径;MSVC 语法用例走 cmd+vcvars,只在 --real-msvc 下跑)
 node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\probe.mjs --real-msvc
 # ⑤ evidence 绑定是否认得你的 GDExtension 项目
 node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\reference\binding-probe.mjs --project E:\GodotProject\dsh_goochen_assistant
-# ⑥ 手动跑一次 C++ 检查(会真的构建项目;debug target)
+# ⑥ 先看语法阶段会用什么(不编译任何东西),再手动跑一次
+node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\cpp-gdextension.mjs check <项目>\addons\<插件>\platform\native\src\*.cpp --project <项目> --print-flags
+# ⑦ 语法阶段(约 1 秒,不构建、不取锁;实测本项目 1.14 s)
+node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\cpp-gdextension.mjs check <项目>\addons\<插件>\platform\native\src\*.cpp --project <项目> --stage syntax --out "$env:TEMP\cpp-syntax.json"
+# ⑧ 构建阶段(会真的构建项目;debug target,链接错误只有它能看见)
 node E:\Deepseek\deepseek_harness\plugins\lsp-echo\checkers\cpp-gdextension\cpp-gdextension.mjs check <项目>\addons\<插件>\platform\native\src\*.cpp --project <项目> --out "$env:TEMP\cpp-check.json"
+# ⑨ 快照合并:一次写入只替换它自己带的记录(语法阶段不会抹掉 <link>,也不会抹掉没查的文件)
+node E:\Deepseek\deepseek_harness\plugins\lsp-echo\reference\snapshot-probe.mjs
 ```
 
 ## 配置(装载行)
@@ -363,12 +369,17 @@ Godot 任何 `--editor` 实例都会打开调试适配器(DAP),默认端口正�
    - `{ syntheticKeys: ["<link>"] }` —— 引擎会写**没有文件对应**的快照键时声明归属:只有它能替换这个键、
      别的引擎的快照合并不挤掉它、它也只在这个引擎自己的轮次里出现(否则一句链接错误会每次都被当成
      "本轮结果"重复注入)。桥在 payload 里同样声明一次,宿主据此做快照合并;
+   - **快照合并的粒度是一条记录,不是一个扩展名** —— 一次写入只替换它自己带的键,没带的键(别的引擎的
+     键空间、本引擎这轮没看的文件的旧记录)原样保留,只有配置里不再绑定的扩展名、以及文件已不存在的
+     记录才清掉。所以引擎可以只报**一部分**文件(这正是 C++ 语法阶段的做法),不会把别的记录抹掉;
    - `{ budgetMs: 40000, noWait: true }` —— 检查本身就是一次真实构建的引擎,在 pre-step 通道里限制
      预算并且不排队等别的构建:一轮对话不会被冷启动重编卡住(超时的构建按桥的规则继续在后台跑,
      改动文件留在待检查列表、下一步重试);
    - vendored 依赖目录(如 `godot-cpp`)建议放进默认跳过列表:它自带的构建入口不是**本项目**的构建。
-   C++ 引擎是这套写法的样板:`host/stop` 退化成预检与空操作,每次检查跑一次项目构建
-   (详细契约见 `checkers/cpp-gdextension/README.md`);
+   C++ 引擎是这套写法的样板:`host/stop` 退化成预检与空操作,检查**分两级** —— 语法阶段用项目自己的
+   编译器 + 项目自己的 flags 只解释改动的文件(不构建、不取锁、秒级),构建阶段才是权威结论(链接、
+   构建脚本、依赖库)。桥的 `check` 因此多一个 `--stage`(默认 `build`,老调用不受影响),
+   详细契约见 `checkers/cpp-gdextension/README.md`;
 4. 自动反馈/管理/生命周期代码无需改动。
 
 详见 `docs/design.md`。

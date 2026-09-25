@@ -84,14 +84,23 @@ function recomputeSummary(files, syntheticKeys) {
 
 /**
  * Serialize one snapshot write for a project (RFC §8). Merges into the
- * existing file: keys whose extension belongs to `ownedExts` are dropped
- * (replaced by this payload); all other keys (other engines' keyspaces) are
- * preserved; the summary is recomputed from the merged set.
+ * existing file: the keys this payload carries are replaced, the keys it does
+ * not carry survive (another engine's keyspace, and this engine's own records
+ * for files this round did not look at), and the summary is recomputed from the
+ * merged set.
+ *
+ * A round is not the whole project: the cpp engine's syntax stage checks only the
+ * files that changed, and an engine that replaces its entire extension keyspace
+ * would erase the records of every file it did not look at — including the build
+ * stage's `<link>` record, whose absence reads as "no link errors". The one
+ * exception is a key the payload declares as its own `syntheticKeys`: declaring it
+ * means owning it, so not producing it removes it (a clean build clears `<link>`).
  *
  * `keepExts` (optional) carries the extensions still bound to this project in
- * the live config. Old keys whose extension is NOT in keepExts are evicted —
- * the owning engine was removed from the project, so its stale diagnostics
- * must not survive (RFC §8: eviction keys off lsp config changes only).
+ * the live config. Old keys whose extension is NOT in keepExts are evicted — the
+ * owning engine was removed from the project, so its stale diagnostics must not
+ * survive (RFC §8: eviction keys off lsp config changes only). A record whose
+ * file no longer exists is evicted too: nothing can fix it.
  * @param {string} project project root
  * @param {object} payload bridge payload ({project, files, summary, ...})
  * @param {string[]} [ownedExts] extensions owned by the writing engine
@@ -113,38 +122,46 @@ export function writeSnapshot(project, payload, ownedExts, keepExts) {
     const oldFiles = existing.files && typeof existing.files === 'object' ? existing.files : {}
     const keepSet = keepExts && keepExts.length ? new Set(keepExts) : null
     const ownSet = ownedExts && ownedExts.length ? new Set(ownedExts) : null
-    // Keys the writing engine declares as its own but that carry no extension
-    // (the cpp bridge's `<link>`). They are replaced by this write, and no other
-    // engine may evict them — an extension-based rule cannot see them.
+    const written = new Set(Object.keys(payload.files || {}))
+    // The keys this write declares as its own without a file behind them (`<link>`).
+    // Declaring one means "this key is mine", so a round that produced no such record
+    // — a build with no link errors — must remove the previous one; without that, a
+    // fixed link error outlives every later check that keeps passing.
     const synthSet = new Set(Array.isArray(payload.syntheticKeys) ? payload.syntheticKeys : [])
     if (!ownSet && !keepSet) {
       // v1 replace semantics (single engine without extension table)
       Object.assign(files, payload.files || {})
     } else {
       for (const rel of Object.keys(oldFiles)) {
+        if (written.has(rel)) continue // replaced by this write
+        if (synthSet.has(rel)) continue // this write owns the key and produced no record
         const ext = extOf(rel)
-        if (synthSet.has(rel)) continue // this engine's synthetic key, replaced below
         if (!ext) { files[rel] = oldFiles[rel]; continue } // another engine's synthetic key
         if (keepSet && !keepSet.has(ext)) continue // engine removed from project → evict
-        if (ownSet && ownSet.has(ext)) continue // this engine's keyspace, replaced below
+        if (!fs.existsSync(path.join(project, rel))) continue // the file is gone → nothing left to fix
         files[rel] = oldFiles[rel]
       }
-      for (const rel of Object.keys(payload.files || {})) files[rel] = payload.files[rel]
+      for (const rel of written) files[rel] = payload.files[rel]
     }
     // Declared synthetic keys of this write, sticky so that a later writer that
     // declares none does not erase the declaration a kept key still needs.
     const synthKeys = Array.isArray(payload.syntheticKeys) && payload.syntheticKeys.length
       ? payload.syntheticKeys
       : existing.synthetic_keys
+    // A round that carried no record at all must not refresh what the snapshot says
+    // about the last check: its note, stage and timestamp would describe a check
+    // that never happened.
+    const wrote = written.size > 0
     const merged = {
       tool: payload.tool,
       version: payload.version,
       project: payload.project || project,
-      server: payload.server,
-      port: payload.port,
-      engine_note: payload.engine_note,
+      server: wrote ? payload.server : existing.server,
+      port: wrote ? payload.port : existing.port,
+      engine_note: wrote ? payload.engine_note : existing.engine_note,
+      stage: wrote ? payload.stage || existing.stage : existing.stage,
       synthetic_keys: synthKeys,
-      updated_at: new Date().toISOString(),
+      updated_at: wrote ? new Date().toISOString() : existing.updated_at,
       files,
       summary: recomputeSummary(files, synthKeys),
     }
@@ -491,13 +508,10 @@ export async function checkFiles(bridge, project, files, timeoutMs = 120_000, ro
       return writeSnapshot(project, payload, ownedExts, keepExts)
     } catch (parseError) {
       try { fs.unlinkSync(tmpOut) } catch { /* best effort */ }
-      return {
-        project,
-        summary: { errors: 0, warnings: 0, files_checked: 0, files_with_errors: [] },
-        files: {},
-        stdout: r.stdout,
-        stderr: r.stderr,
-      }
+      // A payload that cannot be read back is not a result. Answering with an empty
+      // "no errors" one would turn "nothing was checked" into "nothing is wrong",
+      // which is the one thing a check must never do.
+      throw new Error(`bridge wrote no readable payload: ${(parseError && parseError.message) || parseError}`)
     }
   }
 }
