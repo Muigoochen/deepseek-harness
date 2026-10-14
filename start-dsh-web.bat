@@ -77,7 +77,20 @@ echo   Model API key: configure inside the Web UI, or write DEEPSEEK_API_KEY=...
 echo   into the .env file at the repository root.
 echo   Press Ctrl+C to stop the server.
 echo.
+rem Launch the built artifact when it exists. A source launch (`pnpm dsh`) reaches
+rem @deepseek-ai/* through tsconfig paths (src) while the plugin graph loads the
+rem same packages from lib, so each package's module-private Symbol is created
+rem twice and every tool call fails with "Cannot read properties of undefined
+rem (reading 'prepare')". Both halves must come from one plane: without lib
+rem everything is src, with lib everything is lib.
+if not exist "%~dp0apps\cli\lib\bin.js" goto :start_source
+node "%~dp0apps\cli\lib\bin.js" web %WEB_ARGS% %CLOCK_ARGS%
+goto :web_exited
+
+:start_source
 call pnpm dsh web %WEB_ARGS% %CLOCK_ARGS%
+
+:web_exited
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.
 echo dsh web exited with code %EXIT_CODE%

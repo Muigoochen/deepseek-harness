@@ -12,6 +12,21 @@ function unsupported(type: string): never {
   throw new LlmError(`DeepSeek Messages cannot represent ${type}`, 'UNSUPPORTED_CONTENT')
 }
 
+/**
+ * Assistant vocabulary that a durable user or tool-result message can carry: a
+ * subagent settlement notice saved before 0.1.6-alpha.1 inlined the child's
+ * closing `reasoning` and `tool-call` blocks into a user message, and any later
+ * producer can do the same. No DeepSeek protocol represents those blocks as
+ * user input, and the chat-completions serializer dropped them, so this
+ * protocol drops them rather than failing every later request of a session
+ * whose durable content no longer changes. Other types still fail loud:
+ * dropping a `file` or a future block would discard real user content.
+ */
+const UNREPRESENTABLE_USER_CONTENT: ReadonlySet<ContentBlock['type']> = new Set<ContentBlock['type']>([
+  'reasoning',
+  'tool-call',
+])
+
 /** Historical arguments that Messages cannot represent use empty input; durable content stays unchanged. */
 function toolInput(raw: string): Record<string, unknown> {
   let value: unknown
@@ -58,6 +73,7 @@ export function serialize(
   const inHistory = model?.systemPromptUpdate === 'in-history'
   const input = (blocks: readonly ContentBlock[]): WireInput[] => blocks.flatMap((block): WireInput[] => {
     if (block.type === 'text') return block.text ? [{ type: 'text', text: block.text }] : []
+    if (UNREPRESENTABLE_USER_CONTENT.has(block.type)) return []
     if (block.type !== 'image') return unsupported(`user/tool-result content ${block.type}`)
     const version = images.get(block.attachment.attachmentId)
     if (version === undefined) throw new LlmError('DeepSeek Messages request image is missing', 'INVALID_REQUEST')
@@ -103,22 +119,41 @@ export function serialize(
     else messages.push({ role: message.role, content })
   }
   flushSystemUpdates()
-  let pending = new Set<string>()
+  // Messages pairs each assistant tool call with a result in the message right
+  // after it. A durable log can hold a call whose result never landed: a turn
+  // that ends with a scheduler failure keeps the `tool/call` event it already
+  // recorded, and every later request reloads that transcript unchanged, so
+  // refusing it leaves the session unusable for good (#7065's second shape). The
+  // unanswered call is dropped from this request instead: the model never sees a
+  // tool result the log does not hold, and the durable log keeps the evidence
+  // that the call was left open.
+  let pending: { message: WireMessage; unanswered: Set<string> } | undefined
+  const dropUnansweredCalls = (): void => {
+    const open = pending
+    pending = undefined
+    if (open === undefined || open.unanswered.size === 0) return
+    open.message.content = open.message.content
+      .filter(block => block.type !== 'tool_use' || !open.unanswered.has(block.id))
+  }
   for (const message of messages) {
     if (message.role === 'assistant') {
+      dropUnansweredCalls()
       const calls = message.content.filter(block => block.type === 'tool_use')
-      pending = new Set(calls.map(block => block.id))
-      if (pending.size !== calls.length) throw new LlmError('DeepSeek Messages duplicate tool call id', 'INVALID_REQUEST')
+      const unanswered = new Set(calls.map(block => block.id))
+      if (unanswered.size !== calls.length) throw new LlmError('DeepSeek Messages duplicate tool call id', 'INVALID_REQUEST')
+      pending = { message, unanswered }
     } else if (message.role === 'user') {
       const results = message.content.filter(block => block.type === 'tool_result')
       for (const result of results) {
-        if (!pending.delete(result.tool_use_id)) throw new LlmError('DeepSeek Messages tool result has no matching call', 'INVALID_REQUEST')
+        if (pending === undefined || !pending.unanswered.delete(result.tool_use_id)) {
+          throw new LlmError('DeepSeek Messages tool result has no matching call', 'INVALID_REQUEST')
+        }
       }
-      if (pending.size > 0) throw new LlmError('DeepSeek Messages tool calls need immediate results', 'INVALID_REQUEST')
       message.content = [...results, ...message.content.filter(block => block.type !== 'tool_result')]
+      dropUnansweredCalls()
     }
   }
-  if (pending.size > 0) throw new LlmError('DeepSeek Messages history ends with unresolved tools', 'INVALID_REQUEST')
+  dropUnansweredCalls()
   const effort = options.purpose === 'session-title' ? 'off' : options.reasoningEffort ?? (connection.defaults.reasoningEffort ?? (connection.defaults.thinking === 'disabled' ? 'off' : 'high'))
   if (!['off', 'low', 'high', 'max'].includes(effort) || (connection.defaults.thinking === 'disabled' && effort !== 'off')) {
     throw new LlmError(`DeepSeek Messages does not support reasoning effort ${effort}`, 'UNSUPPORTED_REASONING_EFFORT')

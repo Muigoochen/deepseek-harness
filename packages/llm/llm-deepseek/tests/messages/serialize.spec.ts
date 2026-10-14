@@ -62,7 +62,33 @@ describe('Messages request conversion', () => {
     expect(nativeBody([user(), update]).system).toBeUndefined()
     expect(() => nativeBody([user(), assistant([{ type: 'text', text: 'done' }]), update])).toThrow(/preceding user/)
     expect(() => nativeBody([user(), createSystemMessage('', 'test')])).toThrow(/empty in-history/)
-    expect(() => nativeBody([user(), assistant([call(), call('b')]), update, result()])).toThrow(/immediate results/)
+    expect(nativeBody([user(), assistant([call(), call('b')]), update, result()]).messages[1]?.content).toEqual([
+      { type: 'tool_use', id: 'a', name: 'read', input: { path: 'a' } },
+    ])
+  })
+
+  it('drops an assistant tool call whose result never landed', () => {
+    // The poisoned shape #7065 reports: a scheduler failure ended the turn after
+    // `tool/call` was recorded, so the durable transcript keeps a call that no
+    // later message can answer. Refusing it every request would leave the
+    // session unusable for good.
+    const poisoned = [user(), assistant([{ type: 'text', text: 'Checking.' }, call(), call('b')]), result('a'), user('continue')]
+    expect(body(poisoned).messages).toEqual([
+      { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+      { role: 'assistant', content: [
+        { type: 'text', text: 'Checking.' },
+        { type: 'tool_use', id: 'a', name: 'read', input: { path: 'a' } },
+      ] },
+      { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'a', content: [{ type: 'text', text: 'result' }], is_error: false },
+        { type: 'text', text: 'continue' },
+      ] },
+    ])
+  })
+
+  it('drops a trailing assistant call that no result can follow', () => {
+    expect(body([user(), assistant([{ type: 'text', text: 'Checking.' }, call()])]).messages[1]?.content)
+      .toEqual([{ type: 'text', text: 'Checking.' }])
   })
 
   it('groups parallel results before ordinary text and keeps tool failure content', () => {
@@ -84,6 +110,35 @@ describe('Messages request conversion', () => {
     expect(response.messages[2]?.content[0]).toMatchObject({ content: [] })
     const minimal = createMessage({ role: 'user', source: { kind: 'user' }, content: [{ type: 'tool-result', toolCallId: ToolCallId('a'), content: [{ type: 'text', text: '' }] }] })
     expect(body([assistant([call()]), minimal]).messages[1]?.content[0]).toEqual({ type: 'tool_result', tool_use_id: 'a', content: [] })
+  })
+
+  it('drops assistant vocabulary a durable user message can carry', () => {
+    // A settlement notice saved before 0.1.6-alpha.1 inlined the child's
+    // reasoning and tool-call blocks into a user message. Durable content never
+    // changes, so dropping them here is what keeps that session usable (#7065);
+    // the chat-completions serializer dropped the same blocks.
+    const notice = createMessage({
+      role: 'user',
+      source: { kind: 'plugin', plugin: 'test' },
+      content: [
+        { type: 'text', text: 'Its closing message:' },
+        { type: 'reasoning', text: 'child thought' },
+        call('child'),
+        { type: 'text', text: 'review done' },
+      ],
+    })
+    expect(body([notice]).messages).toEqual([{
+      role: 'user',
+      content: [{ type: 'text', text: 'Its closing message:' }, { type: 'text', text: 'review done' }],
+    }])
+  })
+
+  it('drops the same vocabulary inside nested tool-result content', () => {
+    const nested = result('a', [{ type: 'reasoning', text: 'child thought' }, { type: 'text', text: 'kept' }])
+    expect(body([user(), assistant([call()]), nested]).messages[2]).toEqual({
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'a', content: [{ type: 'text', text: 'kept' }], is_error: false }],
+    })
   })
 
   it('collects leading system text and maps tools, stop sequences and explicit output cap', () => {
@@ -142,7 +197,7 @@ describe('Messages request conversion', () => {
   })
 
   it.each([
-    [result()], [assistant([call()])], [assistant([call()]), user()],
+    [result()],
     [assistant([call(), call()]), result()],
     [assistant([call()]), result(), result()],
   ])('rejects unmatched or duplicated tool history %#', (...messages) => {
@@ -313,7 +368,11 @@ describe('Messages images', () => {
     await expect(prepareImages([assistant([image])], connection, model, attachments, access, signal)).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTENT' })
     expect(() => body([result('a', [image])])).toThrow(/image/)
     expect(() => body([assistant([image])])).toThrow(/assistant/)
-    expect(() => body([result('a', [{ type: 'reasoning', text: 'bad' }])])).toThrow(/user/)
+    expect(() => body([createMessage({
+      role: 'user',
+      source: { kind: 'plugin', plugin: 'test' },
+      content: [{ type: 'chart' } as unknown as ContentBlock],
+    })])).toThrow(/user\/tool-result content/)
     expect(() => serialize(options({ model }), connection, [result('a', [image])], new Map([[ref.attachmentId, version]]), access, undefined, new Map()))
       .toThrow(/request file id is missing/)
   })
